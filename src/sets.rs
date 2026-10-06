@@ -8,8 +8,11 @@
 //! Extension points:
 //! - Link kinds: [`PLACEMENTS`] maps item kinds to a profile subdirectory and how a
 //!   source expands; [`LINKED`] lists the kinds reconciled at launch: skills under
-//!   `skills/` and instruction fragments under `rules/` (config-dir `rules/` loads
-//!   like `~/.claude/rules/`, so no `CLAUDE.md` import block is needed).
+//!   `skills/`, instruction fragments under `rules/` (config-dir `rules/` loads
+//!   like `~/.claude/rules/`, so no `CLAUDE.md` import block is needed), and
+//!   subagents, custom commands and output styles as `.md` files under `agents/`,
+//!   `commands/` and `output-styles/` (Claude loads each from the config directory
+//!   and follows symlinked files).
 //! - Plugins: [`plugin_installed`] gates `set add --plugin`; [`plugin_items`] gives
 //!   a registration's subscribed plugin IDs for injection.
 
@@ -46,7 +49,7 @@ enum Select {
     /// Child regular `.md` files (instruction fragments).
     Markdown,
 }
-const PLACEMENTS: [Placement; 2] = [
+const PLACEMENTS: [Placement; 5] = [
     Placement {
         explicit: ItemKind::Skill,
         source: ItemKind::SkillSource,
@@ -59,6 +62,24 @@ const PLACEMENTS: [Placement; 2] = [
         directory: "rules",
         select: Select::Markdown,
     },
+    Placement {
+        explicit: ItemKind::Agent,
+        source: ItemKind::AgentSource,
+        directory: "agents",
+        select: Select::Markdown,
+    },
+    Placement {
+        explicit: ItemKind::Command,
+        source: ItemKind::CommandSource,
+        directory: "commands",
+        select: Select::Markdown,
+    },
+    Placement {
+        explicit: ItemKind::OutputStyle,
+        source: ItemKind::OutputStyleSource,
+        directory: "output-styles",
+        select: Select::Markdown,
+    },
 ];
 /// Item kinds linked into owned profiles at launch.
 const LINKED: &[ItemKind] = &[
@@ -66,6 +87,12 @@ const LINKED: &[ItemKind] = &[
     ItemKind::SkillSource,
     ItemKind::Instruction,
     ItemKind::InstructionSource,
+    ItemKind::Agent,
+    ItemKind::AgentSource,
+    ItemKind::Command,
+    ItemKind::CommandSource,
+    ItemKind::OutputStyle,
+    ItemKind::OutputStyleSource,
 ];
 /// Claude-managed per-account names that are never linked, replaced or removed.
 const SYNCED: &str = "synced";
@@ -87,7 +114,8 @@ fn linkable(name: &str, select: Select) -> bool {
 }
 
 /// Whether a linked item's source exists with the type its kind needs: skills and
-/// sources are directories, instruction fragments regular files. The source is
+/// sources are directories, single Markdown items (instruction fragments, agents,
+/// commands, output styles) regular files. The source is
 /// user data that Claude reaches through the link, so (like listing a source) the
 /// check follows symlinks; a dangling link counts as missing. Only read, never
 /// written. Non-linked kinds (plugins) are not checked here.
@@ -107,7 +135,7 @@ fn source_present(item: &Item) -> bool {
 
 /// The source type [`source_present`] requires, for messages.
 fn source_type(kind: ItemKind) -> &'static str {
-    if kind == ItemKind::Instruction {
+    if placement(kind).is_some_and(|p| p.explicit == kind && p.select == Select::Markdown) {
         "a regular file"
     } else {
         "a directory"
@@ -296,17 +324,20 @@ fn item(args: ItemArgs) -> Result<Item> {
         }
         Ok(Item { kind, value })
     };
-    if let Some(p) = args.skill {
-        return path(ItemKind::Skill, p);
-    }
-    if let Some(p) = args.skills_from {
-        return path(ItemKind::SkillSource, p);
-    }
-    if let Some(p) = args.instruction {
-        return path(ItemKind::Instruction, p);
-    }
-    if let Some(p) = args.instructions_from {
-        return path(ItemKind::InstructionSource, p);
+    let paths = [
+        (ItemKind::Skill, args.skill),
+        (ItemKind::SkillSource, args.skills_from),
+        (ItemKind::Instruction, args.instruction),
+        (ItemKind::InstructionSource, args.instructions_from),
+        (ItemKind::Agent, args.agent),
+        (ItemKind::AgentSource, args.agents_from),
+        (ItemKind::Command, args.command),
+        (ItemKind::CommandSource, args.commands_from),
+        (ItemKind::OutputStyle, args.output_style),
+        (ItemKind::OutputStyleSource, args.output_styles_from),
+    ];
+    if let Some((kind, p)) = paths.into_iter().find_map(|(k, p)| p.map(|p| (k, p))) {
+        return path(kind, p);
     }
     let id = args.plugin.unwrap_or_default();
     let valid = |part: &str| {
@@ -546,7 +577,7 @@ pub fn command(action: SetAction, data: &mut Value) -> Result<Vec<String>> {
             ));
             if registration.kind == Kind::Upstream {
                 lines.push(
-                    "Upstream profiles receive only plugin items; skills and instructions are ignored"
+                    "Upstream profiles receive only plugin items; linked items (skills, instructions, agents, commands, output styles) are ignored"
                         .into(),
                 );
             }

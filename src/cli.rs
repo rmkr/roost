@@ -289,6 +289,24 @@ pub struct ItemArgs {
     /// A directory whose every child .md file is an instruction fragment
     #[arg(long, value_name = "DIR")]
     pub instructions_from: Option<PathBuf>,
+    /// A subagent definition (.md file), linked under agents/
+    #[arg(long, value_name = "FILE")]
+    pub agent: Option<PathBuf>,
+    /// A directory whose every child .md file is a subagent definition
+    #[arg(long, value_name = "DIR")]
+    pub agents_from: Option<PathBuf>,
+    /// A custom command (.md file), linked under commands/
+    #[arg(long, value_name = "FILE")]
+    pub command: Option<PathBuf>,
+    /// A directory whose every child .md file is a custom command
+    #[arg(long, value_name = "DIR")]
+    pub commands_from: Option<PathBuf>,
+    /// An output style (.md file), linked under output-styles/
+    #[arg(long, value_name = "FILE")]
+    pub output_style: Option<PathBuf>,
+    /// A directory whose every child .md file is an output style
+    #[arg(long, value_name = "DIR")]
+    pub output_styles_from: Option<PathBuf>,
     /// A plugin installed in the plugin store
     #[arg(long, value_name = "PLUGIN@MARKETPLACE")]
     pub plugin: Option<String>,

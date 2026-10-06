@@ -1,4 +1,4 @@
-//! Shared sets and launch-time skill and instruction links (spec "Shared sets", gate A16).
+//! Shared sets and launch-time skill, instruction, agent, command and output-style links (spec "Shared sets", gate A16).
 //! Disposable fixtures only: fake `claude`, private temp root/home, no real data.
 #![cfg(unix)]
 mod common;
@@ -726,4 +726,194 @@ fn launch_skips_vanished_sources_with_one_warning_and_drops_their_links() {
     fs::create_dir(&delta).unwrap();
     f.ok(&["run", "Work"]);
     assert_eq!(fs::read_link(profile.join("skills/delta")).unwrap(), delta);
+}
+
+/// Agents, commands and output styles: (CLI flag for one file, flag for a whole
+/// directory, profile subdirectory, item kind names).
+const MARKDOWN_KINDS: [(&str, &str, &str, &str, &str); 3] = [
+    (
+        "--agent",
+        "--agents-from",
+        "agents",
+        "agent",
+        "agent_source",
+    ),
+    (
+        "--command",
+        "--commands-from",
+        "commands",
+        "command",
+        "command_source",
+    ),
+    (
+        "--output-style",
+        "--output-styles-from",
+        "output-styles",
+        "output_style",
+        "output_style_source",
+    ),
+];
+
+#[test]
+fn launch_links_agents_commands_and_output_styles_and_unsubscribe_removes_them() {
+    for (one, many, directory, _, _) in MARKDOWN_KINDS {
+        let f = Fixture::new();
+        let library = fragments(
+            &f,
+            "library",
+            &["review.md", "git.md", ".hidden.md", "notes.txt"],
+        );
+        fs::create_dir(library.join("nested.md")).unwrap();
+        symlink(library.join("review.md"), library.join("alias.md")).unwrap();
+        let solo = fragments(&f, "solo", &["deploy.md"]).join("deploy.md");
+        f.ok(&["set", "create", "core"]);
+        f.ok(&["set", "add", "core", many, s(&library)]);
+        f.ok(&["set", "add", "core", one, s(&solo)]);
+        f.ok(&["add", "Work", "--no-sets"]);
+        f.ok(&["set", "subscribe", "Work", "core"]);
+        let target = f.profile("Work").join(directory);
+        fs::create_dir(&target).unwrap();
+        fs::set_permissions(&target, fs::Permissions::from_mode(0o775)).unwrap();
+        fs::write(target.join("git.md"), "own").unwrap();
+        let out = f.ok(&["run", "Work"]);
+        let stderr = String::from_utf8_lossy(&out.stderr);
+        assert!(
+            stderr.contains(&format!("{directory}/git.md")) && stderr.contains("existing content"),
+            "{directory}: {stderr}"
+        );
+        assert_eq!(
+            fs::read_link(target.join("review.md")).unwrap(),
+            library.join("review.md")
+        );
+        assert_eq!(fs::read_link(target.join("deploy.md")).unwrap(), solo);
+        assert_eq!(fs::read_to_string(target.join("git.md")).unwrap(), "own");
+        assert_eq!(
+            fs::metadata(&target).unwrap().permissions().mode() & 0o777,
+            0o700
+        );
+        for skipped in [".hidden.md", "notes.txt", "nested.md", "alias.md"] {
+            assert!(
+                fs::symlink_metadata(target.join(skipped)).is_err(),
+                "{directory}/{skipped}"
+            );
+        }
+        let paths: Vec<_> = f.state()["links"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|l| l["path"].as_str().unwrap().to_owned())
+            .collect();
+        assert_eq!(
+            paths,
+            [
+                format!("{directory}/deploy.md"),
+                format!("{directory}/review.md")
+            ]
+        );
+        f.ok(&["set", "unsubscribe", "Work", "core"]);
+        f.ok(&["run", "Work"]);
+        assert!(fs::symlink_metadata(target.join("review.md")).is_err());
+        assert!(fs::symlink_metadata(target.join("deploy.md")).is_err());
+        assert_eq!(fs::read_to_string(target.join("git.md")).unwrap(), "own");
+        assert_eq!(
+            fs::read_to_string(library.join("review.md")).unwrap(),
+            "# review.md"
+        );
+        assert!(solo.exists());
+        assert_eq!(f.state()["links"], json!([]));
+    }
+}
+
+#[test]
+fn agent_command_and_style_items_are_listed_validated_and_conflict() {
+    for (one, many, directory, kind, source_kind) in MARKDOWN_KINDS {
+        let f = Fixture::new();
+        let library = fragments(&f, "library", &["review.md", "notes.txt"]);
+        let other = fragments(&f, "other", &["review.md"]);
+        f.ok(&["set", "create", "core"]);
+        f.ok(&["set", "create", "extra"]);
+        // Single items must be existing regular .md files; sources directories.
+        f.fails(
+            &["set", "add", "core", one, s(&library.join("notes.txt"))],
+            "usage",
+        );
+        f.fails(&["set", "add", "core", one, s(&library)], "usage");
+        fs::create_dir(library.join("dir.md")).unwrap();
+        f.fails(
+            &["set", "add", "core", one, s(&library.join("dir.md"))],
+            "not_found",
+        );
+        f.fails(
+            &["set", "add", "core", one, s(&library.join("absent.md"))],
+            "not_found",
+        );
+        f.fails(
+            &["set", "add", "core", many, s(&library.join("review.md"))],
+            "not_found",
+        );
+        f.ok(&["set", "add", "core", many, s(&library)]);
+        f.ok(&["set", "add", "extra", one, s(&other.join("review.md"))]);
+        assert_eq!(
+            f.sets(),
+            json!([
+                {"name":"core","default":false,
+                 "items":[{"kind":source_kind,"value":s(&library)}],
+                 "subscribers":[]},
+                {"name":"extra","default":false,
+                 "items":[{"kind":kind,"value":s(&other.join("review.md"))}],
+                 "subscribers":[]}
+            ])
+        );
+        let text = String::from_utf8(f.ok(&["set", "list"]).stdout).unwrap();
+        assert!(
+            text.contains(&format!("{source_kind}:{}", library.display()))
+                && text.contains(&format!("{kind}:{}", other.join("review.md").display())),
+            "{text}"
+        );
+        f.ok(&["add", "Work", "--no-sets"]);
+        f.ok(&["set", "subscribe", "Work", "core"]);
+        let out = f.fails(&["set", "subscribe", "Work", "extra"], "collision");
+        assert!(
+            String::from_utf8_lossy(&out.stderr).contains(&format!("{directory}/review.md")),
+            "{directory}"
+        );
+        f.ok(&["set", "drop", "core", many, s(&library)]);
+        assert_eq!(f.sets()[0]["items"], json!([]));
+    }
+}
+
+#[test]
+fn upstream_and_alias_get_no_agents_commands_or_styles_and_purge_unlinks_without_following() {
+    let f = Fixture::new();
+    let library = fragments(&f, "library", &["review.md"]);
+    f.ok(&["set", "create", "core", "--default"]);
+    for (_, many, _, _, _) in MARKDOWN_KINDS {
+        f.ok(&["set", "add", "core", many, s(&library)]);
+    }
+    let upstream = f.home.join(".ccm/profiles/up");
+    fs::create_dir_all(&upstream).unwrap();
+    f.ok(&["register", "up", "--path", s(&upstream)]);
+    f.ok(&["set", "subscribe", "up", "core"]);
+    f.ok(&["run", "up"]);
+    f.ok(&["add", "personal", "--link-default"]);
+    f.ok(&["run", "personal"]);
+    f.ok(&["add", "Work"]);
+    f.ok(&["run", "Work"]);
+    for (_, _, directory, _, _) in MARKDOWN_KINDS {
+        assert!(!upstream.join(directory).exists(), "{directory}");
+        assert!(
+            !f.home.join(".claude").join(directory).exists(),
+            "{directory}"
+        );
+        let link = f.profile("Work").join(directory).join("review.md");
+        assert_eq!(fs::read_link(&link).unwrap(), library.join("review.md"));
+    }
+    assert_eq!(f.state()["links"].as_array().unwrap().len(), 3);
+    f.ok(&["remove", "Work", "--purge", "--yes"]);
+    assert!(!f.profile("Work").exists());
+    assert_eq!(
+        fs::read_to_string(library.join("review.md")).unwrap(),
+        "# review.md"
+    );
+    assert_eq!(f.state()["links"], json!([]));
 }

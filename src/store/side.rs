@@ -94,6 +94,12 @@ pub enum ItemKind {
     Instruction,
     InstructionSource,
     Plugin,
+    Agent,
+    AgentSource,
+    Command,
+    CommandSource,
+    OutputStyle,
+    OutputStyleSource,
 }
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
@@ -544,6 +550,58 @@ mod tests {
         assert_eq!(sets, SetsFile::empty(&store.root_id));
         assert!(!sets.plugin_auto_update);
         assert!(!f.root.join(STATE).exists() && !f.root.join(SETS).exists());
+    }
+
+    #[test]
+    fn sets_written_before_agent_command_and_style_kinds_still_read() {
+        let f = Fixture::new();
+        let root_id = f.open(OpenMode::Read).unwrap().root_id.clone();
+        let old = format!(
+            r#"{{"schema_version":1,"root_id":"{root_id}","sets":[{{"name":"core","default":true,"items":[
+                {{"kind":"skill","value":"/s/a"}},{{"kind":"skill_source","value":"/s"}},
+                {{"kind":"instruction","value":"/n/a.md"}},{{"kind":"instruction_source","value":"/n"}},
+                {{"kind":"plugin","value":"p@m"}}]}}],"subscriptions":[],"plugin_auto_update":false}}"#
+        );
+        fs::write(f.root.join(SETS), old).unwrap();
+        fs::set_permissions(f.root.join(SETS), fs::Permissions::from_mode(0o600)).unwrap();
+        let store = f.open(OpenMode::Read).unwrap();
+        let kinds: Vec<ItemKind> = store.read_sets().unwrap().sets[0]
+            .items
+            .iter()
+            .map(|i| i.kind)
+            .collect();
+        assert_eq!(
+            kinds,
+            [
+                ItemKind::Skill,
+                ItemKind::SkillSource,
+                ItemKind::Instruction,
+                ItemKind::InstructionSource,
+                ItemKind::Plugin
+            ]
+        );
+        let names: Vec<_> = [
+            ItemKind::Agent,
+            ItemKind::AgentSource,
+            ItemKind::Command,
+            ItemKind::CommandSource,
+            ItemKind::OutputStyle,
+            ItemKind::OutputStyleSource,
+        ]
+        .iter()
+        .map(|k| serde_json::to_string(k).unwrap())
+        .collect();
+        assert_eq!(
+            names,
+            [
+                "\"agent\"",
+                "\"agent_source\"",
+                "\"command\"",
+                "\"command_source\"",
+                "\"output_style\"",
+                "\"output_style_source\""
+            ]
+        );
     }
 
     #[test]
