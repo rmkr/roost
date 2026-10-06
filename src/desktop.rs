@@ -53,18 +53,61 @@ pub fn run(name: Option<&str>, foreground: bool) -> Result<i32> {
             let registration = store.find(name, false)?.clone();
             (store, registration)
         }
-        None => {
-            let store = crate::select::open_launch(&root)?;
-            crate::select::choose(
-                store,
-                &root,
-                "Choose a profile for Claude Desktop",
-                no_terminal,
-                picker_rows,
-            )?
-        }
+        None => picker(&root, no_terminal)?,
     };
     start(store, registration, foreground)
+}
+
+/// The Desktop picker: Enter returns the choice; `x` closes the highlighted row's
+/// running Desktop, reports the outcome above the list and shows it again (with
+/// fresh Desktop states) on the same row.
+fn picker(root: &Path, no_terminal: impl Fn() -> Error) -> Result<(Store, Registration)> {
+    use crate::select::{Actions, Choice};
+    let mut initial = None;
+    loop {
+        let store = crate::select::open_launch(root)?;
+        let actions = Actions {
+            hint: "↑/↓, Enter launch, x close, Esc cancel",
+            keys: &['x'],
+            initial,
+        };
+        match crate::select::choose_with(
+            store,
+            root,
+            "Choose a profile for Claude Desktop",
+            Some(actions),
+            &no_terminal,
+            picker_rows,
+        )? {
+            Choice::Chosen(store, registration) => return Ok((*store, registration)),
+            Choice::Action(listed, index) => {
+                initial = Some(index);
+                let store = Store::open(root, false, OpenMode::Read)?;
+                let current = store
+                    .registry
+                    .registrations
+                    .iter()
+                    .find(|r| r.registration_id == listed.registration_id)
+                    .cloned();
+                let outcome = match current {
+                    Some(current) if current == listed => close_registration(store, &current),
+                    _ => Err(Error::new(
+                        "ownership",
+                        "Profile changed while the picker was open",
+                    )),
+                };
+                match outcome {
+                    Ok(line) => eprintln!("{line}"),
+                    Err(e) => {
+                        eprintln!("{}: {}", e.code, e.message);
+                        if let Some(step) = &e.next_step {
+                            eprintln!("Next: {step}");
+                        }
+                    }
+                }
+            }
+        }
+    }
 }
 
 /// The registration (if any) borrowing the conventional Desktop folder.
@@ -473,12 +516,7 @@ fn close_registration(store: Store, registration: &Registration) -> Result<Strin
             .and_then(|(_, lock)| lock)
     };
     drop(store);
-    let not_running = || {
-        format!(
-            "Claude Desktop is not running for {}",
-            registration.name
-        )
-    };
+    let not_running = || format!("Claude Desktop is not running for {}", registration.name);
     let Some(target) = lock.filter(|target| linux::live_lock(target, host.as_deref())) else {
         return Ok(not_running());
     };
@@ -661,11 +699,15 @@ mod linux {
         };
         // The pidfd pins this process: if it exits and the PID is reused after the
         // checks below, signalling fails instead of reaching the newcomer.
-        let pidfd = match pidfd_open(Pid::from_raw(pid).expect("positive"), PidfdFlags::empty())
-        {
+        let pidfd = match pidfd_open(Pid::from_raw(pid).expect("positive"), PidfdFlags::empty()) {
             Ok(fd) => fd,
             Err(rustix::io::Errno::SRCH) => return Ok(false),
-            Err(_) => return Err(Error::new("io", "Cannot inspect the Claude Desktop process")),
+            Err(_) => {
+                return Err(Error::new(
+                    "io",
+                    "Cannot inspect the Claude Desktop process",
+                ));
+            }
         };
         if !runs_program(pid, program) {
             return Err(Error::new(
@@ -685,7 +727,9 @@ mod linux {
                     "ownership",
                     format!("Cannot signal Claude Desktop for {name} (process {pid})"),
                 )
-                .next(format!("Quit Claude Desktop for {name} from its own window or menu")));
+                .next(format!(
+                    "Quit Claude Desktop for {name} from its own window or menu"
+                )));
             }
         }
         let deadline = Instant::now() + CLOSE_WAIT;
@@ -816,6 +860,18 @@ mod tests {
         assert!(!linux::live_lock(
             Path::new(&format!("my-host-{dead}")),
             host
+        ));
+    }
+
+    #[test]
+    fn a_process_runs_the_program_only_by_its_canonical_executable() {
+        let me = std::process::id() as libc::pid_t;
+        let exe = std::env::current_exe().unwrap();
+        assert!(linux::runs_program(me, &exe));
+        assert!(!linux::runs_program(me, Path::new("/bin/sleep")));
+        assert!(!linux::runs_program(
+            me,
+            Path::new("/nonexistent/claude-desktop")
         ));
     }
 }

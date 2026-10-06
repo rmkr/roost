@@ -300,6 +300,37 @@ pub(crate) fn choose(
     no_terminal: impl FnOnce() -> Error,
     render: impl FnOnce(&Store, &mut [Value]) -> (Vec<String>, usize),
 ) -> Result<(Store, Registration)> {
+    match choose_with(store, root, title, None, no_terminal, render)? {
+        Choice::Chosen(store, registration) => Ok((*store, registration)),
+        Choice::Action(..) => unreachable!("no action keys"),
+    }
+}
+
+/// Extra picker keys for `choose_with`: the hint after the title, the action keys,
+/// and a starting row that overrides `render`'s (to stay on the acted-on row).
+pub(crate) struct Actions<'a> {
+    pub hint: &'a str,
+    pub keys: &'a [char],
+    pub initial: Option<usize>,
+}
+
+/// A `choose_with` result: the revalidated choice with the store reacquired, or an
+/// action key pressed on a row (the registration as listed, the row index), with
+/// the store released for the caller to act and show the picker again.
+pub(crate) enum Choice {
+    Chosen(Box<Store>, Registration),
+    Action(Registration, usize),
+}
+
+/// `choose` with optional action keys.
+pub(crate) fn choose_with(
+    store: Store,
+    root: &Path,
+    title: &str,
+    actions: Option<Actions>,
+    no_terminal: impl FnOnce() -> Error,
+    render: impl FnOnce(&Store, &mut [Value]) -> (Vec<String>, usize),
+) -> Result<Choice> {
     let active = store
         .registry
         .registrations
@@ -329,7 +360,20 @@ pub(crate) fn choose(
     let (lines, initial) = render(&store, &mut records);
     let root_id = store.root_id.clone();
     drop(store);
-    let index = platform::pick(title, &lines[0], &lines[1..=records.len()], initial)?;
+    let rows = &lines[1..=records.len()];
+    let index = match actions {
+        None => platform::pick(title, &lines[0], rows, initial)?,
+        Some(actions) => {
+            let initial = actions.initial.unwrap_or(initial);
+            match platform::pick_with(title, actions.hint, &lines[0], rows, initial, actions.keys)?
+            {
+                platform::Picked::Chosen(index) => index,
+                platform::Picked::Action(_, index) => {
+                    return Ok(Choice::Action(choices[index].clone(), index));
+                }
+            }
+        }
+    };
     let chosen = &choices[index];
     let store = open_launch(root)?;
     let current = store
@@ -343,7 +387,7 @@ pub(crate) fn choose(
                 .next("Repeat the command to choose from the current profiles"),
         );
     }
-    Ok((store, chosen.clone()))
+    Ok(Choice::Chosen(Box::new(store), chosen.clone()))
 }
 
 /// `roost switch`: select NAME (or, without NAME, the picker's choice) for this

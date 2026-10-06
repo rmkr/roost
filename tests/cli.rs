@@ -1405,7 +1405,10 @@ fn desktop_close_terminates_the_verified_desktop_and_is_a_noop_when_not_running(
     assert!(alive(pid));
     let out = f.ok(&["desktop", "--close", "Work"]);
     let stdout = String::from_utf8_lossy(&out.stdout);
-    assert!(stdout.contains("Closed Claude Desktop for Work"), "{stdout}");
+    assert!(
+        stdout.contains("Closed Claude Desktop for Work"),
+        "{stdout}"
+    );
     assert!(!alive(pid));
     assert!(!f.desktop_folder("Work").join("SingletonLock").exists());
     // Not running (any more, or never launched): a success that says so.
@@ -1455,7 +1458,10 @@ fn desktop_close_reports_a_desktop_that_ignores_sigterm_and_never_escalates() {
         &f,
         "Work",
         &f.desktop_folder("Work"),
-        &[("FAKE_DESKTOP_TERM", "ignore"), ("FAKE_DESKTOP_SECONDS", "40")],
+        &[
+            ("FAKE_DESKTOP_TERM", "ignore"),
+            ("FAKE_DESKTOP_SECONDS", "40"),
+        ],
     );
     let started = std::time::Instant::now();
     let out = f.run(&["desktop", "--close", "Work"]);
@@ -1465,7 +1471,10 @@ fn desktop_close_reports_a_desktop_that_ignores_sigterm_and_never_escalates() {
     let stderr = String::from_utf8_lossy(&out.stderr);
     assert_eq!(out.status.code(), Some(1), "{stderr}");
     assert!(stderr.contains("desktop_running"), "{stderr}");
-    assert!(stderr.contains("still running after 10 seconds"), "{stderr}");
+    assert!(
+        stderr.contains("still running after 10 seconds"),
+        "{stderr}"
+    );
     assert!(survived, "Roost must not force-kill");
     assert!(waited >= std::time::Duration::from_secs(10), "{waited:?}");
     assert!(waited < std::time::Duration::from_secs(20), "{waited:?}");
@@ -1936,8 +1945,18 @@ for cwd,args,keys in json.loads(cases):
         env={'ROOST_DIR':root,'HOME':home,'PATH':binpath+':/usr/bin:/bin'}
         env.update(json.loads(extra))
         os.execve(exe,[exe]+args,env)
-    data=b'';sent=False;deadline=time.monotonic()+10
+    data=b'';queue=None;mark=0;deadline=time.monotonic()+20
     while time.monotonic()<deadline:
+        if queue is None and b'Choose a profile' in data:
+            time.sleep(0.1);queue=list(keys);mark=len(data)
+        # A `WAIT:TEXT` step waits until TEXT arrives after the previous step.
+        while queue:
+            if queue[0].startswith('WAIT:'):
+                at=data.find(queue[0][5:].encode(),mark)
+                if at<0:break
+                mark=at+len(queue[0])-5;queue.pop(0)
+            else:
+                os.write(fd,queue.pop(0).encode('latin-1'));time.sleep(0.1);mark=len(data)
         if not select.select([fd],[],[],0.1)[0]:continue
         try:chunk=os.read(fd,65536)
         except OSError as e:
@@ -1945,11 +1964,6 @@ for cwd,args,keys in json.loads(cases):
             raise
         if not chunk:break
         data+=chunk
-        if not sent and b'Choose a profile' in data:
-            time.sleep(0.1)
-            for key in keys:
-                os.write(fd,key.encode('latin-1'));time.sleep(0.1)
-            sent=True
     else:
         os.kill(pid,9);raise RuntimeError('PTY deadline exceeded: %r'%data)
     os.close(fd);_,status=os.waitpid(pid,0)
@@ -2298,6 +2312,81 @@ fn desktop_picker_marks_and_refuses_a_running_profile_and_cancels_with_130() {
     }
     assert_eq!(f.desktop_launches().len(), 1);
     assert_eq!(fs::read(f.root.join("state.json")).unwrap(), state);
+}
+
+#[test]
+fn desktop_picker_x_closes_a_running_row_and_stays_open_with_the_row_refreshed() {
+    let f = Fixture::new();
+    f.add("Work");
+    f.add("Home");
+    f.ok(&["desktop", "--foreground", "Work"]);
+    let pid = running_desktop(&f, "Work", &f.desktop_folder("Work"), &[]);
+    // The highlight starts on Work, the last Desktop launch.
+    let result = desktop_picker(
+        &f,
+        &[],
+        &[
+            "x",
+            "WAIT:Closed Claude Desktop for Work",
+            "WAIT:Choose a profile",
+            "\x1b",
+        ],
+    );
+    let text = result["text"].as_str().unwrap();
+    assert_eq!(result["exit"], 130, "{text}");
+    assert!(
+        text.contains("↑/↓, Enter launch, x close, Esc cancel"),
+        "{text}"
+    );
+    assert!(!alive(pid));
+    // The first frame showed it running; the redrawn row no longer does.
+    assert!(text.contains("running"), "{text}");
+    let row = picker_row(text, "Work");
+    assert!(
+        row.contains("signed in") && !row.contains("running"),
+        "{text}"
+    );
+    assert_eq!(f.desktop_launches().len(), 2);
+}
+
+#[test]
+fn desktop_picker_x_on_a_row_that_is_not_running_only_says_so() {
+    let f = Fixture::new();
+    f.add("Work");
+    f.add("Home");
+    f.ok(&["desktop", "--foreground", "Work"]);
+    let state = fs::read(f.root.join("state.json")).unwrap();
+    let result = desktop_picker(
+        &f,
+        &[],
+        &[
+            "k",
+            "x",
+            "WAIT:Claude Desktop is not running for Home",
+            "WAIT:Choose a profile",
+            "\x1b",
+        ],
+    );
+    let text = result["text"].as_str().unwrap();
+    assert_eq!(result["exit"], 130, "{text}");
+    assert_eq!(f.desktop_launches().len(), 1);
+    assert_eq!(fs::read(f.root.join("state.json")).unwrap(), state);
+}
+
+#[test]
+fn other_pickers_ignore_x_and_keep_their_footer() {
+    let f = Fixture::new();
+    f.add("Work");
+    let a = repo(&f, "a");
+    let results = pty_session(&f, &[], &[(&a, &["switch"], &["x", "\r"])]);
+    let text = results[0]["text"].as_str().unwrap();
+    assert_eq!(results[0]["exit"], 0, "{text}");
+    assert!(text.contains("(↑/↓, Enter; Esc cancels)"), "{text}");
+    assert!(!text.contains("x close"), "{text}");
+    assert_eq!(
+        results[0]["launched"],
+        json!(f.root.join("profiles/Work").to_str().unwrap())
+    );
 }
 
 #[test]

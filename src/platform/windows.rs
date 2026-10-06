@@ -135,6 +135,16 @@ pub fn confirm(_: &str, _: bool) -> Result<()> {
 pub fn pick(_: &str, _: &str, _: &[String], _: usize) -> Result<usize> {
     Err(unavailable())
 }
+pub fn pick_with(
+    _: &str,
+    _: &str,
+    _: &str,
+    _: &[String],
+    _: usize,
+    _: &[char],
+) -> Result<super::Picked> {
+    Err(unavailable())
+}
 pub fn setup_path(_: &Path, _: Option<&str>, _: bool) -> Result<Vec<String>> {
     Err(Error::new(
         "io",

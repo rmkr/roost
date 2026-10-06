@@ -724,6 +724,8 @@ enum Key {
     Down,
     Choose,
     Cancel,
+    /// An ASCII letter or digit with no built-in meaning.
+    Letter(char),
     Other,
 }
 
@@ -749,6 +751,7 @@ fn decode_key(bytes: &[u8]) -> Option<(Key, usize)> {
         [b'j', ..] => (Key::Down, 1),
         [b'\r' | b'\n', ..] => (Key::Choose, 1),
         [b'q' | 3 | 4, ..] => (Key::Cancel, 1),
+        [b, ..] if b.is_ascii_alphanumeric() => (Key::Letter(char::from(*b)), 1),
         [_, ..] => (Key::Other, 1),
     })
 }
@@ -786,12 +789,19 @@ fn read_ready(descriptor: libc::c_int, timeout: libc::c_int) -> Result<Option<Ve
 /// reverse video. Rows may carry `ls` styles; reverse video is re-applied after
 /// each embedded reset so the highlight spans the whole row. Later frames first
 /// move the cursor back over the previous one.
-fn picker_frame(title: &str, header: &str, rows: &[String], current: usize, first: bool) -> String {
+fn picker_frame(
+    title: &str,
+    hint: &str,
+    header: &str,
+    rows: &[String],
+    current: usize,
+    first: bool,
+) -> String {
     let mut text = String::new();
     if !first {
         text.push_str(&format!("\x1b[{}A", rows.len() + 2));
     }
-    text.push_str(&format!("\r\x1b[2K{title} (↑/↓, Enter; Esc cancels)\n"));
+    text.push_str(&format!("\r\x1b[2K{title} ({hint})\n"));
     text.push_str(&format!("\r\x1b[2K  {header}\n"));
     for (index, row) in rows.iter().enumerate() {
         if index == current {
@@ -808,6 +818,24 @@ fn picker_frame(title: &str, header: &str, rows: &[String], current: usize, firs
 /// or k/j move, Enter chooses; Ctrl-C, Esc, `q` or EOF cancel (exit 130). The
 /// terminal mode is restored and the list erased on every exit.
 pub fn pick(title: &str, header: &str, rows: &[String], initial: usize) -> Result<usize> {
+    match pick_with(title, "↑/↓, Enter; Esc cancels", header, rows, initial, &[])? {
+        super::Picked::Chosen(index) => Ok(index),
+        super::Picked::Action(..) => unreachable!("no action keys"),
+    }
+}
+
+/// `pick` with a custom `hint` after the title and extra `actions` keys: pressing
+/// one ends the picker (restoring the terminal and erasing the list, like a
+/// choice) with that key and the highlighted row, so the caller can act and show
+/// the picker again.
+pub fn pick_with(
+    title: &str,
+    hint: &str,
+    header: &str,
+    rows: &[String],
+    initial: usize,
+    actions: &[char],
+) -> Result<super::Picked> {
     if rows.is_empty() {
         return Err(Error::new("not_found", "Nothing to choose from"));
     }
@@ -834,7 +862,8 @@ pub fn pick(title: &str, header: &str, rows: &[String], initial: usize) -> Resul
     };
     let mut out = std::io::stderr();
     let height = rows.len() + 2;
-    let draw = |current: usize, first: bool| picker_frame(title, header, rows, current, first);
+    let draw =
+        |current: usize, first: bool| picker_frame(title, hint, header, rows, current, first);
     let mut current = initial.min(rows.len() - 1);
     let _ = write!(out, "\x1b[?25l{}", draw(current, true));
     let _ = out.flush();
@@ -859,9 +888,12 @@ pub fn pick(title: &str, header: &str, rows: &[String], initial: usize) -> Resul
             match key {
                 Key::Up => current = current.saturating_sub(1),
                 Key::Down => current = (current + 1).min(rows.len() - 1),
-                Key::Choose => chosen = Some(Ok(current)),
+                Key::Choose => chosen = Some(Ok(super::Picked::Chosen(current))),
                 Key::Cancel => chosen = Some(Err(Error::cancelled())),
-                Key::Other => (),
+                Key::Letter(letter) if actions.contains(&letter) => {
+                    chosen = Some(Ok(super::Picked::Action(letter, current)));
+                }
+                Key::Letter(_) | Key::Other => (),
             }
             if chosen.is_some() {
                 break;
@@ -895,14 +927,14 @@ mod tests {
             "\x1b[1mHome\x1b[0m  \x1b[32m✓\x1b[0m".to_owned(),
             "\x1b[1mWork\x1b[0m  –".to_owned(),
         ];
-        let frame = picker_frame("Choose", "Profile", &rows, 1, true);
+        let frame = picker_frame("Choose", "↑/↓", "Profile", &rows, 1, true);
         let lines: Vec<&str> = frame.split('\n').collect();
         assert_eq!(lines[2], "\r\x1b[2K  \x1b[1mHome\x1b[0m  \x1b[32m✓\x1b[0m");
         assert_eq!(
             lines[3],
             "\r\x1b[2K\x1b[7m> \x1b[1mWork\x1b[0m\x1b[7m  –\x1b[0m"
         );
-        assert!(picker_frame("Choose", "Profile", &rows, 0, false).starts_with("\x1b[4A"));
+        assert!(picker_frame("Choose", "↑/↓", "Profile", &rows, 0, false).starts_with("\x1b[4A"));
     }
     #[test]
     fn copy_excludes_sensitive_and_linked_objects_at_depth() {

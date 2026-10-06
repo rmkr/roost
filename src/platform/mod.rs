@@ -267,3 +267,10 @@ mod tests {
         assert!(valid_name("ordinary\\file").is_ok());
     }
 }
+
+/// What a picker returned: a chosen row, or an action key pressed on a row.
+#[derive(Debug, PartialEq, Eq)]
+pub enum Picked {
+    Chosen(usize),
+    Action(char, usize),
+}
