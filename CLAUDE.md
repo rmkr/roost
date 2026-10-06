@@ -44,6 +44,20 @@ Key invariants that cut across modules:
 - Token values never go on the command line, into errors, or into logs.
 - Launch-time side effects (selection/last use, link and settings reconciliation, plugin auto-update and injection) warn and never block the launch.
 
-## Planning tracker
+## Planning archive
 
-Work is tracked in GitHub issues on `rmkr/roost`: a spec is a parent issue, its tickets are sub-issues, and order uses GitHub's "blocked by" relations. PRs close their issues. `.scratch/` is a read-only archive of the completed rust-port and workflow-ux efforts (Markdown tracker conventions in `.scratch/README.md`); workflow-ux decisions are in `.scratch/workflow-ux/design.md` and ADRs in `docs/adr/`.
+`.scratch/` is a read-only archive of the completed rust-port and workflow-ux efforts (Markdown tracker conventions in `.scratch/README.md`); workflow-ux decisions are in `.scratch/workflow-ux/design.md` and ADRs in `docs/adr/`.
+
+## Agent skills
+
+### Issue tracker
+
+GitHub issues on `rmkr/roost`: a spec is a parent issue, its tickets are sub-issues, order uses GitHub's "blocked by" relations, and PRs close their issues. See `docs/agents/issue-tracker.md`.
+
+### Triage labels
+
+The five default triage labels (`needs-triage`, `needs-info`, `ready-for-agent`, `ready-for-human`, `wontfix`). See `docs/agents/triage-labels.md`.
+
+### Domain docs
+
+Single-context: `GLOSSARY.md` and `docs/adr/` at the repo root. See `docs/agents/domain.md`.
