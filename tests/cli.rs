@@ -997,3 +997,81 @@ print(json.dumps(results))
         ])
     );
 }
+
+fn launched(output: &Output) -> Value {
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    parsed(output)
+}
+
+#[test]
+fn switch_selects_per_project_and_bare_roost_launches_it() {
+    let f = Fixture::new();
+    f.add("Work");
+    f.add("Home");
+    let project = f.path.join("app");
+    fs::create_dir(&project).unwrap();
+    let selected = f
+        .command()
+        .current_dir(&project)
+        .args(["switch", "--no-launch", "work"])
+        .output()
+        .unwrap();
+    assert!(selected.status.success(), "{selected:?}");
+    let probe = launched(
+        &f.command()
+            .current_dir(&project)
+            .args(["--", "--help", "-p", ""])
+            .output()
+            .unwrap(),
+    );
+    assert_eq!(probe["arguments"], json!(["--help", "-p", ""]));
+    assert_eq!(
+        probe["env"]["CLAUDE_CONFIG_DIR"],
+        json!(f.root.join("profiles/Work").to_str().unwrap())
+    );
+    // Another directory has no selection and no terminal: usage, never a picker.
+    let other = f.run(&[]);
+    assert_eq!(other.status.code(), Some(2));
+    let stderr = String::from_utf8_lossy(&other.stderr);
+    assert!(
+        stderr.contains("roost switch NAME") && stderr.contains("roost run NAME"),
+        "{stderr}"
+    );
+    // switch NAME launches like run and moves the selection.
+    let probe = launched(
+        &f.command()
+            .current_dir(&project)
+            .args(["switch", "Home", "--", "--", "x"])
+            .output()
+            .unwrap(),
+    );
+    assert_eq!(probe["arguments"], json!(["--", "x"]));
+    let probe = launched(&f.command().current_dir(&project).output().unwrap());
+    assert_eq!(
+        probe["env"]["CLAUDE_CONFIG_DIR"],
+        json!(f.root.join("profiles/Home").to_str().unwrap())
+    );
+    // Forget clears; forgetting again still succeeds.
+    for _ in 0..2 {
+        let out = f
+            .command()
+            .current_dir(&project)
+            .args(["switch", "--forget"])
+            .output()
+            .unwrap();
+        assert!(out.status.success(), "{out:?}");
+    }
+    assert_eq!(
+        f.command()
+            .current_dir(&project)
+            .output()
+            .unwrap()
+            .status
+            .code(),
+        Some(2)
+    );
+}
