@@ -653,7 +653,10 @@ enum Recorded {
     Replaced,
 }
 
-/// Opens an existing link directory of an owned profile without following links.
+/// Opens an existing link directory of an owned profile without following links,
+/// tightening it to 0700 through the verified handle when Claude created it
+/// group-writable (umask 002), so its namespace passes the link-safety check.
+/// Only ever called with owned profiles; borrowed data is never touched.
 fn link_directory(profile: &Directory, name: &str) -> Result<Option<Directory>> {
     let Some(entry) = profile.entry(name)? else {
         return Ok(None);
@@ -671,6 +674,7 @@ fn link_directory(profile: &Directory, name: &str) -> Result<Option<Directory>> 
             format!("{} changed while opening", directory.path.display()),
         ));
     }
+    directory.restrict_to_owner()?;
     Ok(Some(directory))
 }
 

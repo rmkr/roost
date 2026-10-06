@@ -169,6 +169,28 @@ impl Directory {
         file_identity(&self.file)
     }
 
+    /// Tightens a group- or world-writable directory that the caller owns to 0700
+    /// through this already-open handle (fchmod, never a path). Only for directories
+    /// inside Roost-owned profiles, such as `skills/` that Claude created under umask
+    /// 002; borrowed data is never passed here. Another owner is ownership.
+    pub(crate) fn restrict_to_owner(&self) -> Result<()> {
+        let metadata = self
+            .file
+            .metadata()
+            .map_err(|e| Error::io("inspect directory", &self.path, e))?;
+        if metadata.uid() != rustix::process::geteuid().as_raw() {
+            return Err(Error::new(
+                "ownership",
+                format!("Not owned by the current user: {}", self.path.display()),
+            ));
+        }
+        if metadata.mode() & 0o022 != 0 {
+            fs::fchmod(&self.file, Mode::from_raw_mode(0o700))
+                .map_err(|e| native_error("restrict directory", &self.path, e))?;
+        }
+        Ok(())
+    }
+
     pub fn entries(&self) -> Result<Vec<String>> {
         let directory = fs::Dir::read_from(&self.file)
             .map_err(|e| native_error("read directory", &self.path, e))?;

@@ -26,6 +26,9 @@ impl Directory {
     pub fn identity(&self) -> Result<FileIdentity> {
         Err(unavailable())
     }
+    pub(crate) fn restrict_to_owner(&self) -> Result<()> {
+        Err(unavailable())
+    }
     pub fn entries(&self) -> Result<Vec<String>> {
         Err(unavailable())
     }

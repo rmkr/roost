@@ -263,7 +263,8 @@ fn launch_links_subscribed_skills_and_removes_only_recorded_links() {
     f.ok(&["add", "Work"]);
     let skills = f.profile("Work").join("skills");
     fs::create_dir(&skills).unwrap();
-    fs::set_permissions(&skills, fs::Permissions::from_mode(0o755)).unwrap();
+    // Claude creates skills/ group-writable under umask 002; Roost tightens it.
+    fs::set_permissions(&skills, fs::Permissions::from_mode(0o775)).unwrap();
     // Existing content wins; unrecorded foreign links are never touched.
     fs::create_dir(skills.join("beta")).unwrap();
     symlink(&source, skills.join("foreign")).unwrap();
@@ -281,6 +282,10 @@ fn launch_links_subscribed_skills_and_removes_only_recorded_links() {
         source.join("alpha")
     );
     assert_eq!(fs::read_link(skills.join("gamma")).unwrap(), single);
+    assert_eq!(
+        fs::metadata(&skills).unwrap().permissions().mode() & 0o777,
+        0o700
+    );
     assert!(fs::symlink_metadata(skills.join("beta")).unwrap().is_dir());
     assert!(
         fs::symlink_metadata(skills.join("synced"))
@@ -362,6 +367,19 @@ fn upstream_and_alias_launches_receive_no_links() {
     f.ok(&["set", "subscribe", "up", "core"]);
     f.ok(&["run", "up"]);
     assert!(!upstream.join("skills").exists());
+    // Borrowed data keeps its permissions, even a group-writable skills/.
+    fs::create_dir(upstream.join("skills")).unwrap();
+    fs::set_permissions(upstream.join("skills"), fs::Permissions::from_mode(0o775)).unwrap();
+    f.ok(&["run", "up"]);
+    assert_eq!(
+        fs::metadata(upstream.join("skills"))
+            .unwrap()
+            .permissions()
+            .mode()
+            & 0o777,
+        0o775
+    );
+    assert_eq!(fs::read_dir(upstream.join("skills")).unwrap().count(), 0);
     f.ok(&["add", "personal", "--link-default"]);
     f.ok(&["run", "personal"]);
     assert!(!f.home.join(".claude/skills").exists());
@@ -519,7 +537,7 @@ fn launch_links_instruction_fragments_into_rules_and_unsubscribe_removes_them() 
     fs::write(profile.join("CLAUDE.md"), "mine").unwrap();
     let rules = profile.join("rules");
     fs::create_dir(&rules).unwrap();
-    fs::set_permissions(&rules, fs::Permissions::from_mode(0o755)).unwrap();
+    fs::set_permissions(&rules, fs::Permissions::from_mode(0o775)).unwrap();
     fs::write(rules.join("git.md"), "own rule").unwrap();
     let out = f.ok(&["run", "Work"]);
     let stderr = String::from_utf8_lossy(&out.stderr);
@@ -532,6 +550,10 @@ fn launch_links_instruction_fragments_into_rules_and_unsubscribe_removes_them() 
         notes.join("style.md")
     );
     assert_eq!(fs::read_link(rules.join("review.md")).unwrap(), solo);
+    assert_eq!(
+        fs::metadata(&rules).unwrap().permissions().mode() & 0o777,
+        0o700
+    );
     assert_eq!(
         fs::read_to_string(rules.join("git.md")).unwrap(),
         "own rule"
