@@ -15,7 +15,7 @@ use std::{
 };
 
 const PROBE_LIMIT: usize = 1024 * 1024;
-const PROBE_TIMEOUT: Duration = Duration::from_secs(10);
+pub(crate) const PROBE_TIMEOUT: Duration = Duration::from_secs(10);
 const AUTH_ENV: &[&str] = &[
     "ANTHROPIC_API_KEY",
     "ANTHROPIC_AUTH_TOKEN",
@@ -190,16 +190,11 @@ impl ProfileEnv {
         self.set(name, value);
         Ok(())
     }
-    /// Applies the variables to `command`, consuming any token value.
-    pub fn apply(self, command: &mut Command) {
-        for (name, value) in self.vars {
-            command.env(name, value);
-        }
-    }
-    /// A command for `program` with this environment applied.
+    /// A command for `program` with this environment applied, consuming any token
+    /// value.
     pub fn command(self, program: PathBuf) -> Command {
         let mut command = Command::new(program);
-        self.apply(&mut command);
+        command.envs(self.vars);
         command
     }
 }
@@ -237,34 +232,26 @@ pub fn profile_env(
             .next("Use roost reuse NAME before launching"));
     }
     store.validate(registration)?;
-    if registration.kind != Kind::DefaultAlias && !allow_auth_env {
+    if registration.kind == Kind::DefaultAlias {
+        return Ok(ProfileEnv::pass_through());
+    }
+    if !allow_auth_env {
         let conflicts = auth_conflicts(|name| env::var_os(name));
         if !conflicts.is_empty() {
             return Err(Error::new("auth_conflict", format!("Inherited authentication controls: {}", conflicts.join(", "))).next("Use direct roost run/status --allow-auth-env to accept caller authentication precedence"));
         }
     }
     // Even override validates token protection, but never reads unused secret bytes.
-    let token = if registration.kind != Kind::DefaultAlias {
-        let present = store.token_present(registration)?;
-        if present && !allow_auth_env {
-            store.token(registration)?
-        } else {
-            None
-        }
+    let token = if store.token_present(registration)? && !allow_auth_env {
+        store.token(registration)?
     } else {
         None
     };
-    if registration.kind == Kind::DefaultAlias {
-        return Ok(ProfileEnv::pass_through());
-    }
     let directory = registration
         .directory
         .as_ref()
         .ok_or_else(|| Error::new("ownership", "Isolated profile has no directory"))?;
-    Ok(ProfileEnv::isolated(
-        directory,
-        token.filter(|_| !allow_auth_env),
-    ))
+    Ok(ProfileEnv::isolated(directory, token))
 }
 
 /// Constructs the profile's Claude command only: callers must release the Store
@@ -313,11 +300,6 @@ fn resolve_in(name: &str, path: Option<OsString>) -> Result<PathBuf> {
     }))
 }
 
-struct Probe {
-    stdout: Vec<u8>,
-    exit: ExitStatus,
-}
-
 fn nonblocking(pipe: &impl std::os::fd::AsRawFd) -> io::Result<()> {
     // SAFETY: the live pipe owns this fd; fcntl does not retain the descriptor.
     let flags = unsafe { libc::fcntl(pipe.as_raw_fd(), libc::F_GETFL) };
@@ -349,7 +331,7 @@ fn capture(
     code: &'static str,
     timeout: Duration,
     limit: usize,
-) -> Result<Probe> {
+) -> Result<(Vec<u8>, ExitStatus)> {
     let deadline = Instant::now() + timeout;
     command
         .stdin(Stdio::null())
@@ -410,10 +392,7 @@ fn capture(
                 && stderr_done
                 && let Some(exit) = exit
             {
-                return Ok(Probe {
-                    stdout: output,
-                    exit,
-                });
+                return Ok((output, exit));
             }
             thread::sleep(Duration::from_millis(2));
         }
@@ -427,19 +406,13 @@ fn capture(
     result
 }
 
-pub(crate) fn bounded_probe(command: Command, code: &'static str) -> Result<(Vec<u8>, ExitStatus)> {
-    let probe = capture(command, code, PROBE_TIMEOUT, PROBE_LIMIT)?;
-    Ok((probe.stdout, probe.exit))
-}
-
-/// A captured probe with its own deadline (plugin auto-update); 1 MiB per stream.
-pub(crate) fn deadline_probe(
+/// A captured probe: stdout and exit status, within `timeout` and 1 MiB per stream.
+pub(crate) fn probe(
     command: Command,
     code: &'static str,
     timeout: Duration,
 ) -> Result<(Vec<u8>, ExitStatus)> {
-    let probe = capture(command, code, timeout, PROBE_LIMIT)?;
-    Ok((probe.stdout, probe.exit))
+    capture(command, code, timeout, PROBE_LIMIT)
 }
 
 fn parse_version(bytes: &[u8]) -> Option<String> {
@@ -465,14 +438,14 @@ fn version_at(path: &OsStr) -> Result<String> {
     // Deliberately starts from caller environment, never a profile command/token.
     let mut command = Command::new(path);
     command.arg("--version");
-    let probe = capture(command, "claude_unsupported", PROBE_TIMEOUT, PROBE_LIMIT)?;
-    if !probe.exit.success() {
+    let (stdout, exit) = probe(command, "claude_unsupported", PROBE_TIMEOUT)?;
+    if !exit.success() {
         return Err(Error::new(
             "claude_unsupported",
             "Claude version probe failed",
         ));
     }
-    parse_version(&probe.stdout).ok_or_else(|| {
+    parse_version(&stdout).ok_or_else(|| {
         Error::new(
             "claude_unsupported",
             "Claude version is unsupported or unrecognized",
@@ -561,10 +534,7 @@ fn recognized_status(
         warnings.push("Claude did not report a valid absolute configuration directory".to_owned());
     }
     let expected = if registration.kind == Kind::DefaultAlias {
-        match env::var_os("CLAUDE_CONFIG_DIR").filter(|value| !value.is_empty()) {
-            Some(value) => platform::absolute(Path::new(&value)).ok(),
-            None => platform::default_directory().ok(),
-        }
+        platform::claude_config_dir().ok()
     } else {
         registration.directory.clone()
     };
@@ -608,8 +578,8 @@ pub fn probe_all<K: Send>(
 pub fn status(mut command: Command, registration: &Registration) -> Result<Status> {
     version_at(command.get_program())?;
     command.args(["auth", "status"]);
-    let probe = capture(command, "auth_status", PROBE_TIMEOUT, PROBE_LIMIT)?;
-    recognized_status(&probe.stdout, probe.exit.code(), registration)
+    let (stdout, exit) = probe(command, "auth_status", PROBE_TIMEOUT)?;
+    recognized_status(&stdout, exit.code(), registration)
 }
 
 #[cfg(test)]
@@ -893,9 +863,10 @@ mod tests {
     fn captured_probes_drain_both_streams_and_bound_failure() {
         let mut command = Command::new("sh");
         command.args(["-c", "i=0; while [ $i -lt 2000 ]; do printf 'stdout-0123456789'; printf 'stderr-0123456789' >&2; i=$((i+1)); done"]);
-        let probe = capture(command, "auth_status", Duration::from_secs(3), 100_000).unwrap();
-        assert!(probe.exit.success());
-        assert_eq!(probe.stdout.len(), 17 * 2000);
+        let (stdout, exit) =
+            capture(command, "auth_status", Duration::from_secs(3), 100_000).unwrap();
+        assert!(exit.success());
+        assert_eq!(stdout.len(), 17 * 2000);
         let mut command = Command::new("sh");
         command.args(["-c", "while :; do printf 'too-large-secret'; done"]);
         let error = capture(command, "auth_status", Duration::from_secs(2), 100)

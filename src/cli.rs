@@ -396,44 +396,13 @@ fn parse_from(args: Vec<OsString>) -> std::result::Result<Action, clap::Error> {
     // Public run has one boundary: only switches before NAME are manager switches.
     // Clap's normal trailing arguments can still consume a known switch after NAME.
     if args.get(1).is_some_and(|v| v == "run") {
-        let mut index = 2;
-        let mut allow_auth_env = false;
-        loop {
-            let value = args.get(index).ok_or_else(|| usage("run requires NAME"))?;
-            if value == "--allow-auth-env" {
-                if allow_auth_env {
-                    return Err(usage("--allow-auth-env may be supplied only once"));
-                }
-                allow_auth_env = true;
-                index += 1;
-                continue;
-            }
-            if value == "--help" || value == "-h" {
-                return Cli::try_parse_from([
-                    OsString::from("roost"),
-                    OsString::from("run"),
-                    OsString::from("--help"),
-                ])
-                .map(|_| unreachable!());
-            }
-            let name = value
-                .to_str()
-                .ok_or_else(|| usage("profile NAME must be ASCII"))?;
-            if name.starts_with('-') {
-                return Err(usage(
-                    "unknown run manager option; manager options precede NAME",
-                ));
-            }
-            let mut tail = args[index + 1..].to_vec();
-            if tail.first().is_some_and(|v| v == OsStr::new("--")) {
-                tail.remove(0);
-            }
-            return Ok(Action::Run {
-                allow_auth_env,
-                name: name.into(),
-                arguments: tail,
-            });
-        }
+        let ([allow_auth_env], index) = manager_prefix(&args, ["--allow-auth-env"])?;
+        let value = args.get(index).ok_or_else(|| usage("run requires NAME"))?;
+        return Ok(Action::Run {
+            allow_auth_env,
+            name: profile_name(value, "run")?,
+            arguments: claude_tail(&args[index + 1..]),
+        });
     }
     if let Some(action) = parse_launch(&args)? {
         return Ok(action);
@@ -476,37 +445,59 @@ fn parse_launch(args: &[OsString]) -> std::result::Result<Option<Action>, clap::
     }))
 }
 
-/// `switch` shares run's single boundary: manager switches precede NAME and the
-/// tail after NAME (one optional `--` consumed) belongs to Claude.
-fn parse_switch(args: &[OsString]) -> std::result::Result<Action, clap::Error> {
-    let (mut allow_auth_env, mut no_launch, mut forget) = (false, false, false);
+/// Manager switches before NAME, shared by `run` and `switch`: each flag at most
+/// once, and `--help` goes back to clap. Returns the flags and NAME's index.
+fn manager_prefix<const N: usize>(
+    args: &[OsString],
+    flags: [&str; N],
+) -> std::result::Result<([bool; N], usize), clap::Error> {
+    let mut set = [false; N];
     let mut index = 2;
     while let Some(value) = args.get(index) {
-        let flag = if value == "--allow-auth-env" {
-            &mut allow_auth_env
-        } else if value == "--no-launch" {
-            &mut no_launch
-        } else if value == "--forget" {
-            &mut forget
-        } else if value == "--help" || value == "-h" {
+        if value == "--help" || value == "-h" {
             return Cli::try_parse_from([
                 OsString::from("roost"),
-                OsString::from("switch"),
+                args[1].clone(),
                 OsString::from("--help"),
             ])
             .map(|_| unreachable!());
-        } else {
+        }
+        let Some(flag) = flags.iter().position(|f| value == *f) else {
             break;
         };
-        if *flag {
-            return Err(usage(format!(
-                "{} may be supplied only once",
-                value.to_string_lossy()
-            )));
+        if set[flag] {
+            return Err(usage(format!("{} may be supplied only once", flags[flag])));
         }
-        *flag = true;
+        set[flag] = true;
         index += 1;
     }
+    Ok((set, index))
+}
+
+fn profile_name(value: &OsStr, command: &str) -> std::result::Result<String, clap::Error> {
+    let name = value
+        .to_str()
+        .ok_or_else(|| usage("profile NAME must be ASCII"))?;
+    if name.starts_with('-') {
+        return Err(usage(format!(
+            "unknown {command} manager option; manager options precede NAME"
+        )));
+    }
+    Ok(name.into())
+}
+
+/// The tail after NAME belongs to Claude, minus one leading `--`.
+fn claude_tail(tail: &[OsString]) -> Vec<OsString> {
+    tail.strip_prefix(&[OsString::from("--")][..])
+        .unwrap_or(tail)
+        .to_vec()
+}
+
+/// `switch` shares run's single boundary: manager switches precede NAME and the
+/// tail after NAME (one optional `--` consumed) belongs to Claude.
+fn parse_switch(args: &[OsString]) -> std::result::Result<Action, clap::Error> {
+    let ([allow_auth_env, no_launch, forget], index) =
+        manager_prefix(args, ["--allow-auth-env", "--no-launch", "--forget"])?;
     if [allow_auth_env, no_launch, forget]
         .into_iter()
         .filter(|v| *v)
@@ -524,32 +515,24 @@ fn parse_switch(args: &[OsString]) -> std::result::Result<Action, clap::Error> {
         }
         // No NAME: the picker chooses; the tail after `--` belongs to Claude.
         Some(value) if value == OsStr::new("--") => None,
-        Some(value) => {
-            let name = value
-                .to_str()
-                .ok_or_else(|| usage("profile NAME must be ASCII"))?;
-            if name.starts_with('-') {
-                return Err(usage(
-                    "unknown switch manager option; manager options precede NAME",
-                ));
-            }
-            Some(name.to_owned())
-        }
+        Some(value) => Some(profile_name(value, "switch")?),
     };
     // Without NAME a `--` (if any) is at `index` and was the one separator.
     if no_launch && args.len() > index + usize::from(name.is_some()) {
         return Err(usage("switch --no-launch takes no Claude arguments"));
     }
-    let mut tail = args.get(index + 1..).unwrap_or_default().to_vec();
-    if name.is_some() && tail.first().is_some_and(|v| v == OsStr::new("--")) {
-        tail.remove(0);
-    }
+    let tail = args.get(index + 1..).unwrap_or_default();
+    let arguments = if name.is_some() {
+        claude_tail(tail)
+    } else {
+        tail.to_vec()
+    };
     Ok(Action::Switch {
         allow_auth_env,
         no_launch,
         forget,
         name,
-        arguments: tail,
+        arguments,
     })
 }
 
@@ -741,6 +724,35 @@ mod tests {
         ] {
             assert!(parse_from(values.iter().map(OsString::from).collect()).is_err());
         }
+    }
+    #[test]
+    fn run_and_switch_share_the_manager_prefix() {
+        let error = |values: &[&str]| {
+            parse_from(values.iter().map(OsString::from).collect())
+                .unwrap_err()
+                .to_string()
+        };
+        for command in ["run", "switch"] {
+            let twice = error(&[
+                "roost",
+                command,
+                "--allow-auth-env",
+                "--allow-auth-env",
+                "w",
+            ]);
+            assert!(
+                twice.contains("--allow-auth-env may be supplied only once"),
+                "{twice}"
+            );
+            let unknown = error(&["roost", command, "--bogus", "w"]);
+            assert!(
+                unknown.contains(&format!("unknown {command} manager option")),
+                "{unknown}"
+            );
+            let help = parse_from(["roost", command, "-h"].map(OsString::from).to_vec());
+            assert_eq!(help.unwrap_err().kind(), ErrorKind::DisplayHelp);
+        }
+        assert!(error(&["roost", "run"]).contains("run requires NAME"));
     }
     #[test]
     fn invalid_combinations_are_rejected() {

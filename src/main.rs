@@ -164,10 +164,7 @@ fn open(root: &Path, mode: OpenMode) -> Result<Store> {
 }
 fn effective_directory(reg: &store::Registration) -> Result<PathBuf> {
     if reg.kind == Kind::DefaultAlias {
-        match std::env::var_os("CLAUDE_CONFIG_DIR").filter(|v| !v.is_empty()) {
-            Some(path) => platform::absolute(Path::new(&path)),
-            None => platform::default_directory(),
-        }
+        platform::claude_config_dir()
     } else {
         reg.directory
             .clone()
@@ -283,7 +280,8 @@ fn dispatch(action: Action, data: &mut Value) -> Result<Outcome> {
             let lines = table::profiles(
                 &profiles,
                 full,
-                table::stdout_color(),
+                false,
+                table::color_for(&std::io::stdout()),
                 platform::stdout_width(),
             );
             *data = json!({"project":project,"profiles":profiles});
@@ -401,10 +399,7 @@ fn dispatch(action: Action, data: &mut Value) -> Result<Outcome> {
             let source = if copy_default {
                 let selected = match source {
                     Some(path) => platform::absolute(&path)?,
-                    None => match std::env::var_os("CLAUDE_CONFIG_DIR").filter(|v| !v.is_empty()) {
-                        Some(path) => platform::absolute(Path::new(&path))?,
-                        None => platform::default_directory()?,
-                    },
+                    None => platform::claude_config_dir()?,
                 };
                 platform::Directory::open(&selected, false)?;
                 platform::confirm(

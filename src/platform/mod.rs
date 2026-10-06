@@ -74,8 +74,13 @@ pub fn root() -> Result<PathBuf> {
     }
 }
 
-pub fn default_directory() -> Result<PathBuf> {
-    Ok(home()?.join(".claude"))
+/// Claude's own configuration directory: `CLAUDE_CONFIG_DIR` when set and not
+/// empty, else `~/.claude`.
+pub fn claude_config_dir() -> Result<PathBuf> {
+    match std::env::var_os("CLAUDE_CONFIG_DIR").filter(|v| !v.is_empty()) {
+        Some(path) => absolute(Path::new(&path)),
+        None => Ok(home()?.join(".claude")),
+    }
 }
 
 pub fn random_id() -> Result<String> {
@@ -259,5 +264,5 @@ mod tests {
 #[derive(Debug, PartialEq, Eq)]
 pub enum Picked {
     Chosen(usize),
-    Action(char, usize),
+    Action(usize),
 }
