@@ -1,6 +1,7 @@
 mod cli;
 mod launch;
 mod platform;
+mod sets;
 mod store;
 mod table;
 
@@ -78,6 +79,9 @@ fn initial_data(action: &Action) -> Value {
         Action::Status { name, .. } => {
             json!({"name":name,"kind":null,"reported_logged_in":null,"auth_method":null,"config_directory":null,"scope":null})
         }
+        Action::Set {
+            action: cli::SetAction::List { .. },
+        } => json!({"sets":[]}),
         Action::Doctor { .. } => {
             json!({"claude_path":null,"claude_version":null,"storage_directory":null,"launcher_directory":null,"path_member":null,"profiles":[],"findings":[]})
         }
@@ -191,14 +195,18 @@ fn dispatch(action: Action, data: &mut Value) -> Result<Outcome> {
                 }
                 Err(e) => return Err(e),
             };
+            let mut warnings = vec![];
             let profiles = if let Some(store) = &store {
-                store.profiles(retained)?
+                let mut profiles = store.profiles(retained)?;
+                warnings.extend(sets::annotate(store, &mut profiles));
+                profiles
             } else {
                 vec![]
             };
             let lines = table::profiles(&profiles, table::stdout_color());
             *data = json!({"profiles":profiles});
             let mut output = Outcome::lines(lines);
+            output.warnings = warnings;
             if store.as_ref().is_some_and(Store::pending) {
                 output
                     .warnings
@@ -225,8 +233,10 @@ fn dispatch(action: Action, data: &mut Value) -> Result<Outcome> {
             allow_auth_env,
             arguments,
         } => {
-            let store = open(&platform::root()?, OpenMode::Read)?;
-            let command = launch::prepare(&store, store.find(&name, false)?, allow_auth_env)?;
+            let store = open(&platform::root()?, OpenMode::Launch)?;
+            let reg = store.find(&name, false)?;
+            let command = launch::prepare(&store, reg, allow_auth_env)?;
+            sets::reconcile_at_launch(&store, reg);
             drop(store);
             Ok(Outcome {
                 exit: launch::execute(command, &arguments)?,
@@ -245,7 +255,7 @@ fn dispatch(action: Action, data: &mut Value) -> Result<Outcome> {
                     "Launcher root binding must be absolute",
                 ));
             }
-            let store = open(&platform::absolute(&root)?, OpenMode::Read)?;
+            let store = open(&platform::absolute(&root)?, OpenMode::Launch)?;
             if store.root_id != root_id {
                 return Err(Error::new(
                     "ownership",
@@ -277,6 +287,7 @@ fn dispatch(action: Action, data: &mut Value) -> Result<Outcome> {
                 );
             }
             let command = launch::prepare(&store, reg, false)?;
+            sets::reconcile_at_launch(&store, reg);
             drop(store);
             Ok(Outcome {
                 exit: launch::execute(command, &arguments)?,
@@ -317,6 +328,7 @@ fn dispatch(action: Action, data: &mut Value) -> Result<Outcome> {
             copy_default,
             source,
             yes,
+            no_sets,
         } => {
             let root = platform::root()?;
             let source = if copy_default {
@@ -351,6 +363,10 @@ fn dispatch(action: Action, data: &mut Value) -> Result<Outcome> {
                 }
             )]);
             out.warnings = warnings;
+            if !link_default && !no_sets {
+                out.warnings
+                    .extend(sets::subscribe_new(&store, &name, source.as_deref()));
+            }
             if !link_default {
                 out.lines
                     .push(format!("Login: roost run {name} auth login"));
@@ -416,8 +432,11 @@ fn dispatch(action: Action, data: &mut Value) -> Result<Outcome> {
                 );
             }
             let messages = store.remove(&name, purge)?;
-            Ok(Outcome::lines(messages))
+            let mut out = Outcome::lines(messages);
+            out.warnings.extend(sets::forget_removed(&store));
+            Ok(out)
         }
+        Action::Set { action } => Ok(Outcome::lines(sets::command(action, data)?)),
         Action::Token { name, stdin, clear } => {
             let root = platform::root()?;
             let selection = {
@@ -493,7 +512,8 @@ fn doctor(data: &mut Value) -> Result<Outcome> {
                 findings.push(finding("recovery","error","Pending operation requires classified recovery; purge deletion is never automatically continued".into(),Some(&root),Some("Retry the original acknowledged mutation after inspection; explicit purge retries require quiet writers".into())));
             }
             match store.profiles(true) {
-                Ok(profiles) => {
+                Ok(mut profiles) => {
+                    let _ = sets::annotate(&store, &mut profiles);
                     for p in &profiles {
                         for l in p["launchers"].as_array().into_iter().flatten() {
                             let condition = l["condition"].as_str().unwrap_or("unsafe");
