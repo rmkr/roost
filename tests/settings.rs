@@ -254,11 +254,20 @@ fn launch_merges_hooks_preserving_other_keys_and_records_only_its_own() {
         .unwrap()
         .remove("PreToolUse");
     f.write_settings("Work", &serde_json::to_string_pretty(&settings).unwrap());
-    f.ok(&["run", "Work"]);
+    // It warns once, naming the fragment to edit instead.
+    let stderr = f.stderr_of(&["run", "Work"]);
+    let fragment = dir.join("atuin.json");
+    assert_eq!(stderr.matches("warning:").count(), 1, "{stderr}");
+    assert!(
+        stderr.contains("PreToolUse") && stderr.contains(&format!("edit {}", fragment.display())),
+        "{stderr}"
+    );
     assert_eq!(
         f.settings("Work")["hooks"]["PreToolUse"],
         json!([{"matcher":"Bash","hooks":[hook("atuin")]}])
     );
+    let stderr = f.stderr_of(&["run", "Work"]);
+    assert!(stderr.is_empty(), "{stderr}");
     // Unsubscribing removes only Roost's recorded, unchanged entries at the next
     // launch; the profile's own identical handler and other keys stay.
     f.ok(&["set", "unsubscribe", "Work", "core"]);

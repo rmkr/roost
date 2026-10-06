@@ -264,6 +264,8 @@ struct Hook {
     event: String,
     matcher: Option<String>,
     handler: Json,
+    /// The fragment file it comes from, for messages (not part of its identity).
+    source: PathBuf,
 }
 impl Hook {
     fn record(&self) -> HookRecord {
@@ -373,6 +375,7 @@ fn hooks(value: &Json) -> std::result::Result<Vec<Hook>, String> {
                     event: event.clone(),
                     matcher: matcher.clone(),
                     handler: handler.clone(),
+                    source: PathBuf::new(),
                 });
             }
         }
@@ -516,6 +519,10 @@ fn subscribed_fragments(
                 Ok((identity, _)) if seen.contains(&identity) => {}
                 Ok((identity, fragment)) => {
                     seen.push(identity);
+                    let mut fragment = fragment;
+                    for hook in &mut fragment.hooks {
+                        hook.source.clone_from(&path);
+                    }
                     found.push((path, fragment));
                 }
                 Err(reason) => warn(format!(
@@ -706,6 +713,16 @@ fn apply_hooks(
                 records.push(hook.record());
             }
         } else if add_hook(settings, hook) {
+            // A recorded handler that is gone was removed or edited by hand: the
+            // set is the source of truth, so point at the fragment to change.
+            if recorded.iter().any(|r| hook.is(r)) {
+                warnings.push(format!(
+                    "Re-added shared {} hook from {}, which was missing from settings.json; to change or remove it, edit {} in its fragment directory",
+                    hook.event,
+                    hook.source.display(),
+                    hook.source.display()
+                ));
+            }
             records.push(hook.record());
         } else {
             warnings.push(format!(
