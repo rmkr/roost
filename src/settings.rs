@@ -34,6 +34,8 @@ const STATUS_LINE: &str = "statusLine";
 const OUTPUT_STYLE: &str = "outputStyle";
 /// Keys a fragment may set.
 const ALLOWED: [&str; 3] = [HOOKS, STATUS_LINE, OUTPUT_STYLE];
+/// Single-value keys, in [`Fragment::singles`] order.
+const SINGLE_KEYS: [&str; 2] = [STATUS_LINE, OUTPUT_STYLE];
 
 /// A JSON value whose objects keep their key order and whose numbers keep their
 /// exact text; duplicate keys are refused.
@@ -275,7 +277,8 @@ impl Hook {
             handler: self.handler.to_value(),
         }
     }
-    fn is(&self, record: &HookRecord) -> bool {
+    /// Whether `record` names this handler (same event, matcher and handler).
+    fn matches_record(&self, record: &HookRecord) -> bool {
         self.event == record.event
             && self.matcher == record.matcher
             && self.handler.to_value() == record.handler
@@ -286,13 +289,21 @@ impl Hook {
 #[derive(Debug, Default)]
 struct Fragment {
     hooks: Vec<Hook>,
-    status_line: Option<Json>,
-    output_style: Option<Json>,
+    /// Values of [`SINGLE_KEYS`], by position.
+    singles: [Option<Json>; 2],
+}
+
+/// The non-empty string `type` of an object (hook handler or `statusLine`).
+fn type_of(value: &Json) -> Option<&str> {
+    value
+        .get("type")
+        .and_then(Json::as_str)
+        .filter(|t| !t.is_empty())
 }
 
 /// Validates a fragment document: an object with only `hooks`, `statusLine` and
 /// `outputStyle`, each in Claude's shape.
-fn fragment(bytes: &[u8]) -> std::result::Result<Fragment, String> {
+fn parse_fragment(bytes: &[u8]) -> std::result::Result<Fragment, String> {
     let document = Json::parse(bytes)?;
     let Json::Object(entries) = document else {
         return Err("not a JSON object".into());
@@ -300,28 +311,25 @@ fn fragment(bytes: &[u8]) -> std::result::Result<Fragment, String> {
     let mut fragment = Fragment::default();
     for (key, value) in entries {
         match key.as_str() {
-            HOOKS => fragment.hooks = hooks(&value)?,
+            HOOKS => {
+                fragment.hooks = parse_hooks(&value)?;
+                continue;
+            }
             STATUS_LINE => {
-                let valid = matches!(&value, Json::Object(_))
-                    && value
-                        .get("type")
-                        .and_then(Json::as_str)
-                        .is_some_and(|t| !t.is_empty())
-                    && (value.get("type").and_then(Json::as_str) != Some("command")
-                        || value.get("command").and_then(Json::as_str).is_some());
+                let valid = type_of(&value).is_some_and(|t| {
+                    t != "command" || value.get("command").and_then(Json::as_str).is_some()
+                });
                 if !valid {
                     return Err(
                         "statusLine must be an object with a type (and a command for type command)"
                             .into(),
                     );
                 }
-                fragment.status_line = Some(value);
             }
             OUTPUT_STYLE => {
                 if !value.as_str().is_some_and(|s| !s.is_empty()) {
                     return Err("outputStyle must be a non-empty string".into());
                 }
-                fragment.output_style = Some(value);
             }
             other => {
                 return Err(format!(
@@ -330,11 +338,14 @@ fn fragment(bytes: &[u8]) -> std::result::Result<Fragment, String> {
                 ));
             }
         }
+        if let Some(index) = SINGLE_KEYS.iter().position(|k| *k == key) {
+            fragment.singles[index] = Some(value);
+        }
     }
     Ok(fragment)
 }
 
-fn hooks(value: &Json) -> std::result::Result<Vec<Hook>, String> {
+fn parse_hooks(value: &Json) -> std::result::Result<Vec<Hook>, String> {
     let shape = "hooks must map event names to arrays of {matcher?, hooks:[{type, ...}]}";
     let Json::Object(events) = value else {
         return Err(shape.into());
@@ -354,21 +365,12 @@ fn hooks(value: &Json) -> std::result::Result<Vec<Hook>, String> {
             if fields.iter().any(|(k, _)| k != "matcher" && k != HOOKS) {
                 return Err(shape.into());
             }
-            let matcher = match group.get("matcher") {
-                None => None,
-                Some(Json::String(m)) => Some(m.clone()),
-                Some(_) => return Err(shape.into()),
-            };
+            let matcher = group_matcher(group).ok_or(shape)?.map(str::to_owned);
             let Some(Json::Array(handlers)) = group.get(HOOKS) else {
                 return Err(shape.into());
             };
             for handler in handlers {
-                let typed = matches!(handler, Json::Object(_))
-                    && handler
-                        .get("type")
-                        .and_then(Json::as_str)
-                        .is_some_and(|t| !t.is_empty());
-                if !typed {
+                if type_of(handler).is_none() {
                     return Err(shape.into());
                 }
                 found.push(Hook {
@@ -403,7 +405,7 @@ fn read_fragment(
     if bytes.len() > MAX_READ_BYTES {
         return Err("larger than 4 MiB".into());
     }
-    Ok((identity, fragment(&bytes)?))
+    Ok((identity, parse_fragment(&bytes)?))
 }
 
 /// Fragment files of a setting item: the file itself, or a source's immediate
@@ -432,11 +434,6 @@ fn fragment_paths(item: &Item) -> std::result::Result<Vec<PathBuf>, String> {
     }
     paths.sort();
     Ok(paths)
-}
-
-/// Whether a kind is a settings item.
-pub(crate) fn is_setting(kind: ItemKind) -> bool {
-    matches!(kind, ItemKind::Setting | ItemKind::SettingSource)
 }
 
 /// `set add` check: every fragment of the item is valid (usage error naming it).
@@ -471,14 +468,12 @@ enum Single {
 /// Merged desired settings of a registration's subscribed fragments.
 struct Desired {
     hooks: Vec<Hook>,
-    status_line: Single,
-    output_style: Single,
+    /// Desired values of [`SINGLE_KEYS`], by position.
+    singles: [Single; 2],
 }
 impl Desired {
     fn is_empty(&self) -> bool {
-        self.hooks.is_empty()
-            && matches!(self.status_line, Single::Absent)
-            && matches!(self.output_style, Single::Absent)
+        self.hooks.is_empty() && self.singles.iter().all(|s| matches!(s, Single::Absent))
     }
 }
 
@@ -491,19 +486,12 @@ fn subscribed_fragments(
 ) -> Vec<(PathBuf, Fragment)> {
     let mut found: Vec<(PathBuf, Fragment)> = vec![];
     let mut seen: Vec<FileIdentity> = vec![];
-    for (set, item) in items.iter().filter(|(_, i)| is_setting(i.kind)) {
-        let directory = item.kind == ItemKind::SettingSource;
-        let present = std::fs::metadata(&item.value)
-            .is_ok_and(|m| if directory { m.is_dir() } else { m.is_file() });
-        if !present {
+    for (set, item) in items.iter().filter(|(_, i)| i.kind.is_setting()) {
+        if !crate::sets::source_present(item) {
             warn(format!(
                 "Skipped {} from set {set}: missing or not {}",
                 item.value,
-                if directory {
-                    "a directory"
-                } else {
-                    "a regular file"
-                }
+                crate::sets::source_type(item.kind)
             ));
             continue;
         }
@@ -515,11 +503,10 @@ fn subscribed_fragments(
             }
         };
         for path in paths {
-            match read_fragment(&path, !directory) {
+            match read_fragment(&path, item.kind == ItemKind::Setting) {
                 Ok((identity, _)) if seen.contains(&identity) => {}
-                Ok((identity, fragment)) => {
+                Ok((identity, mut fragment)) => {
                     seen.push(identity);
-                    let mut fragment = fragment;
                     for hook in &mut fragment.hooks {
                         hook.source.clone_from(&path);
                     }
@@ -535,24 +522,19 @@ fn subscribed_fragments(
     found
 }
 
-/// Single-value keys set by more than one fragment, as messages.
-fn single_conflicts(fragments: &[(PathBuf, Fragment)]) -> Vec<(&'static str, String)> {
+/// Single-value keys set by more than one fragment: (position in
+/// [`SINGLE_KEYS`], message).
+fn single_conflicts(fragments: &[(PathBuf, Fragment)]) -> Vec<(usize, String)> {
     let mut found = vec![];
-    for (key, pick) in [
-        (
-            STATUS_LINE,
-            (|f: &Fragment| f.status_line.is_some()) as fn(&Fragment) -> bool,
-        ),
-        (OUTPUT_STYLE, |f: &Fragment| f.output_style.is_some()),
-    ] {
+    for (index, key) in SINGLE_KEYS.iter().enumerate() {
         let paths: Vec<String> = fragments
             .iter()
-            .filter(|(_, f)| pick(f))
+            .filter(|(_, f)| f.singles[index].is_some())
             .map(|(p, _)| p.display().to_string())
             .collect();
         if paths.len() > 1 {
             found.push((
-                key,
+                index,
                 format!("{key} would come from {}", paths.join(" and ")),
             ));
         }
@@ -576,28 +558,22 @@ fn desired(items: &[(&str, &Item)], warnings: &mut Vec<String>) -> Desired {
     for (_, message) in &conflicting {
         warnings.push(format!("Skipped shared {message}"));
     }
-    let single = |key: &str, pick: fn(&Fragment) -> Option<&Json>| {
-        if conflicting.iter().any(|(k, _)| *k == key) {
+    let singles = std::array::from_fn(|index| {
+        if conflicting.iter().any(|(i, _)| *i == index) {
             return Single::Conflict;
         }
         fragments
             .iter()
-            .find_map(|(_, f)| pick(f).cloned())
+            .find_map(|(_, f)| f.singles[index].clone())
             .map_or(Single::Absent, Single::Value)
-    };
-    let status_line = single(STATUS_LINE, |f| f.status_line.as_ref());
-    let output_style = single(OUTPUT_STYLE, |f| f.output_style.as_ref());
+    });
     let mut hooks: Vec<Hook> = vec![];
     for hook in fragments.into_iter().flat_map(|(_, f)| f.hooks) {
-        if !hooks.iter().any(|h| h.is(&hook.record())) {
+        if !hooks.iter().any(|h| h.matches_record(&hook.record())) {
             hooks.push(hook);
         }
     }
-    Desired {
-        hooks,
-        status_line,
-        output_style,
-    }
+    Desired { hooks, singles }
 }
 
 fn group_matcher(group: &Json) -> Option<Option<&str>> {
@@ -701,7 +677,7 @@ fn apply_hooks(
         return recorded.to_vec();
     }
     for record in recorded {
-        if !desired.iter().any(|h| h.is(record)) {
+        if !desired.iter().any(|h| h.matches_record(record)) {
             remove_hook(settings, record);
         }
     }
@@ -709,13 +685,13 @@ fn apply_hooks(
     for hook in desired {
         if contains_hook(settings, hook) {
             // Present: still Roost's when recorded, else the profile's own.
-            if recorded.iter().any(|r| hook.is(r)) {
+            if recorded.iter().any(|r| hook.matches_record(r)) {
                 records.push(hook.record());
             }
         } else if add_hook(settings, hook) {
             // A recorded handler that is gone was removed or edited by hand: the
             // set is the source of truth, so point at the fragment to change.
-            if recorded.iter().any(|r| hook.is(r)) {
+            if recorded.iter().any(|r| hook.matches_record(r)) {
                 warnings.push(format!(
                     "Re-added shared {} hook from {}, which was missing from settings.json; to change or remove it, edit {} in its fragment directory",
                     hook.event,
@@ -736,6 +712,20 @@ fn apply_hooks(
 
 /// Reconciles one single-value key; returns its new record. The profile's own
 /// value wins: Roost replaces or removes only the value it recorded, unchanged.
+/// A record's value for the single-value key at `index` in [`SINGLE_KEYS`].
+fn single_slot(record: &SettingsRecord, index: usize) -> &Option<Value> {
+    match SINGLE_KEYS[index] {
+        STATUS_LINE => &record.status_line,
+        _ => &record.output_style,
+    }
+}
+fn single_slot_mut(record: &mut SettingsRecord, index: usize) -> &mut Option<Value> {
+    match SINGLE_KEYS[index] {
+        STATUS_LINE => &mut record.status_line,
+        _ => &mut record.output_style,
+    }
+}
+
 fn apply_single(
     settings: &mut Json,
     key: &str,
@@ -957,7 +947,7 @@ pub(crate) fn reconcile(store: &Store, registration: &Registration) -> Vec<Strin
         },
     };
     let mut document = original.clone();
-    let record = SettingsRecord {
+    let mut record = SettingsRecord {
         registration_id: id.clone(),
         hooks: apply_hooks(
             &mut document,
@@ -965,21 +955,18 @@ pub(crate) fn reconcile(store: &Store, registration: &Registration) -> Vec<Strin
             &recorded.hooks,
             &mut warnings,
         ),
-        status_line: apply_single(
-            &mut document,
-            STATUS_LINE,
-            &desired.status_line,
-            recorded.status_line.as_ref(),
-            &mut warnings,
-        ),
-        output_style: apply_single(
-            &mut document,
-            OUTPUT_STYLE,
-            &desired.output_style,
-            recorded.output_style.as_ref(),
-            &mut warnings,
-        ),
+        status_line: None,
+        output_style: None,
     };
+    for (index, (key, single)) in SINGLE_KEYS.iter().zip(&desired.singles).enumerate() {
+        *single_slot_mut(&mut record, index) = apply_single(
+            &mut document,
+            key,
+            single,
+            single_slot(&recorded, index).as_ref(),
+            &mut warnings,
+        );
+    }
     let save = |record: &SettingsRecord| {
         store.update_state(|state| {
             state.settings.retain(|r| &r.registration_id != id);

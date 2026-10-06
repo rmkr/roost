@@ -158,6 +158,12 @@ pub enum ItemKind {
     /// A directory whose immediate `*.json` files are settings fragments.
     SettingSource,
 }
+impl ItemKind {
+    /// Whether this is a settings item (merged into `settings.json`, not linked).
+    pub fn is_setting(self) -> bool {
+        matches!(self, Self::Setting | Self::SettingSource)
+    }
+}
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
 pub struct Subscription {

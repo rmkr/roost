@@ -7,7 +7,7 @@
 //!
 //! Extension points:
 //! - Link kinds: [`PLACEMENTS`] maps item kinds to a profile subdirectory and how a
-//!   source expands; [`LINKED`] lists the kinds reconciled at launch: skills under
+//!   source expands; every kind in it is reconciled at launch: skills under
 //!   `skills/`, instruction fragments under `rules/` (config-dir `rules/` loads
 //!   like `~/.claude/rules/`, so no `CLAUDE.md` import block is needed), and
 //!   subagents, custom commands and output styles as `.md` files under `agents/`,
@@ -85,26 +85,40 @@ const PLACEMENTS: [Placement; 5] = [
         select: Select::Markdown,
     },
 ];
-/// Item kinds linked into owned profiles at launch.
-const LINKED: &[ItemKind] = &[
-    ItemKind::Skill,
-    ItemKind::SkillSource,
-    ItemKind::Instruction,
-    ItemKind::InstructionSource,
-    ItemKind::Agent,
-    ItemKind::AgentSource,
-    ItemKind::Command,
-    ItemKind::CommandSource,
-    ItemKind::OutputStyle,
-    ItemKind::OutputStyleSource,
-];
 /// Claude-managed per-account names that are never linked, replaced or removed.
 const SYNCED: &str = "synced";
 
+/// The placement of a kind linked into owned profiles at launch (every kind in
+/// [`PLACEMENTS`]); `None` for settings fragments and plugins.
 fn placement(kind: ItemKind) -> Option<&'static Placement> {
     PLACEMENTS
         .iter()
         .find(|p| p.explicit == kind || p.source == kind)
+}
+
+/// What a path-valued item's source must be on disk.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum SourceType {
+    File,
+    Directory,
+}
+
+/// The source type of a kind, the one place path-valued kinds are told apart:
+/// a linked kind's comes from its placement (a single Markdown item is a file,
+/// skills and sources are directories), a settings fragment is a file and a
+/// settings source a directory. `None` for kinds that name no path (plugins).
+fn source_kind(kind: ItemKind) -> Option<SourceType> {
+    match kind {
+        ItemKind::Setting => Some(SourceType::File),
+        ItemKind::SettingSource => Some(SourceType::Directory),
+        _ => placement(kind).map(|p| {
+            if p.explicit == kind && p.select == Select::Markdown {
+                SourceType::File
+            } else {
+                SourceType::Directory
+            }
+        }),
+    }
 }
 
 /// Whether `name` may become a link name: Unicode, no line breaks, not hidden and
@@ -117,36 +131,27 @@ fn linkable(name: &str, select: Select) -> bool {
         && (select == Select::Directories || name.ends_with(".md"))
 }
 
-/// Whether a linked item's source exists with the type its kind needs: skills and
-/// sources are directories, single Markdown items (instruction fragments, agents,
-/// commands, output styles) regular files. The source is
-/// user data that Claude reaches through the link, so (like listing a source) the
-/// check follows symlinks; a dangling link counts as missing. Only read, never
-/// written. Non-linked kinds (plugins) are not checked here.
-fn source_present(item: &Item) -> bool {
-    if !LINKED.contains(&item.kind) && !settings::is_setting(item.kind) {
+/// Whether an item's source exists with the type its kind needs
+/// ([`source_kind`]). The source is user data that Claude reaches through a link
+/// (or Roost reads as settings fragments), so (like listing a source) the check
+/// follows symlinks; a dangling link counts as missing. Only read, never written.
+/// Kinds that name no path (plugins) are not checked here.
+pub(crate) fn source_present(item: &Item) -> bool {
+    let Some(source) = source_kind(item.kind) else {
         return true;
-    }
+    };
     let Ok(metadata) = std::fs::metadata(&item.value) else {
         return false;
     };
-    if file_kind(item.kind) {
-        metadata.is_file()
-    } else {
-        metadata.is_dir()
+    match source {
+        SourceType::File => metadata.is_file(),
+        SourceType::Directory => metadata.is_dir(),
     }
 }
 
-/// Whether a kind's source is a regular file: single Markdown items and settings
-/// fragments; everything else names a directory.
-fn file_kind(kind: ItemKind) -> bool {
-    kind == ItemKind::Setting
-        || placement(kind).is_some_and(|p| p.explicit == kind && p.select == Select::Markdown)
-}
-
 /// The source type [`source_present`] requires, for messages.
-fn source_type(kind: ItemKind) -> &'static str {
-    if file_kind(kind) {
+pub(crate) fn source_type(kind: ItemKind) -> &'static str {
+    if source_kind(kind) == Some(SourceType::File) {
         "a regular file"
     } else {
         "a directory"
@@ -524,7 +529,7 @@ pub fn command(action: SetAction, data: &mut Value) -> Result<Vec<String>> {
                 )
                 .next("Check the path, then add it again"));
             }
-            if settings::is_setting(item.kind) {
+            if item.kind.is_setting() {
                 settings::validate(&item)?;
             }
             if item.kind == ItemKind::Plugin && !plugin_installed(&store, &item.value)? {
@@ -855,7 +860,7 @@ pub fn reconcile(store: &Store, registration: &Registration) -> Vec<String> {
     let mut links = Links::new();
     for (set, item) in subscribed(&sets, &registration.registration_id)
         .into_iter()
-        .filter(|(_, i)| LINKED.contains(&i.kind))
+        .filter(|(_, i)| placement(i.kind).is_some())
     {
         expand(set, item, &mut links, &mut warnings);
     }
