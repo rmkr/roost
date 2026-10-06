@@ -188,7 +188,7 @@ impl Store {
     }
 }
 
-#[cfg(all(test, unix))]
+#[cfg(test)]
 mod tests {
     use super::super::*;
     use super::*;

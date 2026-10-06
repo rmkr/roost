@@ -3,20 +3,18 @@ use serde::{Deserialize, Serialize};
 use std::io::{Read, Write};
 use std::path::{Component, Path, PathBuf};
 
-#[cfg(unix)]
+#[cfg(not(unix))]
+compile_error!(
+    "Native Windows is unsupported. Use a Linux Roost and Claude installation in WSL 2."
+);
+
 mod unix;
-#[cfg(unix)]
 pub use unix::*;
-#[cfg(windows)]
-mod windows;
-#[cfg(windows)]
-pub use windows::*;
 
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(tag = "platform", rename_all = "snake_case", deny_unknown_fields)]
 pub enum FileIdentity {
     Unix { device: String, inode: String },
-    Windows { volume: String, index: String },
 }
 
 #[derive(Debug)]
@@ -82,37 +80,20 @@ pub fn default_directory() -> Result<PathBuf> {
 
 pub fn random_id() -> Result<String> {
     let mut bytes = [0_u8; 16];
-    getrandom::fill(&mut bytes)
+    std::fs::File::open("/dev/urandom")
+        .and_then(|mut f| f.read_exact(&mut bytes))
         .map_err(|_| Error::new("io", "Operating-system randomness unavailable"))?;
     Ok(bytes.iter().map(|b| format!("{b:02x}")).collect())
 }
 
 pub fn path_member(path: &Path) -> bool {
     std::env::var_os("PATH").is_some_and(|value| {
-        std::env::split_paths(&value).any(|entry| {
-            #[cfg(unix)]
-            {
-                absolute(&entry).is_ok_and(|entry| entry == path)
-            }
-            #[cfg(windows)]
-            {
-                absolute(&entry).is_ok_and(|entry| {
-                    entry
-                        .to_string_lossy()
-                        .eq_ignore_ascii_case(&path.to_string_lossy())
-                })
-            }
-        })
+        std::env::split_paths(&value).any(|entry| absolute(&entry).is_ok_and(|entry| entry == path))
     })
 }
 
 pub(crate) fn valid_name(name: &str) -> Result<()> {
-    if name.is_empty()
-        || name == "."
-        || name == ".."
-        || name.contains(['/', '\0', '\r', '\n'])
-        || (cfg!(windows) && name.contains('\\'))
-    {
+    if name.is_empty() || name == "." || name == ".." || name.contains(['/', '\0', '\r', '\n']) {
         Err(Error::new("unsafe_path", "Unsafe directory entry name"))
     } else {
         Ok(())
@@ -251,6 +232,13 @@ fn copy_contents(
 mod tests {
     use super::*;
     #[test]
+    fn random_id_is_fresh_lowercase_hex() {
+        let (a, b) = (random_id().unwrap(), random_id().unwrap());
+        assert_eq!(a.len(), 32);
+        assert!(a.bytes().all(|c| matches!(c, b'0'..=b'9' | b'a'..=b'f')));
+        assert_ne!(a, b);
+    }
+    #[test]
     fn token_and_exclusion_boundaries() {
         assert_eq!(validate_token(b"  fake-token\n").unwrap(), "fake-token");
         for bytes in [b"".as_slice(), b"fake token", b"fake\0token"] {
@@ -263,7 +251,6 @@ mod tests {
         assert!(!excluded("cache", false));
         assert!(excluded("cache", true));
         assert!(absolute(Path::new("bad\npath")).is_err());
-        #[cfg(unix)]
         assert!(valid_name("ordinary\\file").is_ok());
     }
 }

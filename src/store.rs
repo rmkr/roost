@@ -130,8 +130,6 @@ enum Action {
 #[serde(rename_all = "snake_case")]
 enum Form {
     Sh,
-    Cmd,
-    Ps1,
 }
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
@@ -231,10 +229,7 @@ fn valid_id(value: &str) -> bool {
 fn validate_identity(identity: &FileIdentity) -> Result<()> {
     let decimal = |s: &str| s.parse::<u64>().is_ok_and(|n| n.to_string() == s);
     let valid = match identity {
-        FileIdentity::Unix { device, inode } => cfg!(unix) && decimal(device) && decimal(inode),
-        FileIdentity::Windows { volume, index } => {
-            cfg!(windows) && decimal(volume) && decimal(index)
-        }
+        FileIdentity::Unix { device, inode } => decimal(device) && decimal(inode),
     };
     if !valid {
         return Err(err(
@@ -339,25 +334,22 @@ fn launcher_bytes(directory: &Directory, name: &str) -> Result<Option<Vec<u8>>> 
         return Ok(None);
     }
     let file = directory.open_file(name, true, false)?;
-    #[cfg(unix)]
+    use std::os::unix::fs::PermissionsExt;
+    if file
+        .metadata()
+        .map_err(|e| Error::io("inspect launcher", &directory.path.join(name), e))?
+        .permissions()
+        .mode()
+        & 0o100
+        == 0
     {
-        use std::os::unix::fs::PermissionsExt;
-        if file
-            .metadata()
-            .map_err(|e| Error::io("inspect launcher", &directory.path.join(name), e))?
-            .permissions()
-            .mode()
-            & 0o100
-            == 0
-        {
-            return Err(err(
-                "unsafe_path",
-                format!(
-                    "Owned launcher is not executable: {}",
-                    directory.path.join(name).display()
-                ),
-            ));
-        }
+        return Err(err(
+            "unsafe_path",
+            format!(
+                "Owned launcher is not executable: {}",
+                directory.path.join(name).display()
+            ),
+        ));
     }
     directory.read(name, true, 1024 * 1024)
 }
@@ -365,13 +357,6 @@ fn file_name(path: &Path) -> Result<&str> {
     path.file_name()
         .and_then(|n| n.to_str())
         .ok_or_else(|| err("unsafe_path", "Invalid object name"))
-}
-fn form(path: &Path) -> Form {
-    match path.extension().and_then(|x| x.to_str()) {
-        Some("cmd") => Form::Cmd,
-        Some("ps1") => Form::Ps1,
-        _ => Form::Sh,
-    }
 }
 fn lock(dir: &Directory) -> Result<File> {
     let file = dir.open_file(LOCK, true, true)?;
@@ -1080,7 +1065,7 @@ impl Store {
             };
             let mut after = state(self.directory.identity()?);
             after.launcher_binding = new.launcher_binding.clone();
-            after.launcher_form = Some(form(&destination));
+            after.launcher_form = Some(Form::Sh);
             self.stage_file(
                 stage,
                 Role::Launcher,
@@ -1113,7 +1098,7 @@ impl Store {
             ));
         }
         evidence.launcher_binding = r.launcher_binding.clone();
-        evidence.launcher_form = Some(form(path));
+        evidence.launcher_form = Some(Form::Sh);
         Ok(Some(evidence))
     }
     fn delete_launchers(&mut self, r: &Registration) -> Result<()> {
@@ -1208,14 +1193,10 @@ impl Store {
             .registration_id
             .clone()
             .ok_or_else(|| recovery("Launcher evidence has no registration ID"))?;
+        evidence
+            .launcher_form
+            .ok_or_else(|| recovery("Invalid launcher form"))?;
         let filename = file_name(&a.destination)?;
-        let filename = match evidence.launcher_form {
-            Some(Form::Cmd) => filename.strip_suffix(".cmd"),
-            Some(Form::Ps1) => filename.strip_suffix(".ps1"),
-            Some(Form::Sh) => Some(filename),
-            None => None,
-        }
-        .ok_or_else(|| recovery("Invalid launcher form"))?;
         let name = filename
             .strip_prefix("roost-")
             .ok_or_else(|| recovery("Invalid launcher destination"))?
@@ -2568,7 +2549,7 @@ impl Store {
     }
 }
 
-#[cfg(all(test, unix))]
+#[cfg(test)]
 mod tests {
     use super::*;
     use std::{

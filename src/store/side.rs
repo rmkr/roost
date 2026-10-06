@@ -540,7 +540,7 @@ pub(super) fn admitted(root: &Directory, name: &str) -> Result<bool> {
     Ok(true)
 }
 
-#[cfg(all(test, unix))]
+#[cfg(test)]
 mod tests {
     use super::super::*;
     use super::*;

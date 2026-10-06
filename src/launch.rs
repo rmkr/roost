@@ -76,20 +76,6 @@ fn fixed_path(path: &Path) -> Result<&str> {
 fn quoted_sh(value: &str) -> String {
     format!("'{}'", value.replace('\'', "'\\''"))
 }
-#[cfg(windows)]
-fn quoted_ps(value: &str) -> String {
-    format!("'{}'", value.replace('\'', "''"))
-}
-#[cfg(windows)]
-fn quoted_cmd(value: &str) -> Result<String> {
-    if value.contains('"') {
-        return Err(Error::new(
-            "unsafe_path",
-            "Windows launcher binding contains a quote",
-        ));
-    }
-    Ok(format!("\"{}\"", value.replace('%', "%%")))
-}
 
 pub fn templates(
     root: &Path,
@@ -125,13 +111,9 @@ pub fn templates(
         &registration.registration_id,
         "--",
     ];
-    #[cfg(windows)]
-    let sh_executable = executable.replace('\\', "/");
-    #[cfg(not(windows))]
-    let sh_executable = executable.to_owned();
     let sh = format!(
         "#!/bin/sh\nexec {} {} \"$@\"\n",
-        quoted_sh(&sh_executable),
+        quoted_sh(executable),
         operands
             .iter()
             .map(|s| quoted_sh(s))
@@ -141,33 +123,7 @@ pub fn templates(
     let stem = root
         .join("bin")
         .join(format!("roost-{}", registration.name));
-    #[allow(unused_mut)]
-    let mut result = vec![(stem.clone(), sh.into_bytes())];
-    #[cfg(windows)]
-    {
-        let cmd = format!(
-            "@echo off\r\nsetlocal DisableDelayedExpansion\r\n{} {} %*\r\nendlocal & exit /b %errorlevel%\r\n",
-            quoted_cmd(executable)?,
-            operands
-                .iter()
-                .map(|s| quoted_cmd(s))
-                .collect::<Result<Vec<_>>>()?
-                .join(" ")
-        );
-        result.push((stem.with_extension("cmd"), cmd.into_bytes()));
-        let fixed = operands
-            .iter()
-            .map(|s| quoted_ps(s))
-            .collect::<Vec<_>>()
-            .join(", ");
-        let ps = format!(
-            "\u{feff}# Roost bound launcher format 1\r\n$ErrorActionPreference = 'Stop'\r\nfunction Quote-RoostArgument([string] $Value) {{\r\n    if ($Value.Length -gt 0 -and $Value -notmatch '[\\s\"]') {{ return $Value }}\r\n    $Out = New-Object System.Text.StringBuilder\r\n    [void] $Out.Append('\"')\r\n    $Slashes = 0\r\n    foreach ($Char in $Value.ToCharArray()) {{\r\n        if ($Char -eq '\\') {{ $Slashes++; continue }}\r\n        if ($Char -eq '\"') {{\r\n            [void] $Out.Append(('\\' * (2 * $Slashes + 1)))\r\n        }} else {{ [void] $Out.Append(('\\' * $Slashes)) }}\r\n        [void] $Out.Append($Char)\r\n        $Slashes = 0\r\n    }}\r\n    [void] $Out.Append(('\\' * (2 * $Slashes)))\r\n    [void] $Out.Append('\"')\r\n    return $Out.ToString()\r\n}}\r\n$Start = New-Object System.Diagnostics.ProcessStartInfo\r\n$Start.FileName = {}\r\n$Start.UseShellExecute = $false\r\n$Tail = @({}) + @($args)\r\nif ($null -ne $Start.PSObject.Properties['ArgumentList']) {{\r\n    foreach ($Value in $Tail) {{ [void] $Start.ArgumentList.Add([string] $Value) }}\r\n}} else {{\r\n    $Start.Arguments = (($Tail | ForEach-Object {{ Quote-RoostArgument ([string] $_) }}) -join ' ')\r\n}}\r\n$Child = [System.Diagnostics.Process]::Start($Start)\r\ntry {{ $Child.WaitForExit(); $Result = $Child.ExitCode }} finally {{ $Child.Dispose() }}\r\nexit $Result\r\n",
-            quoted_ps(executable),
-            fixed
-        );
-        result.push((stem.with_extension("ps1"), ps.into_bytes()));
-    }
-    Ok(result)
+    Ok(vec![(stem, sh.into_bytes())])
 }
 
 fn auth_conflicts(mut lookup: impl FnMut(&str) -> Option<OsString>) -> Vec<&'static str> {
@@ -323,7 +279,7 @@ pub fn prepare(
 }
 
 /// Resolves `name` through the caller's PATH like a shell would (Unix: first
-/// executable regular file; Windows: PATHEXT search requiring a native `.exe`).
+/// executable regular file).
 pub fn resolve_program(name: &str) -> Result<PathBuf> {
     resolve_in(name, env::var_os("PATH"))
 }
@@ -331,41 +287,19 @@ pub fn resolve_program(name: &str) -> Result<PathBuf> {
 fn resolve_in(name: &str, path: Option<OsString>) -> Result<PathBuf> {
     let path = path
         .ok_or_else(|| Error::new("claude_unavailable", format!("PATH does not select {name}")))?;
-    #[cfg(unix)]
-    {
-        for directory in env::split_paths(&path) {
-            let candidate = platform::absolute(&directory.join(name))?;
-            if let Ok(metadata) = candidate.metadata()
-                && metadata.is_file()
-                && rustix::fs::accessat(
-                    rustix::fs::CWD,
-                    &candidate,
-                    rustix::fs::Access::EXEC_OK,
-                    rustix::fs::AtFlags::EACCESS,
-                )
-                .is_ok()
-            {
-                return Ok(candidate);
-            }
-        }
-    }
-    #[cfg(windows)]
-    {
-        let extensions =
-            env::var_os("PATHEXT").unwrap_or_else(|| OsString::from(".COM;.EXE;.BAT;.CMD"));
-        let extensions = extensions
-            .to_str()
-            .ok_or_else(|| Error::new("claude_unavailable", "PATHEXT is not Unicode"))?;
-        for directory in env::split_paths(&path) {
-            for extension in extensions.split(';').filter(|s| !s.is_empty()) {
-                let candidate = platform::absolute(&directory.join(format!("{name}{extension}")))?;
-                if candidate.is_file() {
-                    if !extension.eq_ignore_ascii_case(".exe") {
-                        return Err(Error::new("claude_unsupported", format!("PATH-selected {name} is not a native {name}.exe")).next("Select a native installation first on PATH; batch shims are unsupported"));
-                    }
-                    return Ok(candidate);
-                }
-            }
+    for directory in env::split_paths(&path) {
+        let candidate = platform::absolute(&directory.join(name))?;
+        if let Ok(metadata) = candidate.metadata()
+            && metadata.is_file()
+            && rustix::fs::accessat(
+                rustix::fs::CWD,
+                &candidate,
+                rustix::fs::Access::EXEC_OK,
+                rustix::fs::AtFlags::EACCESS,
+            )
+            .is_ok()
+        {
+            return Ok(candidate);
         }
     }
     Err(Error::new(
@@ -384,7 +318,6 @@ struct Probe {
     exit: ExitStatus,
 }
 
-#[cfg(unix)]
 fn nonblocking(pipe: &impl std::os::fd::AsRawFd) -> io::Result<()> {
     // SAFETY: the live pipe owns this fd; fcntl does not retain the descriptor.
     let flags = unsafe { libc::fcntl(pipe.as_raw_fd(), libc::F_GETFL) };
@@ -395,12 +328,7 @@ fn nonblocking(pipe: &impl std::os::fd::AsRawFd) -> io::Result<()> {
     }
     Ok(())
 }
-#[cfg(windows)]
-fn nonblocking(_pipe: &impl std::os::windows::io::AsRawHandle) -> io::Result<()> {
-    Ok(())
-}
 
-#[cfg(unix)]
 fn read_ready(
     pipe: &mut (impl Read + std::os::fd::AsRawFd),
     bytes: &mut [u8],
@@ -414,40 +342,6 @@ fn read_ready(
         }
         result => result.map(Some),
     }
-}
-#[cfg(windows)]
-fn read_ready(
-    pipe: &mut (impl Read + std::os::windows::io::AsRawHandle),
-    bytes: &mut [u8],
-) -> io::Result<Option<usize>> {
-    use windows_sys::Win32::{
-        Foundation::{ERROR_BROKEN_PIPE, GetLastError},
-        System::Pipes::PeekNamedPipe,
-    };
-    let mut available = 0u32;
-    // SAFETY: live pipe handle, valid out pointer, no retained references.
-    if unsafe {
-        PeekNamedPipe(
-            pipe.as_raw_handle(),
-            std::ptr::null_mut(),
-            0,
-            std::ptr::null_mut(),
-            &mut available,
-            std::ptr::null_mut(),
-        )
-    } == 0
-    {
-        return if unsafe { GetLastError() } == ERROR_BROKEN_PIPE {
-            Ok(Some(0))
-        } else {
-            Err(io::Error::last_os_error())
-        };
-    }
-    if available == 0 {
-        return Ok(None);
-    }
-    let count = bytes.len().min(available as usize);
-    pipe.read(&mut bytes[..count]).map(Some)
 }
 
 fn capture(
@@ -599,25 +493,12 @@ pub fn execute(mut command: Command, arguments: &[OsString]) -> Result<i32> {
     }
     command.args(arguments);
     platform::restore_for_exec()?;
-    #[cfg(unix)]
-    {
-        use std::os::unix::process::CommandExt;
-        let _ = command.exec();
-        // A failed exec may already have changed process environment/stdio.
-        // No returning to manager mutation/state reuse after this boundary.
-        eprintln!("roost: io: Could not execute the selected Claude installation");
-        std::process::exit(1);
-    }
-    #[cfg(windows)]
-    {
-        let mut child = command
-            .spawn()
-            .map_err(|_| Error::new("io", "Could not execute the selected Claude installation"))?;
-        let status = child
-            .wait()
-            .map_err(|_| Error::new("io", "Could not wait for Claude"))?;
-        Ok(status.code().unwrap_or(1))
-    }
+    use std::os::unix::process::CommandExt;
+    let _ = command.exec();
+    // A failed exec may already have changed process environment/stdio.
+    // No returning to manager mutation/state reuse after this boundary.
+    eprintln!("roost: io: Could not execute the selected Claude installation");
+    std::process::exit(1);
 }
 pub fn update() -> Result<i32> {
     eprintln!("roost: updating the shared Claude installation");
@@ -742,21 +623,13 @@ mod tests {
             name: "Work".to_owned(),
             kind: Kind::Owned,
             state: State::Active,
-            directory: Some(PathBuf::from(if cfg!(windows) {
-                "C:\\profiles\\Work"
-            } else {
-                "/profiles/Work"
-            })),
+            directory: Some(PathBuf::from("/profiles/Work")),
             directory_identity: None,
             profile_id: Some("c".repeat(32)),
             upstream_linked_default: false,
             launcher_binding: Some(LauncherBinding {
                 format_version: 1,
-                executable: PathBuf::from(if cfg!(windows) {
-                    "C:\\manager\\roost.exe"
-                } else {
-                    "/manager/roost"
-                }),
+                executable: PathBuf::from("/manager/roost"),
             }),
         }
     }
@@ -822,7 +695,7 @@ mod tests {
     #[test]
     fn path_lists_follow_a_nonempty_inherited_value() {
         let paths = [PathBuf::from("/a"), PathBuf::from("/b")];
-        let sep = if cfg!(windows) { ";" } else { ":" };
+        let sep = ":";
         assert_eq!(
             path_list(Some("/x".into()), &paths).unwrap(),
             OsString::from(format!("/x{sep}/a{sep}/b"))
@@ -835,7 +708,6 @@ mod tests {
         assert!(path_list(None, &[PathBuf::from(format!("/a{sep}b"))]).is_err());
     }
 
-    #[cfg(unix)]
     #[test]
     fn program_resolution_selects_the_first_executable_on_path() {
         use std::os::unix::fs::PermissionsExt;
@@ -966,7 +838,6 @@ mod tests {
         }
     }
 
-    #[cfg(unix)]
     #[test]
     fn posix_quotes_and_bound_transport_preserve_literal_tail() {
         let values = [
@@ -1018,7 +889,6 @@ mod tests {
         assert!(!script.contains("ROOST_DIR="));
     }
 
-    #[cfg(unix)]
     #[test]
     fn captured_probes_drain_both_streams_and_bound_failure() {
         let mut command = Command::new("sh");

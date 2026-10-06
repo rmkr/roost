@@ -1026,7 +1026,7 @@ pub(crate) fn reconcile(store: &Store, registration: &Registration) -> Vec<Strin
     warnings
 }
 
-#[cfg(all(test, unix))]
+#[cfg(test)]
 mod tests {
     use super::*;
     use std::{fs, os::unix::fs::PermissionsExt};
