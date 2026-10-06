@@ -1,4 +1,5 @@
 mod cli;
+mod desktop;
 mod launch;
 mod platform;
 mod sets;
@@ -228,6 +229,10 @@ fn dispatch(action: Action, data: &mut Value) -> Result<Outcome> {
             apply,
         )?)),
         Action::Doctor { .. } => doctor(data),
+        Action::Desktop { name, foreground } => Ok(Outcome {
+            exit: desktop::run(&name, foreground)?,
+            ..Outcome::quiet()
+        }),
         Action::List { retained, full, .. } => {
             let root = platform::root()?;
             let store = match open(&root, OpenMode::Read) {
@@ -461,6 +466,19 @@ fn dispatch(action: Action, data: &mut Value) -> Result<Outcome> {
                     },
                 )?;
                 let (scope, registration) = store.preflight_remove(&name, purge)?;
+                // Ordinary removal of an upstream registration also deletes Roost's own
+                // Desktop folder for it (its Desktop sign-in), after confirmation.
+                let desktop = if !purge && registration.kind == Kind::Upstream {
+                    store.desktop_folder(&registration)?
+                } else {
+                    None
+                };
+                if yes && !purge && registration.kind != Kind::Upstream {
+                    return Err(Error::new(
+                        "usage",
+                        "--yes applies only to --purge or to removing an upstream profile",
+                    ));
+                }
                 let root_id = store.root_id.clone();
                 drop(store);
                 if purge {
@@ -470,8 +488,17 @@ fn dispatch(action: Action, data: &mut Value) -> Result<Outcome> {
                         ),
                         yes,
                     )?;
+                } else if let Some(folder) = &desktop {
+                    platform::confirm(
+                        &format!(
+                            "Remove upstream registration {} and delete Roost's Claude Desktop data folder for it at {} (its Desktop sign-in). Quit that Claude Desktop first. Upstream profile data is not touched.",
+                            registration.name,
+                            folder.display()
+                        ),
+                        yes,
+                    )?;
                 }
-                (root_id, registration)
+                (root_id, registration, desktop)
             };
             let mut store = open(
                 &root,
@@ -482,7 +509,12 @@ fn dispatch(action: Action, data: &mut Value) -> Result<Outcome> {
                 },
             )?;
             let (_, current) = store.preflight_remove(&name, purge)?;
-            if store.root_id != selection.0 || current != selection.1 {
+            let desktop = if !purge && current.kind == Kind::Upstream {
+                store.desktop_folder(&current)?
+            } else {
+                None
+            };
+            if store.root_id != selection.0 || current != selection.1 || desktop != selection.2 {
                 return Err(
                     Error::new("ownership", "Profile changed while removal was pending")
                         .next("Inspect the profile and repeat the command for the intended scope"),
@@ -581,6 +613,7 @@ fn doctor(data: &mut Value) -> Result<Outcome> {
                         }
                     }
                     data["profiles"] = json!(profiles);
+                    findings.extend(desktop::findings(&store));
                 }
                 Err(e) => findings.push(finding(
                     e.code,

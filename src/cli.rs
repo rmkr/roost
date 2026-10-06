@@ -84,7 +84,8 @@ pub enum Action {
         name: String,
         #[arg(long)]
         purge: bool,
-        #[arg(long, requires = "purge")]
+        /// Skip the confirmation (purge, or deleting an upstream profile's Desktop folder)
+        #[arg(long)]
         yes: bool,
     },
     /// Delegate to the existing shared Claude updater
@@ -109,6 +110,14 @@ pub enum Action {
     },
     /// Show help for Roost or one manager command
     Help { command: Option<String> },
+    /// Experimental, Linux only: start Claude Desktop with this profile's own Desktop
+    /// data folder (sign-in) and configuration; detached unless --foreground
+    Desktop {
+        /// Stay attached with Desktop's console output, for debugging
+        #[arg(long)]
+        foreground: bool,
+        name: String,
+    },
     #[command(skip)]
     Version,
     #[command(skip)]
@@ -212,6 +221,7 @@ impl Action {
             | Self::Status { name, .. }
             | Self::Token { name, .. }
             | Self::Remove { name, .. }
+            | Self::Desktop { name, .. }
             | Self::Set {
                 action: SetAction::Subscribe { name, .. } | SetAction::Unsubscribe { name, .. },
             } => Some(name),
@@ -356,10 +366,31 @@ mod tests {
         assert_eq!(arguments, vec!["--", "--help", "--allow-auth-env", ""]);
     }
     #[test]
+    fn desktop_takes_one_name_and_no_forwarded_tail() {
+        let Action::Desktop { foreground, name } = parse(&["roost", "desktop", "Work"]) else {
+            panic!()
+        };
+        assert!(!foreground);
+        assert_eq!(name, "Work");
+        assert!(matches!(
+            parse(&["roost", "desktop", "Work", "--foreground"]),
+            Action::Desktop {
+                foreground: true,
+                ..
+            }
+        ));
+        for values in [
+            vec!["roost", "desktop"],
+            vec!["roost", "desktop", "Work", "--", "--flag"],
+            vec!["roost", "desktop", "Work", "extra"],
+        ] {
+            assert!(parse_from(values.iter().map(OsString::from).collect()).is_err());
+        }
+    }
+    #[test]
     fn invalid_combinations_are_rejected() {
         for values in [
             vec!["roost", "add", "work", "--yes"],
-            vec!["roost", "remove", "work", "--yes"],
             vec!["roost", "token", "work", "--stdin", "--clear"],
             vec!["roost", "add", "work", "--source", "."],
         ] {
