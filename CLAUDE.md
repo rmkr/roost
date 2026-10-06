@@ -4,7 +4,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## What this is
 
-Roost (crate `roost-claude`, binary `roost`) is a Rust CLI that manages Claude Code configuration profiles alongside an existing Claude installation: it creates **owned** profiles under `~/.roost` (or `ROOST_DIR`), **registers upstream** profiles at their existing paths without taking ownership, and launches the real `claude` with the right `CLAUDE_CONFIG_DIR`/token environment. Source-only development build; Linux is the only verified platform, and the Windows storage backend deliberately refuses every operation.
+Roost (crate `roost-claude`, binary `roost`) is a Rust CLI that manages Claude Code configuration profiles alongside an existing Claude installation: it creates **owned** profiles under `~/.roost` (or `ROOST_DIR`), **registers upstream** profiles at their existing paths without taking ownership, and launches the real `claude` with the right `CLAUDE_CONFIG_DIR`/token environment. Source-only development build; Linux and macOS are verified (`roost desktop` is Linux-only; macOS temp dirs sit under the `/var` → `/private/var` symlink, so tests canonicalize `temp_dir()`), and the Windows storage backend deliberately refuses every operation.
 
 Authoritative behavior lives in `.scratch/rust-port/spec.md` (accepted spec, including the workflow UX amendments), with the implementation record and remaining acceptance gates in `.scratch/rust-port/implementation.md`. Use the terms defined in `GLOSSARY.md` (profile vs. account, owned vs. registered upstream, retained profile, manager token, default alias, selected profile, shared set, plugin store, instruction and settings fragments) — the code and docs rely on these distinctions.
 

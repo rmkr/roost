@@ -28,7 +28,7 @@ impl Fixture {
     /// A fresh fixture under `roost-<prefix>-<pid>-<n>` with each `(name, script)`
     /// of `fakes` written to `bin/` as an owner-only executable.
     pub fn with_fakes(prefix: &str, fakes: &[(&str, &str)]) -> Self {
-        let path = std::env::temp_dir().join(format!(
+        let path = std::env::temp_dir().canonicalize().unwrap().join(format!(
             "roost-{prefix}-{}-{}",
             std::process::id(),
             SEQUENCE.fetch_add(1, Ordering::Relaxed)

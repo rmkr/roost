@@ -619,16 +619,19 @@ fn upstream_switch_bare_and_desktop_launches_inject_but_aliases_and_update_do_no
     let out = f.ok(&[]);
     assert_eq!(parsed(&out)["env"]["CLAUDE_CODE_PLUGIN_DIRS"], s(&expected));
     // Desktop gets the same environment.
-    f.ok(&["desktop", "--foreground", "Work"]);
-    let record: Value = serde_json::from_str(
-        fs::read_to_string(f.path.join("desktop.jsonl"))
-            .unwrap()
-            .lines()
-            .last()
-            .unwrap(),
-    )
-    .unwrap();
-    assert_eq!(record["env"]["CLAUDE_CODE_PLUGIN_DIRS"], s(&expected));
+    #[cfg(target_os = "linux")]
+    {
+        f.ok(&["desktop", "--foreground", "Work"]);
+        let record: Value = serde_json::from_str(
+            fs::read_to_string(f.path.join("desktop.jsonl"))
+                .unwrap()
+                .lines()
+                .last()
+                .unwrap(),
+        )
+        .unwrap();
+        assert_eq!(record["env"]["CLAUDE_CODE_PLUGIN_DIRS"], s(&expected));
+    }
     // Aliases and the shared updater keep the caller environment exactly.
     f.ok(&["add", "personal", "--link-default"]);
     f.fails(&["set", "subscribe", "personal", "dev"], "usage");

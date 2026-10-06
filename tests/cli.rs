@@ -1,4 +1,6 @@
 #![cfg(unix)]
+// The desktop helpers serve only the Linux-only desktop tests.
+#![cfg_attr(not(target_os = "linux"), allow(dead_code))]
 mod common;
 use common::{Fixture, parsed, private};
 use serde_json::{Value, json};
@@ -770,6 +772,14 @@ fn purge_unlinks_contained_symlink_without_deleting_target() {
 #[test]
 fn fish_path_apply_is_scoped_idempotent_and_refuses_foreign_snippet() {
     let f = Fixture::new();
+    // A fake fish answering the discovery query as real fish does under XDG_CONFIG_HOME.
+    let fish = f.bin.join("fish");
+    fs::write(
+        &fish,
+        "#!/bin/sh\nprintf '%s\\n' \"$XDG_CONFIG_HOME/fish\"\n",
+    )
+    .unwrap();
+    fs::set_permissions(&fish, fs::Permissions::from_mode(0o700)).unwrap();
     let config = f.home.join(".config/fish/conf.d");
     fs::create_dir_all(&config).unwrap();
     private(&f.home.join(".config"));
@@ -956,7 +966,7 @@ import errno,json,os,pathlib,pty,select,signal,subprocess,sys,tempfile,time
 exe=sys.argv[1]
 results=[]
 for action in ('purge','token'):
-    with tempfile.TemporaryDirectory(prefix='roost-prompt-race-') as folder:
+    with tempfile.TemporaryDirectory(prefix='roost-prompt-race-',dir=os.path.realpath(tempfile.gettempdir())) as folder:
         root=pathlib.Path(folder)/'root';env={'HOME':folder,'ROOST_DIR':str(root),'PATH':'/usr/bin:/bin'}
         def manager(*args):
             result=subprocess.run([exe,*args],env=env,capture_output=True,timeout=5)
@@ -1093,6 +1103,7 @@ fn switch_selects_per_project_and_bare_roost_launches_it() {
     );
 }
 
+#[cfg(target_os = "linux")]
 #[test]
 fn desktop_gives_owned_and_upstream_profiles_their_own_data_folder() {
     let f = Fixture::new();
@@ -1161,6 +1172,7 @@ fn desktop_gives_owned_and_upstream_profiles_their_own_data_folder() {
     f.ok(&["list"]);
 }
 
+#[cfg(target_os = "linux")]
 #[test]
 fn desktop_default_alias_launches_plain_with_the_caller_environment() {
     let f = Fixture::new();
@@ -1186,6 +1198,7 @@ fn desktop_default_alias_launches_plain_with_the_caller_environment() {
     assert!(!f.root.join("state.json").exists());
 }
 
+#[cfg(target_os = "linux")]
 #[test]
 fn desktop_detaches_by_default_and_reports_an_early_exit() {
     let f = Fixture::new();
@@ -1246,6 +1259,7 @@ fn hostname() -> String {
         .to_owned()
 }
 
+#[cfg(target_os = "linux")]
 #[test]
 fn desktop_refuses_a_running_profile_and_warns_about_other_instances() {
     let f = Fixture::new();
@@ -1300,6 +1314,7 @@ fn desktop_refuses_a_running_profile_and_warns_about_other_instances() {
     );
 }
 
+#[cfg(target_os = "linux")]
 #[test]
 fn purge_and_upstream_remove_refuse_while_that_desktop_runs() {
     let f = Fixture::new();
@@ -1395,6 +1410,7 @@ fn alive(pid: i32) -> bool {
     })
 }
 
+#[cfg(target_os = "linux")]
 #[test]
 fn desktop_close_terminates_the_verified_desktop_and_is_a_noop_when_not_running() {
     let f = Fixture::new();
@@ -1423,6 +1439,7 @@ fn desktop_close_terminates_the_verified_desktop_and_is_a_noop_when_not_running(
     f.fails(&["desktop", "--close", "Missing"], "not_found");
 }
 
+#[cfg(target_os = "linux")]
 #[test]
 fn desktop_close_of_the_alias_closes_the_shared_conventional_instance() {
     let f = Fixture::new();
@@ -1449,6 +1466,7 @@ fn desktop_close_of_the_alias_closes_the_shared_conventional_instance() {
     assert!(!alive(pid));
 }
 
+#[cfg(target_os = "linux")]
 #[test]
 fn desktop_close_reports_a_desktop_that_ignores_sigterm_and_never_escalates() {
     let f = Fixture::new();
@@ -1480,6 +1498,7 @@ fn desktop_close_reports_a_desktop_that_ignores_sigterm_and_never_escalates() {
     assert!(waited < std::time::Duration::from_secs(20), "{waited:?}");
 }
 
+#[cfg(target_os = "linux")]
 #[test]
 fn desktop_close_refuses_a_lock_naming_a_process_that_is_not_claude_desktop() {
     let f = Fixture::new();
@@ -1499,6 +1518,7 @@ fn desktop_close_refuses_a_lock_naming_a_process_that_is_not_claude_desktop() {
     assert!(untouched, "the unrelated process was signalled");
 }
 
+#[cfg(target_os = "linux")]
 #[test]
 fn desktop_needs_the_app_on_path_and_an_active_profile() {
     let f = Fixture::new();
@@ -1524,6 +1544,7 @@ fn desktop_needs_the_app_on_path_and_an_active_profile() {
     assert!(String::from_utf8_lossy(&out.stderr).contains("not_found"));
 }
 
+#[cfg(target_os = "linux")]
 #[test]
 fn desktop_folder_follows_remove_purge_and_upstream_lifecycle() {
     let f = Fixture::new();
@@ -1598,6 +1619,7 @@ fn desktop_folder_follows_remove_purge_and_upstream_lifecycle() {
     );
 }
 
+#[cfg(target_os = "linux")]
 #[test]
 fn doctor_warns_when_desktop_ignored_its_data_folder() {
     let f = Fixture::new();
@@ -1624,6 +1646,7 @@ fn doctor_warns_when_desktop_ignored_its_data_folder() {
     assert!(!doctor.to_string().contains("desktop_data_not_isolated"));
 }
 
+#[cfg(target_os = "linux")]
 #[test]
 fn partial_desktop_deletion_keeps_the_journal_until_an_explicit_purge_retry() {
     let f = Fixture::new();
@@ -1649,6 +1672,7 @@ fn partial_desktop_deletion_keeps_the_journal_until_an_explicit_purge_retry() {
     assert!(!f.root.join("profiles/Work").exists());
 }
 
+#[cfg(target_os = "linux")]
 #[test]
 fn desktop_launch_reconciles_subscribed_skill_links() {
     let f = Fixture::new();
@@ -2220,6 +2244,7 @@ fn picker_row(text: &str, name: &str) -> String {
         .to_owned()
 }
 
+#[cfg(target_os = "linux")]
 #[test]
 fn desktop_without_name_highlights_the_last_desktop_launch_and_launches_detached() {
     let f = Fixture::new();
@@ -2266,6 +2291,7 @@ fn desktop_without_name_highlights_the_last_desktop_launch_and_launches_detached
     assert_eq!(state["selections"], json!([]), "{state}");
 }
 
+#[cfg(target_os = "linux")]
 #[test]
 fn desktop_picker_falls_back_to_last_used_and_foreground_stays_attached() {
     let f = Fixture::new();
@@ -2287,6 +2313,7 @@ fn desktop_picker_falls_back_to_last_used_and_foreground_stays_attached() {
     );
 }
 
+#[cfg(target_os = "linux")]
 #[test]
 fn desktop_picker_marks_and_refuses_a_running_profile_and_cancels_with_130() {
     let f = Fixture::new();
@@ -2314,6 +2341,7 @@ fn desktop_picker_marks_and_refuses_a_running_profile_and_cancels_with_130() {
     assert_eq!(fs::read(f.root.join("state.json")).unwrap(), state);
 }
 
+#[cfg(target_os = "linux")]
 #[test]
 fn desktop_picker_x_closes_a_running_row_and_stays_open_with_the_row_refreshed() {
     let f = Fixture::new();
@@ -2349,6 +2377,7 @@ fn desktop_picker_x_closes_a_running_row_and_stays_open_with_the_row_refreshed()
     assert_eq!(f.desktop_launches().len(), 2);
 }
 
+#[cfg(target_os = "linux")]
 #[test]
 fn desktop_picker_x_on_a_row_that_is_not_running_only_says_so() {
     let f = Fixture::new();
@@ -2389,6 +2418,7 @@ fn other_pickers_ignore_x_and_keep_their_footer() {
     );
 }
 
+#[cfg(target_os = "linux")]
 #[test]
 fn desktop_without_name_and_terminal_is_usage_naming_desktop_name() {
     let f = Fixture::new();
@@ -2418,6 +2448,7 @@ fn state_json(f: &Fixture) -> Value {
     serde_json::from_slice(&fs::read(f.root.join("state.json")).unwrap()).unwrap()
 }
 
+#[cfg(target_os = "linux")]
 #[test]
 fn linked_desktop_borrows_the_conventional_folder_in_place() {
     let f = Fixture::new();
@@ -2522,6 +2553,7 @@ fn linked_desktop_borrows_the_conventional_folder_in_place() {
     f.ok(&["desktop", "--link", "Other"]);
 }
 
+#[cfg(target_os = "linux")]
 #[test]
 fn link_follows_xdg_config_home_from_the_caller_environment() {
     let f = Fixture::new();
@@ -2554,6 +2586,7 @@ fn detached_from_terminal(f: &Fixture, args: &[&str]) -> Output {
     command.output().unwrap()
 }
 
+#[cfg(target_os = "linux")]
 #[test]
 fn link_replaces_an_own_desktop_folder_only_after_confirmation() {
     let f = Fixture::new();
@@ -2597,6 +2630,7 @@ fn link_replaces_an_own_desktop_folder_only_after_confirmation() {
     f.ok(&["doctor"]);
 }
 
+#[cfg(target_os = "linux")]
 #[test]
 fn linked_desktop_shares_one_instance_with_the_alias_and_survives_removal() {
     let f = Fixture::new();
@@ -2651,6 +2685,7 @@ fn linked_desktop_shares_one_instance_with_the_alias_and_survives_removal() {
     assert!(upstream.exists());
 }
 
+#[cfg(target_os = "linux")]
 #[test]
 fn desktop_picker_shows_the_borrowed_folder_for_the_linked_and_alias_rows() {
     let f = Fixture::new();

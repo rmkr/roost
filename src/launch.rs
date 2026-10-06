@@ -839,8 +839,10 @@ mod tests {
     #[test]
     fn program_resolution_selects_the_first_executable_on_path() {
         use std::os::unix::fs::PermissionsExt;
-        let base =
-            env::temp_dir().join(format!("roost-resolve-{}", platform::random_id().unwrap()));
+        let base = env::temp_dir()
+            .canonicalize()
+            .unwrap()
+            .join(format!("roost-resolve-{}", platform::random_id().unwrap()));
         let (first, second) = (base.join("first"), base.join("second"));
         std::fs::create_dir_all(&first).unwrap();
         std::fs::create_dir_all(&second).unwrap();

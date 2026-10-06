@@ -87,7 +87,7 @@ pub(crate) fn file_mode(file: &File) -> Result<u32> {
 
 /// Sets an opened file's permission bits (`0o777`).
 pub(crate) fn set_file_mode(file: &File, mode: u32) -> Result<()> {
-    fs::fchmod(file, Mode::from_raw_mode(mode & 0o777))
+    fs::fchmod(file, Mode::from_raw_mode((mode & 0o777) as _))
         .map_err(|e| Error::new("io", format!("Cannot set file mode: {e}")))
 }
 
@@ -610,7 +610,7 @@ impl Directory {
             &self.file,
             name,
             OFlags::RDWR | OFlags::CREATE | OFlags::EXCL | OFlags::NOFOLLOW | OFlags::CLOEXEC,
-            Mode::from_raw_mode(mode),
+            Mode::from_raw_mode(mode as _),
         )
         .map(File::from)
         .map_err(|e| native_error("create private file", &path, e))?;
@@ -1336,8 +1336,10 @@ mod tests {
     }
     #[test]
     fn copy_excludes_sensitive_and_linked_objects_at_depth() {
-        let path =
-            std::env::temp_dir().join(format!("roost-copy-{}", super::super::random_id().unwrap()));
+        let path = std::env::temp_dir()
+            .canonicalize()
+            .unwrap()
+            .join(format!("roost-copy-{}", super::super::random_id().unwrap()));
         let fixture = Directory::create(&path).unwrap();
         let source = fixture.create_dir("source").unwrap();
         let nested = source.create_dir("nested").unwrap();
@@ -1387,7 +1389,7 @@ mod tests {
 
     #[test]
     fn symlinks_are_created_and_read_relative_to_the_handle_without_following() {
-        let path = std::env::temp_dir().join(format!(
+        let path = std::env::temp_dir().canonicalize().unwrap().join(format!(
             "roost-symlink-{}",
             super::super::random_id().unwrap()
         ));
@@ -1439,7 +1441,7 @@ mod tests {
     }
     #[test]
     fn anchored_files_and_no_link_traversal() {
-        let path = std::env::temp_dir().join(format!(
+        let path = std::env::temp_dir().canonicalize().unwrap().join(format!(
             "roost-platform-{}",
             super::super::random_id().unwrap()
         ));
@@ -1468,7 +1470,7 @@ mod tests {
 
     #[test]
     fn purge_refuses_replaced_parent_path() {
-        let path = std::env::temp_dir().join(format!(
+        let path = std::env::temp_dir().canonicalize().unwrap().join(format!(
             "roost-purge-{}",
             super::super::random_id().unwrap()
         ));

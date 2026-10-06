@@ -1034,7 +1034,7 @@ mod tests {
     struct Temp(PathBuf);
     impl Temp {
         fn new() -> Self {
-            let path = std::env::temp_dir().join(format!(
+            let path = std::env::temp_dir().canonicalize().unwrap().join(format!(
                 "roost-settings-unit-{}",
                 crate::platform::random_id().unwrap()
             ));

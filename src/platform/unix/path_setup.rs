@@ -364,7 +364,7 @@ mod tests {
     #[test]
     fn startup_apply_preserves_permissions_and_refuses_links() {
         use std::os::unix::fs::PermissionsExt;
-        let path = std::env::temp_dir().join(format!(
+        let path = std::env::temp_dir().canonicalize().unwrap().join(format!(
             "roost-path-{}",
             super::super::super::random_id().unwrap()
         ));
