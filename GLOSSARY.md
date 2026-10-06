@@ -63,3 +63,7 @@ _Avoid_: Shared profile, plugin cache
 **Instruction fragment**:
 A self-contained file of Claude instructions on one topic that a shared set can carry.
 _Avoid_: Shared CLAUDE.md, snippet, partial
+
+**Settings fragment**:
+A small file of Claude settings for one concern, such as a tool's hooks or the status line, that a shared set can carry.
+_Avoid_: Shared settings.json, settings snippet
