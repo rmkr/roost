@@ -36,7 +36,7 @@ impl Fixture {
 import json,os,sys,time
 args=sys.argv[1:]
 if args==['--version']:
-    print(os.environ.get('FAKE_CLAUDE_VERSION','2.1.268 (Claude Code)'));sys.exit(0)
+    print(os.environ.get('FAKE_CLAUDE_VERSION','2.1.280 (Claude Code)'));sys.exit(0)
 mode=os.environ.get('FAKE_CLAUDE_MODE','')
 if mode=='slow':
     ready=os.environ.get('FAKE_CLAUDE_READY')
@@ -521,15 +521,13 @@ fn child_numeric_result_is_preserved_and_old_claude_refused() {
     let out = f
         .command()
         .args(["run", "Work"])
-        .env("FAKE_CLAUDE_VERSION", "2.1.267 (Claude Code)")
+        .env("FAKE_CLAUDE_VERSION", "2.1.279 (Claude Code)")
         .output()
         .unwrap();
     assert_eq!(out.status.code(), Some(1));
-    assert!(
-        String::from_utf8(out.stderr)
-            .unwrap()
-            .contains("claude_unsupported")
-    );
+    let stderr = String::from_utf8(out.stderr).unwrap();
+    assert!(stderr.contains("claude_unsupported"));
+    assert!(stderr.contains("Claude Code 2.1.280 or later"));
 }
 
 #[test]

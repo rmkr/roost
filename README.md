@@ -17,7 +17,7 @@ roost doctor
 
 Keep Cargo's normal collision protection: do not force-overwrite an unrelated `roost` executable. Cargo owns its installation root/bin; Roost's profile storage and generated-launcher PATH are separate. Check which executable your shell resolves before use.
 
-Roost requires an existing supported Claude installation on PATH, with Claude Code 2.1.268 or later. Roost does not install Claude. Native Windows targets require the selected `claude.exe`; batch shims are unsupported initially.
+Roost requires an existing supported Claude installation on PATH, with Claude Code 2.1.280 or later. Roost does not install Claude. Native Windows targets require the selected `claude.exe`; batch shims are unsupported initially.
 
 ## First profile and login
 

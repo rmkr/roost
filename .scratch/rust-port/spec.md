@@ -26,7 +26,7 @@ Roost uses MIT. Extra upstream credits/revision text is not required in README/h
 
 ## Version and platform targets
 
-Initial source-testing toolchain: Rust/Cargo **1.97.0**. This is a selected pin, not a proven application MSRV. Claude Code **2.1.268+** is the selected documented lower bound for status `configDirectory`; prove floor/current required features before claiming support, and explicitly raise the floor if needed. Fish **3.2+** supplies `fish_add_path --path`. PowerShell **5.1** and **7+** remain required. Use portable POSIX syntax for sh/Bash/Zsh; record actual tested versions rather than invent historical floors.
+Initial source-testing toolchain: Rust/Cargo **1.97.0**. This is a selected pin, not a proven application MSRV. Claude Code **2.1.280+** is the selected documented lower bound for status `configDirectory`; prove floor/current required features before claiming support, and explicitly raise the floor if needed. Fish **3.2+** supplies `fish_add_path --path`. PowerShell **5.1** and **7+** remain required. Use portable POSIX syntax for sh/Bash/Zsh; record actual tested versions rather than invent historical floors.
 
 | Environment | Required Rust target | Intended combined runtime baseline |
 | --- | --- | --- |

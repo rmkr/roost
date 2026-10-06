@@ -450,7 +450,7 @@ fn parse_version(bytes: &[u8]) -> Option<String> {
         .map(str::parse::<u64>)
         .collect::<std::result::Result<Vec<_>, _>>()
         .ok()?;
-    if parts.len() != 3 || (parts[0], parts[1], parts[2]) < (2, 1, 268) {
+    if parts.len() != 3 || (parts[0], parts[1], parts[2]) < (2, 1, 280) {
         return None;
     }
     Some(format!("{}.{}.{}", parts[0], parts[1], parts[2]))
@@ -471,7 +471,7 @@ fn version_at(path: &OsStr) -> Result<String> {
             "claude_unsupported",
             "Claude version is unsupported or unrecognized",
         )
-        .next("Use Claude Code 2.1.268 or later with supported native status")
+        .next("Use Claude Code 2.1.280 or later with supported native status")
     })
 }
 pub fn claude_info() -> Result<(PathBuf, String)> {
@@ -696,17 +696,18 @@ mod tests {
     #[test]
     fn version_floor_is_exact() {
         assert_eq!(
-            parse_version(b"2.1.268 (Claude Code)\n").as_deref(),
-            Some("2.1.268")
+            parse_version(b"2.1.280 (Claude Code)\n").as_deref(),
+            Some("2.1.280")
         );
         assert_eq!(parse_version(b"3.0.0"), Some("3.0.0".to_owned()));
         for bytes in [
-            &b"2.1.267"[..],
+            &b"2.1.279"[..],
+            b"2.1.268",
             b"2.0.999",
             b"2.1",
-            b"text 2.1.268",
-            b"2.1.268-beta",
-            b"2.1.268\nsecret",
+            b"text 2.1.280",
+            b"2.1.280-beta",
+            b"2.1.280\nsecret",
         ] {
             assert!(parse_version(bytes).is_none());
         }
