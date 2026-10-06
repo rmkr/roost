@@ -5,7 +5,7 @@ Labels: workflow-ux
 Status: open
 Assignee: unassigned
 Parent: [Make Roost simpler to work with day to day](../map.md)
-Blocked by: 01, 03
+Blocked by: 01, 03, 10
 
 ## Question
 
