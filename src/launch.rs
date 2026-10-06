@@ -213,10 +213,6 @@ impl ProfileEnv {
     }
     /// Sets (or overrides) one variable on an isolated launch; ignored for aliases,
     /// whose caller environment always passes through unchanged.
-    #[allow(
-        dead_code,
-        reason = "shared scaffold for plugin injection (07) and Desktop (09)"
-    )]
     pub fn set(&mut self, name: &'static str, value: impl Into<OsString>) {
         if !self.isolated {
             return;

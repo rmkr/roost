@@ -256,10 +256,6 @@ impl Directory {
 
     /// Creates `name` as a symbolic link to the absolute `target`, relative to this
     /// verified handle. Never replaces an existing entry; returns the link's own identity.
-    #[allow(
-        dead_code,
-        reason = "shared scaffold for set links (05) and Desktop (09)"
-    )]
     pub fn symlink(&self, target: &Path, name: &str) -> Result<FileIdentity> {
         valid_name(name)?;
         let text = target
@@ -286,10 +282,6 @@ impl Directory {
 
     /// Reads the text of the link `name` without following it. `None` when absent;
     /// any other object type is unsafe_path.
-    #[allow(
-        dead_code,
-        reason = "shared scaffold for set links (05) and Desktop (09)"
-    )]
     pub fn read_link(&self, name: &str) -> Result<Option<PathBuf>> {
         valid_name(name)?;
         let path = self.path.join(name);

@@ -5,11 +5,6 @@
 //! Records are keyed by registration ID; entries naming an unknown registration are
 //! ignored on read and dropped by the next write.
 
-#![allow(
-    dead_code,
-    reason = "shared scaffold consumed by selection (04), sets (05), plugins (07) and Desktop (09)"
-)]
-
 use super::{
     Directory, LIMIT, OpenMode, Registry, Result, Store, encode, err, file_state, nullable, parse,
     valid_id, validate_identity,
