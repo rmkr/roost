@@ -12,3 +12,11 @@ Blocked by: 01, 03, 10
 Implement [design: selected profile and switching](../design.md#selected-profile-and-switching): project key from the git common directory, bare `roost` launch, arrow-key picker with last-used highlight, non-terminal failure, `switch` with `--no-launch`/`--forget`, default-alias selection, last-used recording from run/switch/launchers, stale-selection handling, and clearing on remove/purge. Add the `@`/`^` markers and Last used column to `ls`.
 
 ## Comments
+
+2026-10-06 (Claude subagent ticket-04): Implemented on branch `ticket/04-selected-profile`, not yet resolved.
+- `src/select.rs`: project key (walks to `.git`, `gitdir:`/`commondir`, fallback to the current directory with a warning, unsafe_path for non-Unicode/CRLF keys), bare `roost` (`[--allow-auth-env] [-- tail]`), `switch` (`--no-launch`, `--forget`), picker flow (lock released while waiting, then reacquire, revalidate, record), last-use recording (`launched`, called from Run/Internal next to `sets::reconcile_at_launch`; aliases record nothing), `annotate` for `last_used`/`selected`/`most_recent`, and `forget_removed` (Remove arm).
+- `platform::pick` (unix raw mode on stdin, drawn on stderr; Up/Down/k/j/Enter; Esc/q/Ctrl-C/Ctrl-D/EOF return 130) plus a fail-closed Windows stub.
+- `ls`: `@`/`^` marker, Last used column, legend in the summary; list JSON `project` filled. Doctor records are annotated as well.
+- `Store::read_state_unfiltered` added to `store::side` so a stale selection that names a dropped registration can still be reported.
+- Interpretation: `switch NAME` (launching) warns and still launches when the selection write fails (Launch-time mutation, A15); `switch --no-launch` and `--forget` fail with the side file's error category.
+- Test note: this machine has an empty `/tmp/.git`, so every temp directory shares one project key; CLI tests give each project its own `.git` (`repo()` helper).
