@@ -211,9 +211,7 @@ pub fn stdout_color() -> bool {
 /// The human `list` table over ProfileRecord values. Later columns append here.
 pub fn profiles(records: &[Value], full: bool, color: bool, width: Option<usize>) -> Vec<String> {
     let upstream = records.iter().filter(|r| r["kind"] == "upstream").count();
-    let now = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map_or(0, |d| d.as_secs());
+    let now = crate::platform::unix_seconds();
     let mut table = Table::new()
         .marker(|r: &Value| {
             if r["selected"] == true {

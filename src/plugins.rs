@@ -93,13 +93,6 @@ impl Record {
     }
 }
 
-fn now() -> SystemTime {
-    SystemTime::now()
-}
-fn unix_seconds() -> u64 {
-    now().duration_since(UNIX_EPOCH).map_or(0, |d| d.as_secs())
-}
-
 /// PLUGIN or MARKETPLACE: 1–128 characters, no whitespace, control characters,
 /// `/`, `\` or `@`.
 fn valid_part(part: &str) -> bool {
@@ -512,7 +505,7 @@ fn prune(store: &Directory, record: &Record) -> Vec<String> {
     else {
         return warnings;
     };
-    let now_ms = now()
+    let now_ms = SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .map_or(0, |d| d.as_millis());
     let directories = |parent: &Directory| -> Vec<(String, Directory)> {
@@ -736,7 +729,7 @@ fn claim_update(store: &Store, warnings: &mut Vec<String>) -> bool {
             return false;
         }
     };
-    let now = unix_seconds();
+    let now = platform::unix_seconds();
     if state
         .plugin_auto_update_at
         .is_some_and(|at| at <= now && now - at < AUTO_UPDATE_INTERVAL)

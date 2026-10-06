@@ -126,10 +126,16 @@ fn selection_key() -> Result<PathBuf> {
     project.key
 }
 
-fn now() -> u64 {
-    std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map_or(0, |d| d.as_secs())
+/// Sets `id`'s time in a per-registration timestamp list (`last_used`,
+/// `desktop_launched`), adding an entry when absent.
+pub(crate) fn stamp(list: &mut Vec<Timestamp>, id: &str, at: u64) {
+    match list.iter_mut().find(|t| t.registration_id == id) {
+        Some(time) => time.at = at,
+        None => list.push(Timestamp {
+            registration_id: id.to_owned(),
+            at,
+        }),
+    }
 }
 
 fn open_launch(root: &Path) -> Result<Store> {
@@ -148,20 +154,9 @@ pub fn launched(store: &Store, registration: &Registration) {
     if registration.kind == Kind::DefaultAlias {
         return;
     }
-    let at = now();
-    let id = &registration.registration_id;
+    let at = platform::unix_seconds();
     let result = store.update_state(|state| {
-        match state
-            .last_used
-            .iter_mut()
-            .find(|t| &t.registration_id == id)
-        {
-            Some(time) => time.at = at,
-            None => state.last_used.push(Timestamp {
-                registration_id: id.clone(),
-                at,
-            }),
-        }
+        stamp(&mut state.last_used, &registration.registration_id, at);
         Ok(())
     });
     if let Err(e) = result {

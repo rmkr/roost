@@ -61,6 +61,14 @@ pub fn absolute(path: &Path) -> Result<PathBuf> {
     Ok(result)
 }
 
+/// Seconds since the Unix epoch (0 if the clock is before it): the one clock used
+/// for recorded launch times, the auto-update window and relative ages.
+pub fn unix_seconds() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |d| d.as_secs())
+}
+
 pub fn root() -> Result<PathBuf> {
     match std::env::var_os("ROOST_DIR") {
         Some(value) => absolute(Path::new(&value)),

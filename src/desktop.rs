@@ -6,10 +6,7 @@
 //! [ADR 0002]: ../docs/adr/0002-desktop-per-profile-via-user-data-dir.md
 use crate::{
     Error, Result, launch, platform,
-    store::{
-        Kind, OpenMode, Registration, Store,
-        side::{StateFile, Timestamp},
-    },
+    store::{Kind, OpenMode, Registration, Store, side::StateFile},
 };
 use serde_json::{Value, json};
 use std::{
@@ -125,18 +122,9 @@ pub fn refuse_if_running(store: &Store, registration: &Registration) -> Result<(
 }
 
 fn record_launch(state: &mut StateFile, id: &str) {
-    let at = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map_or(0, |d| d.as_secs());
-    for list in [&mut state.last_used, &mut state.desktop_launched] {
-        match list.iter_mut().find(|t| t.registration_id == id) {
-            Some(stamp) => stamp.at = at,
-            None => list.push(Timestamp {
-                registration_id: id.to_owned(),
-                at,
-            }),
-        }
-    }
+    let at = platform::unix_seconds();
+    crate::select::stamp(&mut state.last_used, id, at);
+    crate::select::stamp(&mut state.desktop_launched, id, at);
 }
 
 /// The `SingletonLock` link of the conventional Desktop folder, if any.
