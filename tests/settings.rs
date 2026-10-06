@@ -330,6 +330,12 @@ fn status_line_and_output_style_back_off_to_the_profiles_own_values() {
     .unwrap();
     f.ok(&["run", "Work"]);
     assert_eq!(f.settings("Work")["statusLine"], new_line);
+    // A recorded value deleted by hand is absent, not the profile's own: re-added.
+    let mut settings = f.settings("Work");
+    settings.as_object_mut().unwrap().remove("statusLine");
+    f.write_settings("Work", &settings.to_string());
+    f.ok(&["run", "Work"]);
+    assert_eq!(f.settings("Work")["statusLine"], new_line);
     // The user changing a recorded value wins: Roost warns once and lets go.
     let mut settings = f.settings("Work");
     settings["outputStyle"] = json!("explanatory");
