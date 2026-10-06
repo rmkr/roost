@@ -208,6 +208,15 @@ pub fn stdout_color() -> bool {
     )
 }
 
+/// Color decision for standard error (where the picker draws).
+pub fn stderr_color() -> bool {
+    use std::io::IsTerminal;
+    color_enabled(
+        std::io::stderr().is_terminal(),
+        std::env::var_os("NO_COLOR").as_deref(),
+    )
+}
+
 /// The human `list` table over ProfileRecord values. Later columns append here.
 pub fn profiles(records: &[Value], full: bool, color: bool, width: Option<usize>) -> Vec<String> {
     let upstream = records.iter().filter(|r| r["kind"] == "upstream").count();

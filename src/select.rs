@@ -240,15 +240,33 @@ pub fn launch_selected(allow_auth_env: bool, arguments: &[OsString]) -> Result<O
                 ),
                 None => (),
             }
-            pick(store, &root, &key)?
+            let (store, registration, recorded) = pick(store, &root, &key)?;
+            warn_unrecorded(&registration, recorded);
+            (store, registration)
         }
     };
     start(store, &registration, allow_auth_env, arguments)
 }
 
-/// Shows the picker with the lock released, then reacquires, revalidates the
-/// choice and records the selection (failure warns).
-fn pick(store: Store, root: &Path, key: &Path) -> Result<(Store, Registration)> {
+fn warn_unrecorded(registration: &Registration, recorded: Result<()>) {
+    if let Err(e) = recorded {
+        eprintln!(
+            "warning: Could not remember {} for this project: {}",
+            registration.name, e.message
+        );
+    }
+}
+
+fn terminal() -> bool {
+    use std::io::IsTerminal;
+    std::io::stdin().is_terminal() && std::io::stderr().is_terminal()
+}
+
+/// Shows the picker with the lock released, highlighting this project's valid
+/// selection, else the most recently launched profile, else the first row. Then
+/// reacquires, revalidates the choice and records the selection, returning the
+/// recording result for the caller to warn about or fail on.
+fn pick(store: Store, root: &Path, key: &Path) -> Result<(Store, Registration, Result<()>)> {
     let active = store
         .registry
         .registrations
@@ -258,8 +276,7 @@ fn pick(store: Store, root: &Path, key: &Path) -> Result<(Store, Registration)> 
         return Err(Error::new("not_found", "No active profiles to choose from")
             .next("Create a profile with roost add NAME"));
     }
-    use std::io::IsTerminal;
-    if !(std::io::stdin().is_terminal() && std::io::stderr().is_terminal()) {
+    if !terminal() {
         return Err(Error::new(
             "usage",
             "No profile is selected for this project and no terminal is available to choose one",
@@ -281,10 +298,11 @@ fn pick(store: Store, root: &Path, key: &Path) -> Result<(Store, Registration)> 
                 .ok_or_else(|| Error::new("ownership", "Profile list changed while reading"))
         })
         .collect::<Result<_>>()?;
-    let lines = table::profiles(&records, false, false, None);
+    let lines = table::profiles(&records, false, table::stderr_color(), None);
     let initial = records
         .iter()
-        .position(|r| r["most_recent"] == true)
+        .position(|r| r["selected"] == true)
+        .or_else(|| records.iter().position(|r| r["most_recent"] == true))
         .unwrap_or(0);
     let root_id = store.root_id.clone();
     drop(store);
@@ -302,17 +320,13 @@ fn pick(store: Store, root: &Path, key: &Path) -> Result<(Store, Registration)> 
                 .next("Run roost again to choose from the current profiles"),
         );
     }
-    if let Err(e) = record_selection(&store, key, chosen) {
-        eprintln!(
-            "warning: Could not remember {} for this project: {}",
-            chosen.name, e.message
-        );
-    }
-    Ok((store, chosen.clone()))
+    let recorded = record_selection(&store, key, chosen);
+    Ok((store, chosen.clone(), recorded))
 }
 
-/// `roost switch`: select NAME for this project and launch it, only select it
-/// (`no_launch`), or clear this project's selection (`forget`).
+/// `roost switch`: select NAME (or, without NAME, the picker's choice) for this
+/// project and launch it, only select it (`no_launch`), or clear this project's
+/// selection (`forget`).
 pub fn switch(
     name: Option<&str>,
     no_launch: bool,
@@ -320,9 +334,17 @@ pub fn switch(
     allow_auth_env: bool,
     arguments: &[OsString],
 ) -> Result<Outcome> {
+    if name.is_none() && !forget && !terminal() {
+        return Err(Error::new(
+            "usage",
+            "roost switch without NAME needs a terminal to choose a profile",
+        )
+        .next("roost switch NAME selects one for this project; roost run NAME launches once"));
+    }
     let key = selection_key()?;
-    let store = open_launch(&platform::root()?)?;
-    let Some(name) = name.filter(|_| !forget) else {
+    let root = platform::root()?;
+    let store = open_launch(&root)?;
+    if forget {
         let selected = store
             .read_state_unfiltered()?
             .selections
@@ -343,10 +365,16 @@ pub fn switch(
             },
             key.display()
         )]));
+    }
+    let (store, registration, recorded) = match name {
+        Some(name) => {
+            let registration = store.find(name, false)?.clone();
+            store.validate(&registration)?;
+            let recorded = record_selection(&store, &key, &registration);
+            (store, registration, recorded)
+        }
+        None => pick(store, &root, &key)?,
     };
-    let registration = store.find(name, false)?.clone();
-    store.validate(&registration)?;
-    let recorded = record_selection(&store, &key, &registration);
     if no_launch {
         recorded?;
         return Ok(Outcome::lines(vec![format!(
@@ -355,12 +383,7 @@ pub fn switch(
             key.display()
         )]));
     }
-    if let Err(e) = recorded {
-        eprintln!(
-            "warning: Could not remember {} for this project: {}",
-            registration.name, e.message
-        );
-    }
+    warn_unrecorded(&registration, recorded);
     start(store, &registration, allow_auth_env, arguments)
 }
 

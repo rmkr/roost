@@ -782,6 +782,28 @@ fn read_ready(descriptor: libc::c_int, timeout: libc::c_int) -> Result<Option<Ve
     Ok(Some(buffer[..count as usize].to_vec()))
 }
 
+/// One picker frame: the prompt, the header and every row, the `current` row in
+/// reverse video. Rows may carry `ls` styles; reverse video is re-applied after
+/// each embedded reset so the highlight spans the whole row. Later frames first
+/// move the cursor back over the previous one.
+fn picker_frame(header: &str, rows: &[String], current: usize, first: bool) -> String {
+    let mut text = String::new();
+    if !first {
+        text.push_str(&format!("\x1b[{}A", rows.len() + 2));
+    }
+    text.push_str("\r\x1b[2KChoose a profile for this project (↑/↓, Enter; Esc cancels)\n");
+    text.push_str(&format!("\r\x1b[2K  {header}\n"));
+    for (index, row) in rows.iter().enumerate() {
+        if index == current {
+            let row = row.replace("\x1b[0m", "\x1b[0m\x1b[7m");
+            text.push_str(&format!("\r\x1b[2K\x1b[7m> {row}\x1b[0m\n"));
+        } else {
+            text.push_str(&format!("\r\x1b[2K  {row}\n"));
+        }
+    }
+    text
+}
+
 /// Single-choice picker on stderr reading keys from the terminal on stdin. Up/Down
 /// or k/j move, Enter chooses; Ctrl-C, Esc, `q` or EOF cancel (exit 130). The
 /// terminal mode is restored and the list erased on every exit.
@@ -812,22 +834,7 @@ pub fn pick(header: &str, rows: &[String], initial: usize) -> Result<usize> {
     };
     let mut out = std::io::stderr();
     let height = rows.len() + 2;
-    let draw = |current: usize, first: bool| -> String {
-        let mut text = String::new();
-        if !first {
-            text.push_str(&format!("\x1b[{height}A"));
-        }
-        text.push_str("\r\x1b[2KChoose a profile for this project (↑/↓, Enter; Esc cancels)\n");
-        text.push_str(&format!("\r\x1b[2K  {header}\n"));
-        for (index, row) in rows.iter().enumerate() {
-            if index == current {
-                text.push_str(&format!("\r\x1b[2K\x1b[7m> {row}\x1b[0m\n"));
-            } else {
-                text.push_str(&format!("\r\x1b[2K  {row}\n"));
-            }
-        }
-        text
-    };
+    let draw = |current: usize, first: bool| picker_frame(header, rows, current, first);
     let mut current = initial.min(rows.len() - 1);
     let _ = write!(out, "\x1b[?25l{}", draw(current, true));
     let _ = out.flush();
@@ -882,6 +889,21 @@ pub use path_setup::setup_path;
 mod tests {
     use super::*;
     use std::os::unix::fs::PermissionsExt;
+    #[test]
+    fn picker_highlight_survives_styled_cells_and_plain_rows_stay_plain() {
+        let rows = [
+            "\x1b[1mHome\x1b[0m  \x1b[32m✓\x1b[0m".to_owned(),
+            "\x1b[1mWork\x1b[0m  –".to_owned(),
+        ];
+        let frame = picker_frame("Profile", &rows, 1, true);
+        let lines: Vec<&str> = frame.split('\n').collect();
+        assert_eq!(lines[2], "\r\x1b[2K  \x1b[1mHome\x1b[0m  \x1b[32m✓\x1b[0m");
+        assert_eq!(
+            lines[3],
+            "\r\x1b[2K\x1b[7m> \x1b[1mWork\x1b[0m\x1b[7m  –\x1b[0m"
+        );
+        assert!(picker_frame("Profile", &rows, 0, false).starts_with("\x1b[4A"));
+    }
     #[test]
     fn copy_excludes_sensitive_and_linked_objects_at_depth() {
         let path =

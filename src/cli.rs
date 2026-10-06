@@ -133,7 +133,7 @@ pub enum Action {
         registration_id: String,
         arguments: Vec<OsString>,
     },
-    /// Select a profile for this project and launch it; manager options precede NAME
+    /// Select a profile for this project (NAME, or choose with a picker) and launch it; manager options precede NAME
     Switch {
         #[arg(long)]
         allow_auth_env: bool,
@@ -469,9 +469,12 @@ fn parse_switch(args: &[OsString]) -> std::result::Result<Action, clap::Error> {
         ));
     }
     let name = match args.get(index) {
-        None if forget => None,
-        None => return Err(usage("switch requires NAME")),
-        Some(_) if forget => return Err(usage("switch --forget takes no NAME")),
+        None => None,
+        Some(_) if forget => {
+            return Err(usage("switch --forget takes no NAME or Claude arguments"));
+        }
+        // No NAME: the picker chooses; the tail after `--` belongs to Claude.
+        Some(value) if value == OsStr::new("--") => None,
         Some(value) => {
             let name = value
                 .to_str()
@@ -484,11 +487,12 @@ fn parse_switch(args: &[OsString]) -> std::result::Result<Action, clap::Error> {
             Some(name.to_owned())
         }
     };
-    let mut tail = args.get(index + 1..).unwrap_or_default().to_vec();
-    if no_launch && !tail.is_empty() {
+    // Without NAME a `--` (if any) is at `index` and was the one separator.
+    if no_launch && args.len() > index + usize::from(name.is_some()) {
         return Err(usage("switch --no-launch takes no Claude arguments"));
     }
-    if tail.first().is_some_and(|v| v == OsStr::new("--")) {
+    let mut tail = args.get(index + 1..).unwrap_or_default().to_vec();
+    if name.is_some() && tail.first().is_some_and(|v| v == OsStr::new("--")) {
         tail.remove(0);
     }
     Ok(Action::Switch {
@@ -566,6 +570,33 @@ mod tests {
             vec!["roost", "desktop"],
             vec!["roost", "desktop", "Work", "--", "--flag"],
             vec!["roost", "desktop", "Work", "extra"],
+        ] {
+            assert!(parse_from(values.iter().map(OsString::from).collect()).is_err());
+        }
+    }
+    #[test]
+    fn switch_name_is_optional_and_a_separator_starts_the_tail() {
+        let switch = |values: &[&str]| match parse(values) {
+            Action::Switch {
+                no_launch,
+                name,
+                arguments,
+                ..
+            } => (no_launch, name, arguments),
+            other => panic!("{other:?}"),
+        };
+        assert_eq!(switch(&["roost", "switch"]), (false, None, vec![]));
+        assert_eq!(
+            switch(&["roost", "switch", "--no-launch"]),
+            (true, None, vec![])
+        );
+        assert_eq!(
+            switch(&["roost", "switch", "--", "--", "-p"]),
+            (false, None, vec!["--".into(), "-p".into()])
+        );
+        for values in [
+            vec!["roost", "switch", "--no-launch", "--"],
+            vec!["roost", "switch", "--forget", "--"],
         ] {
             assert!(parse_from(values.iter().map(OsString::from).collect()).is_err());
         }

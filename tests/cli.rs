@@ -1754,15 +1754,37 @@ fn state_write_failure_warns_and_still_launches() {
 /// shows. Returns `[{exit, picker, launched}]`, `launched` being the fake Claude's
 /// CLAUDE_CONFIG_DIR or null.
 fn pick_in_pty(f: &Fixture, cases: &[(&Path, &[&str])]) -> Value {
+    let cases: Vec<(&Path, &[&str], &[&str])> = cases
+        .iter()
+        .map(|(cwd, keys)| (*cwd, &[][..], *keys))
+        .collect();
+    let results = pty_session(f, &[], &cases);
+    Value::Array(
+        results
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|r| json!({"exit": r["exit"], "picker": r["picker"], "launched": r["launched"]}))
+            .collect(),
+    )
+}
+
+/// Runs `roost ARGS` in each project under a PTY with `env` added, sending keys
+/// once the picker shows. Returns `[{exit, picker, launched, arguments, text}]`:
+/// `launched`/`arguments` are the fake Claude's CLAUDE_CONFIG_DIR and arguments
+/// (null when nothing launched) and `text` is everything the terminal received.
+fn pty_session(f: &Fixture, env: &[(&str, &str)], cases: &[(&Path, &[&str], &[&str])]) -> Value {
     let script = r#"
 import errno,json,os,pty,select,sys,time
-exe,root,binpath,home,cases=sys.argv[1:]
+exe,root,binpath,home,extra,cases=sys.argv[1:]
 results=[]
-for cwd,keys in json.loads(cases):
+for cwd,args,keys in json.loads(cases):
     pid,fd=pty.fork()
     if pid==0:
         os.chdir(cwd)
-        os.execve(exe,[exe],{'ROOST_DIR':root,'HOME':home,'PATH':binpath+':/usr/bin:/bin'})
+        env={'ROOST_DIR':root,'HOME':home,'PATH':binpath+':/usr/bin:/bin'}
+        env.update(json.loads(extra))
+        os.execve(exe,[exe]+args,env)
     data=b'';sent=False;deadline=time.monotonic()+10
     while time.monotonic()<deadline:
         if not select.select([fd],[],[],0.1)[0]:continue
@@ -1781,15 +1803,21 @@ for cwd,keys in json.loads(cases):
         os.kill(pid,9);raise RuntimeError('PTY deadline exceeded: %r'%data)
     os.close(fd);_,status=os.waitpid(pid,0)
     text=data.decode(errors='replace')
-    launched=None
+    launched=None;arguments=None
     for line in text.replace('\r','\n').split('\n'):
-        if '{' in line:launched=json.loads(line[line.index('{'):])['env'].get('CLAUDE_CONFIG_DIR')
-    results.append({'exit':os.waitstatus_to_exitcode(status),'picker':'Choose a profile' in text,'launched':launched})
+        if '{' in line:
+            probe=json.loads(line[line.index('{'):])
+            launched=probe['env'].get('CLAUDE_CONFIG_DIR');arguments=probe['arguments']
+    results.append({'exit':os.waitstatus_to_exitcode(status),'picker':'Choose a profile' in text,'launched':launched,'arguments':arguments,'text':text})
 print(json.dumps(results))
 "#;
     let cases: Vec<Value> = cases
         .iter()
-        .map(|(cwd, keys)| json!([cwd.to_str().unwrap(), keys]))
+        .map(|(cwd, args, keys)| json!([cwd.to_str().unwrap(), args, keys]))
+        .collect();
+    let env: serde_json::Map<String, Value> = env
+        .iter()
+        .map(|(k, v)| ((*k).to_owned(), json!(v)))
         .collect();
     let out = Command::new("/usr/bin/python3")
         .args([
@@ -1799,6 +1827,7 @@ print(json.dumps(results))
             f.root.to_str().unwrap(),
             f.bin.to_str().unwrap(),
             f.home.to_str().unwrap(),
+            &serde_json::to_string(&env).unwrap(),
             &serde_json::to_string(&cases).unwrap(),
         ])
         .env_clear()
@@ -1867,4 +1896,126 @@ fn picker_cancels_with_130_and_no_state_change_and_shows_for_one_profile() {
         results,
         json!([{"exit":0,"picker":true,"launched":f.root.join("profiles/Work").to_str().unwrap()}])
     );
+}
+
+/// The profile directory bare `roost` launches in `cwd` without a terminal.
+fn selected_dir(f: &Fixture, cwd: &Path) -> Value {
+    launched(&f.command().current_dir(cwd).output().unwrap())["env"]["CLAUDE_CONFIG_DIR"].clone()
+}
+
+#[test]
+fn switch_without_name_opens_the_picker_on_the_current_selection_and_launches() {
+    let f = Fixture::new();
+    f.add("Work");
+    f.add("Home");
+    let work = f.root.join("profiles/Work");
+    let home = f.root.join("profiles/Home");
+    let (a, b) = (repo(&f, "a"), repo(&f, "b"));
+    f.command()
+        .current_dir(&a)
+        .args(["switch", "--no-launch", "Home"])
+        .output()
+        .unwrap();
+    launched(&f.run(&["run", "Work"]));
+    let results = pty_session(
+        &f,
+        &[],
+        &[
+            // No selection: the most recently launched profile is highlighted.
+            (&b, &["switch", "--", "--resume", ""], &["\r"]),
+            // A selection exists, yet the picker still shows, highlighting it over
+            // the most recently launched profile.
+            (&a, &["switch"], &["\r"]),
+        ],
+    );
+    assert_eq!(results[0]["exit"], 0, "{}", results[0]["text"]);
+    assert_eq!(results[0]["picker"], true);
+    assert_eq!(results[0]["launched"], json!(work.to_str().unwrap()));
+    assert_eq!(results[0]["arguments"], json!(["--resume", ""]));
+    assert_eq!(results[1]["exit"], 0, "{}", results[1]["text"]);
+    assert_eq!(results[1]["launched"], json!(home.to_str().unwrap()));
+    assert_eq!(selected_dir(&f, &b), json!(work.to_str().unwrap()));
+    // Keys move the highlight; --no-launch only records the choice.
+    let results = pty_session(&f, &[], &[(&a, &["switch", "--no-launch"], &["j", "\r"])]);
+    assert_eq!(results[0]["exit"], 0, "{}", results[0]["text"]);
+    assert_eq!(results[0]["launched"], Value::Null);
+    assert!(
+        results[0]["text"]
+            .as_str()
+            .unwrap()
+            .contains("Selected Work for"),
+        "{}",
+        results[0]["text"]
+    );
+    assert_eq!(selected_dir(&f, &a), json!(work.to_str().unwrap()));
+}
+
+#[test]
+fn switch_picker_cancel_exits_130_and_keeps_the_selection() {
+    let f = Fixture::new();
+    f.add("Work");
+    f.add("Home");
+    let a = repo(&f, "a");
+    f.command()
+        .current_dir(&a)
+        .args(["switch", "--no-launch", "Home"])
+        .output()
+        .unwrap();
+    let results = pty_session(
+        &f,
+        &[],
+        &[
+            (&a, &["switch"], &["j", "\x1b"]),
+            (&a, &["switch", "--no-launch"], &["j", "\x03"]),
+        ],
+    );
+    for result in results.as_array().unwrap() {
+        assert_eq!(result["exit"], 130, "{}", result["text"]);
+        assert_eq!(result["picker"], true);
+        assert_eq!(result["launched"], Value::Null);
+    }
+    assert_eq!(
+        selected_dir(&f, &a),
+        json!(f.root.join("profiles/Home").to_str().unwrap())
+    );
+}
+
+#[test]
+fn switch_without_name_and_terminal_is_usage_naming_switch_name() {
+    let f = Fixture::new();
+    f.add("Work");
+    let a = repo(&f, "a");
+    for args in [
+        vec!["switch"],
+        vec!["switch", "--no-launch"],
+        vec!["switch", "--", "-p"],
+    ] {
+        let out = f.command().current_dir(&a).args(&args).output().unwrap();
+        assert_eq!(out.status.code(), Some(2), "{args:?}");
+        let stderr = String::from_utf8_lossy(&out.stderr);
+        assert!(stderr.contains("roost switch NAME"), "{args:?}: {stderr}");
+    }
+    assert!(!f.root.join("state.json").exists());
+}
+
+#[test]
+fn picker_rows_use_list_styles_on_a_terminal_unless_no_color() {
+    let f = Fixture::new();
+    f.add("Work");
+    f.add("Home");
+    let a = repo(&f, "a");
+    let colored = pty_session(&f, &[], &[(&a, &["switch"], &["\x1b"])]);
+    let text = colored[0]["text"].as_str().unwrap();
+    // Names are bold like `roost ls`; the highlighted row keeps reverse video
+    // after every styled cell's reset.
+    assert!(text.contains("\x1b[1mWork\x1b[0m"), "{text:?}");
+    assert!(text.contains("\x1b[7m> "), "{text:?}");
+    assert!(text.contains("\x1b[0m\x1b[7m"), "{text:?}");
+    let plain = pty_session(&f, &[("NO_COLOR", "1")], &[(&a, &["switch"], &["\x1b"])]);
+    let text = plain[0]["text"].as_str().unwrap();
+    assert!(
+        !text.contains("\x1b[1m") && !text.contains("\x1b[32m"),
+        "{text:?}"
+    );
+    assert!(text.contains("\x1b[7m> "), "{text:?}");
 }
