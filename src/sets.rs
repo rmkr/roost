@@ -16,7 +16,7 @@
 //! - Settings fragments (`setting`, `setting_source`) are not links: they are
 //!   validated, conflict-checked and merged into `settings.json` by
 //!   [`crate::settings`], called from [`reconcile_at_launch`] after links.
-//! - Plugins: [`plugin_installed`] gates `set add --plugin`; [`plugin_items`] gives
+//! - Plugins: [`crate::plugins::installed`] gates `set add --plugin`; [`plugin_items`] gives
 //!   a registration's subscribed plugin IDs for injection.
 
 use crate::{
@@ -226,16 +226,16 @@ fn find_set<'a>(sets: &'a SetsFile, name: &str) -> Result<&'a SharedSet> {
         .find(|s| s.name.eq_ignore_ascii_case(name))
         .ok_or_else(|| not_found(name))
 }
-fn find_set_mut<'a>(sets: &'a mut SetsFile, name: &str) -> Result<&'a mut SharedSet> {
+pub(crate) fn find_set_mut<'a>(sets: &'a mut SetsFile, name: &str) -> Result<&'a mut SharedSet> {
     sets.sets
         .iter_mut()
         .find(|s| s.name.eq_ignore_ascii_case(name))
         .ok_or_else(|| not_found(name))
 }
-fn not_found(name: &str) -> Error {
+pub(crate) fn not_found(name: &str) -> Error {
     Error::new("not_found", format!("No set named {name}")).next("List sets with roost set list")
 }
-fn validate_set_name(name: &str) -> Result<()> {
+pub(crate) fn validate_set_name(name: &str) -> Result<()> {
     store::validate_name(name).map_err(|_| Error::new("usage", format!("Invalid set name {name}")))
 }
 
@@ -245,15 +245,21 @@ pub(crate) fn subscribed<'a>(
     sets: &'a SetsFile,
     registration_id: &str,
 ) -> Vec<(&'a str, &'a Item)> {
-    sets.sets
-        .iter()
-        .filter(|set| {
-            sets.subscriptions.iter().any(|s| {
-                s.registration_id == registration_id && s.set.eq_ignore_ascii_case(&set.name)
-            })
-        })
+    subscribed_sets(sets, registration_id)
         .flat_map(|set| set.items.iter().map(|item| (set.name.as_str(), item)))
         .collect()
+}
+
+/// Sets `registration_id` subscribes to, in set order.
+fn subscribed_sets<'a>(
+    sets: &'a SetsFile,
+    registration_id: &str,
+) -> impl Iterator<Item = &'a SharedSet> {
+    sets.sets.iter().filter(move |set| {
+        sets.subscriptions
+            .iter()
+            .any(|s| s.registration_id == registration_id && s.set.eq_ignore_ascii_case(&set.name))
+    })
 }
 
 /// Subscribed plugin IDs of a registration, deduplicated (plugin injection).
@@ -266,11 +272,6 @@ pub fn plugin_items(sets: &SetsFile, registration_id: &str) -> Vec<String> {
     ids.sort();
     ids.dedup();
     ids
-}
-
-/// Whether a plugin ID is installed in the plugin store.
-fn plugin_installed(store: &Store, id: &str) -> Result<bool> {
-    crate::plugins::installed(store, id)
 }
 
 /// Conflicts a registration's subscriptions would have: link paths produced by two
@@ -362,22 +363,16 @@ fn item(args: ItemArgs) -> Result<Item> {
         return path(kind, p);
     }
     let id = args.plugin.unwrap_or_default();
-    let valid = |part: &str| {
-        (1..=128).contains(&part.chars().count())
-            && !part
-                .chars()
-                .any(|c| c.is_whitespace() || c.is_control() || matches!(c, '/' | '\\' | '@'))
-    };
-    match id.split_once('@') {
-        Some((plugin, marketplace)) if valid(plugin) && valid(marketplace) => Ok(Item {
-            kind: ItemKind::Plugin,
-            value: id,
-        }),
-        _ => Err(Error::new(
+    if !crate::plugins::valid_id(&id) {
+        return Err(Error::new(
             "usage",
             format!("Invalid plugin ID {id}; expected PLUGIN@MARKETPLACE"),
-        )),
+        ));
     }
+    Ok(Item {
+        kind: ItemKind::Plugin,
+        value: id,
+    })
 }
 
 fn subscriber_names(store: &Store, sets: &SetsFile, set: &str) -> Vec<String> {
@@ -532,7 +527,7 @@ pub fn command(action: SetAction, data: &mut Value) -> Result<Vec<String>> {
             if item.kind.is_setting() {
                 settings::validate(&item)?;
             }
-            if item.kind == ItemKind::Plugin && !plugin_installed(&store, &item.value)? {
+            if item.kind == ItemKind::Plugin && !crate::plugins::installed(&store, &item.value)? {
                 return Err(Error::new(
                     "not_found",
                     format!("Plugin {} is not installed in the plugin store", item.value),
@@ -702,15 +697,7 @@ pub fn annotate(store: &Store, profiles: &mut [Value]) -> Vec<String> {
                 .find(|r| r.name == name && r.kind != Kind::DefaultAlias)
         });
         let mut names: Vec<String> = match (&sets, registration) {
-            (Some(sets), Some(r)) => sets
-                .sets
-                .iter()
-                .filter(|set| {
-                    sets.subscriptions.iter().any(|s| {
-                        s.registration_id == r.registration_id
-                            && s.set.eq_ignore_ascii_case(&set.name)
-                    })
-                })
+            (Some(sets), Some(r)) => subscribed_sets(sets, &r.registration_id)
                 .map(|set| set.name.clone())
                 .collect(),
             _ => vec![],
