@@ -430,6 +430,33 @@ fn invalid_fragments_and_unsafe_settings_warn_and_never_block_launch() {
 }
 
 #[test]
+fn a_fragment_reached_through_a_link_and_its_real_path_counts_once() {
+    let f = Fixture::new();
+    let dir = f.fragments(
+        "settings",
+        &[(
+            "line.json",
+            json!({"outputStyle":"terse","hooks":{"Stop":[{"hooks":[hook("h")]}]}}),
+        )],
+    );
+    let link = f.path.join("line-link.json");
+    std::os::unix::fs::symlink(dir.join("line.json"), &link).unwrap();
+    f.ok(&["set", "create", "linked"]);
+    f.ok(&["set", "create", "real"]);
+    f.ok(&["set", "add", "linked", "--setting", s(&link)]);
+    f.ok(&["set", "add", "real", "--settings-from", s(&dir)]);
+    f.ok(&["add", "Work", "--no-sets"]);
+    f.ok(&["set", "subscribe", "Work", "linked"]);
+    f.ok(&["set", "subscribe", "Work", "real"]);
+    let stderr = f.stderr_of(&["run", "Work"]);
+    assert!(stderr.is_empty(), "{stderr}");
+    assert_eq!(
+        f.settings("Work"),
+        json!({"outputStyle":"terse","hooks":{"Stop":[{"hooks":[hook("h")]}]}})
+    );
+}
+
+#[test]
 fn rewrites_keep_number_text_exactly() {
     let f = Fixture::new();
     let numbers =

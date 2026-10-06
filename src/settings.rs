@@ -384,10 +384,15 @@ fn hooks(value: &Json) -> std::result::Result<Vec<Hook>, String> {
 /// link (the user manages it) and is followed; a source's children are opened
 /// without following. Only a regular file is read, through a non-blocking open
 /// and at most [`MAX_READ_BYTES`] + 1 bytes, so a FIFO or device swapped in is
-/// refused instead of hanging the launch or filling memory.
-fn read_fragment(path: &Path, follow: bool) -> std::result::Result<Fragment, String> {
+/// refused instead of hanging the launch or filling memory. Returns the opened
+/// file's identity with the fragment.
+fn read_fragment(
+    path: &Path,
+    follow: bool,
+) -> std::result::Result<(FileIdentity, Fragment), String> {
     use std::io::Read;
     let file = crate::platform::open_user_file(path, follow).map_err(|e| e.message)?;
+    let identity = crate::platform::file_identity(&file).map_err(|e| e.message)?;
     let mut bytes = vec![];
     file.take(MAX_READ_BYTES as u64 + 1)
         .read_to_end(&mut bytes)
@@ -395,7 +400,7 @@ fn read_fragment(path: &Path, follow: bool) -> std::result::Result<Fragment, Str
     if bytes.len() > MAX_READ_BYTES {
         return Err("larger than 4 MiB".into());
     }
-    fragment(&bytes)
+    Ok((identity, fragment(&bytes)?))
 }
 
 /// Fragment files of a setting item: the file itself, or a source's immediate
@@ -474,13 +479,15 @@ impl Desired {
     }
 }
 
-/// Valid fragments of the subscribed setting items, each fragment file once, in
-/// set and item order. Problems are reported through `warn`.
+/// Valid fragments of the subscribed setting items, each fragment file once (by
+/// file identity, so a linked `--setting` and its real path in a source count
+/// once), in set and item order. Problems are reported through `warn`.
 fn subscribed_fragments(
     items: &[(&str, &Item)],
     mut warn: impl FnMut(String),
 ) -> Vec<(PathBuf, Fragment)> {
     let mut found: Vec<(PathBuf, Fragment)> = vec![];
+    let mut seen: Vec<FileIdentity> = vec![];
     for (set, item) in items.iter().filter(|(_, i)| is_setting(i.kind)) {
         let directory = item.kind == ItemKind::SettingSource;
         let present = std::fs::metadata(&item.value)
@@ -505,11 +512,12 @@ fn subscribed_fragments(
             }
         };
         for path in paths {
-            if found.iter().any(|(p, _)| *p == path) {
-                continue;
-            }
             match read_fragment(&path, !directory) {
-                Ok(fragment) => found.push((path, fragment)),
+                Ok((identity, _)) if seen.contains(&identity) => {}
+                Ok((identity, fragment)) => {
+                    seen.push(identity);
+                    found.push((path, fragment));
+                }
                 Err(reason) => warn(format!(
                     "Skipped settings fragment {} from set {set}: {reason}",
                     path.display()
@@ -1020,7 +1028,9 @@ mod tests {
     }
 
     /// Runs `read_fragment` on another thread, failing instead of hanging.
-    fn read_within_a_second(path: PathBuf) -> std::result::Result<Fragment, String> {
+    fn read_within_a_second(
+        path: PathBuf,
+    ) -> std::result::Result<(FileIdentity, Fragment), String> {
         let (send, receive) = std::sync::mpsc::channel();
         std::thread::spawn(move || drop(send.send(read_fragment(&path, true))));
         receive
