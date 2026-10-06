@@ -1,89 +1,27 @@
 //! Shared sets and launch-time skill and instruction links (spec "Shared sets", gate A16).
 //! Disposable fixtures only: fake `claude`, private temp root/home, no real data.
 #![cfg(unix)]
+mod common;
+use common::{Fixture, s};
 use serde_json::{Value, json};
 use std::{
     fs,
     os::unix::fs::{PermissionsExt, symlink},
-    path::{Path, PathBuf},
-    process::{Command, Output},
-    sync::atomic::{AtomicU64, Ordering},
+    path::PathBuf,
+    process::Command,
 };
 
-static SEQUENCE: AtomicU64 = AtomicU64::new(0);
-struct Fixture {
-    path: PathBuf,
-    root: PathBuf,
-    home: PathBuf,
-}
-impl Fixture {
-    fn new() -> Self {
-        let path = std::env::temp_dir().join(format!(
-            "roost-sets-{}-{}",
-            std::process::id(),
-            SEQUENCE.fetch_add(1, Ordering::Relaxed)
-        ));
-        fs::create_dir(&path).unwrap();
-        private(&path);
-        let bin = path.join("bin");
-        let home = path.join("home");
-        fs::create_dir(&bin).unwrap();
-        private(&bin);
-        fs::create_dir(&home).unwrap();
-        private(&home);
-        let fake = bin.join("claude");
-        fs::write(
-            &fake,
-            r#"#!/usr/bin/python3
+const FAKE: &str = r#"#!/usr/bin/python3
 import json,os,sys
 args=sys.argv[1:]
 if args==['--version']:
     print('2.1.280 (Claude Code)');sys.exit(0)
 print(json.dumps({'arguments':args,'config':os.environ.get('CLAUDE_CONFIG_DIR')}))
-"#,
-        )
-        .unwrap();
-        fs::set_permissions(&fake, fs::Permissions::from_mode(0o700)).unwrap();
-        let root = path.join("root");
-        Self { path, root, home }
-    }
-    fn command(&self) -> Command {
-        let mut command = Command::new(env!("CARGO_BIN_EXE_roost"));
-        command
-            .env_clear()
-            .env("ROOST_DIR", &self.root)
-            .env("HOME", &self.home)
-            .env(
-                "PATH",
-                format!("{}:/usr/bin:/bin", self.path.join("bin").display()),
-            )
-            .env("SHELL", "/bin/bash")
-            .current_dir(&self.path);
-        command
-    }
-    fn run(&self, args: &[&str]) -> Output {
-        self.command().args(args).output().unwrap()
-    }
-    fn ok(&self, args: &[&str]) -> Output {
-        let out = self.run(args);
-        assert!(
-            out.status.success(),
-            "{args:?}: {}",
-            String::from_utf8_lossy(&out.stderr)
-        );
-        out
-    }
-    fn fails(&self, args: &[&str], code: &str) -> Output {
-        let out = self.run(args);
-        assert!(!out.status.success(), "{args:?} unexpectedly succeeded");
-        let stderr = String::from_utf8_lossy(&out.stderr);
-        assert!(stderr.contains(code), "{args:?}: {stderr}");
-        out
-    }
-    fn json(&self, args: &[&str]) -> Value {
-        let out = self.ok(args);
-        serde_json::from_slice(&out.stdout)
-            .unwrap_or_else(|e| panic!("{e}: {}", String::from_utf8_lossy(&out.stdout)))
+"#;
+
+impl Fixture {
+    fn new() -> Self {
+        Fixture::with_fakes("sets", &[("claude", FAKE)])
     }
     fn sets(&self) -> Value {
         self.json(&["set", "list", "--json"])["data"]["sets"].clone()
@@ -104,17 +42,6 @@ print(json.dumps({'arguments':args,'config':os.environ.get('CLAUDE_CONFIG_DIR')}
     fn state(&self) -> Value {
         serde_json::from_slice(&fs::read(self.root.join("state.json")).unwrap()).unwrap()
     }
-}
-impl Drop for Fixture {
-    fn drop(&mut self) {
-        let _ = fs::remove_dir_all(&self.path);
-    }
-}
-fn private(path: &Path) {
-    fs::set_permissions(path, fs::Permissions::from_mode(0o700)).unwrap();
-}
-fn s(path: &Path) -> &str {
-    path.to_str().unwrap()
 }
 
 #[test]

@@ -2,14 +2,10 @@
 //! Disposable fixtures only: a fake `claude` that emulates `plugin` subcommands in
 //! its CLAUDE_CONFIG_DIR, private temp root/home, no real Claude, account or network.
 #![cfg(unix)]
+mod common;
+use common::{Fixture, parsed, s};
 use serde_json::{Value, json};
-use std::{
-    fs,
-    os::unix::fs::PermissionsExt,
-    path::{Path, PathBuf},
-    process::{Command, Output},
-    sync::atomic::{AtomicU64, Ordering},
-};
+use std::{fs, os::unix::fs::PermissionsExt, path::PathBuf, process::Command};
 
 /// Fake Claude. `plugin ...` subcommands keep `fake-state.json` in CLAUDE_CONFIG_DIR
 /// and write `plugins/cache/<mkt>/<name>/<version>/` like Claude does; marketplaces
@@ -97,64 +93,22 @@ if sub[0]=='list':
 sys.exit(2)
 "#;
 
-static SEQUENCE: AtomicU64 = AtomicU64::new(0);
-struct Fixture {
-    path: PathBuf,
-    root: PathBuf,
-    home: PathBuf,
-    catalog: Value,
-}
+const FAKE_DESKTOP: &str = "#!/usr/bin/python3\nimport json,os,sys\nopen(os.environ['FAKE_DESKTOP_RECORD'],'a').write(json.dumps({'arguments':sys.argv[1:],'env':dict(os.environ)})+'\\n')\n";
+
 impl Fixture {
     fn new() -> Self {
-        let path = std::env::temp_dir().join(format!(
-            "roost-plugins-{}-{}",
-            std::process::id(),
-            SEQUENCE.fetch_add(1, Ordering::Relaxed)
-        ));
-        fs::create_dir(&path).unwrap();
-        private(&path);
-        let bin = path.join("bin");
-        let home = path.join("home");
-        fs::create_dir(&bin).unwrap();
-        private(&bin);
-        fs::create_dir(&home).unwrap();
-        private(&home);
-        fs::write(bin.join("claude"), FAKE).unwrap();
-        fs::set_permissions(bin.join("claude"), fs::Permissions::from_mode(0o700)).unwrap();
-        let desktop = bin.join("claude-desktop");
-        fs::write(
-            &desktop,
-            "#!/usr/bin/python3\nimport json,os,sys\nopen(os.environ['FAKE_DESKTOP_RECORD'],'a').write(json.dumps({'arguments':sys.argv[1:],'env':dict(os.environ)})+'\\n')\n",
-        )
-        .unwrap();
-        fs::set_permissions(&desktop, fs::Permissions::from_mode(0o700)).unwrap();
-        let root = path.join("root");
-        Self {
-            path,
-            root,
-            home,
-            catalog: json!({
-                "tools": {"lint": {}, "fmt": {"deps": ["core"]}, "core": {}},
-                "other": {"lint": {}, "fmt2": {"manifest": "fmt"}}
-            }),
-        }
-    }
-    fn command(&self) -> Command {
-        let mut command = Command::new(env!("CARGO_BIN_EXE_roost"));
-        command
-            .env_clear()
-            .env("ROOST_DIR", &self.root)
-            .env("HOME", &self.home)
-            .env(
-                "PATH",
-                format!("{}:/usr/bin:/bin", self.path.join("bin").display()),
-            )
-            .env("SHELL", "/bin/bash")
-            .env("FAKE_LOG", self.path.join("claude.jsonl"))
-            .env("FAKE_CATALOG", self.catalog.to_string())
-            .env("FAKE_DESKTOP_RECORD", self.path.join("desktop.jsonl"))
-            .current_dir(&self.path);
-        command
+        let f = Fixture::with_fakes(
+            "plugins",
+            &[("claude", FAKE), ("claude-desktop", FAKE_DESKTOP)],
+        );
+        let (log, desktop) = (f.path.join("claude.jsonl"), f.path.join("desktop.jsonl"));
+        let catalog = json!({
+            "tools": {"lint": {}, "fmt": {"deps": ["core"]}, "core": {}},
+            "other": {"lint": {}, "fmt2": {"manifest": "fmt"}}
+        });
+        f.with_var("FAKE_LOG", log)
+            .with_var("FAKE_CATALOG", catalog.to_string())
+            .with_var("FAKE_DESKTOP_RECORD", desktop)
     }
     /// Another program with the fixture's environment and working directory.
     fn with_env(&self, program: PathBuf) -> Command {
@@ -167,28 +121,6 @@ impl Fixture {
             }
         }
         command
-    }
-    fn run(&self, args: &[&str]) -> Output {
-        self.command().args(args).output().unwrap()
-    }
-    fn ok(&self, args: &[&str]) -> Output {
-        let out = self.run(args);
-        assert!(
-            out.status.success(),
-            "{args:?}: {}",
-            String::from_utf8_lossy(&out.stderr)
-        );
-        out
-    }
-    fn fails(&self, args: &[&str], code: &str) -> Output {
-        let out = self.run(args);
-        assert!(!out.status.success(), "{args:?} unexpectedly succeeded");
-        let stderr = String::from_utf8_lossy(&out.stderr);
-        assert!(stderr.contains(code), "{args:?}: {stderr}");
-        out
-    }
-    fn json(&self, args: &[&str]) -> Value {
-        parsed(&self.ok(args))
     }
     fn store(&self) -> PathBuf {
         self.root.join("plugin-store")
@@ -235,26 +167,6 @@ impl Fixture {
             .as_str()
             .map(str::to_owned)
     }
-    fn upstream(&self, name: &str) -> PathBuf {
-        let path = self.home.join(".ccm/profiles").join(name);
-        fs::create_dir_all(&path).unwrap();
-        path
-    }
-}
-impl Drop for Fixture {
-    fn drop(&mut self) {
-        let _ = fs::remove_dir_all(&self.path);
-    }
-}
-fn private(path: &Path) {
-    fs::set_permissions(path, fs::Permissions::from_mode(0o700)).unwrap();
-}
-fn parsed(output: &Output) -> Value {
-    serde_json::from_slice(&output.stdout)
-        .unwrap_or_else(|e| panic!("{e}: {}", String::from_utf8_lossy(&output.stdout)))
-}
-fn s(path: &Path) -> &str {
-    path.to_str().unwrap()
 }
 
 #[test]

@@ -1,4 +1,6 @@
 #![cfg(unix)]
+mod common;
+use common::{Fixture, parsed, private};
 use serde_json::{Value, json};
 use std::{
     fs,
@@ -6,33 +8,9 @@ use std::{
     os::unix::fs::PermissionsExt,
     path::{Path, PathBuf},
     process::{Command, Output, Stdio},
-    sync::atomic::{AtomicU64, Ordering},
 };
 
-static SEQUENCE: AtomicU64 = AtomicU64::new(0);
-struct Fixture {
-    path: PathBuf,
-    root: PathBuf,
-    bin: PathBuf,
-    home: PathBuf,
-}
-impl Fixture {
-    fn new() -> Self {
-        let path = std::env::temp_dir().join(format!(
-            "roost-cli-{}-{}",
-            std::process::id(),
-            SEQUENCE.fetch_add(1, Ordering::Relaxed)
-        ));
-        fs::create_dir(&path).unwrap();
-        private(&path);
-        let bin = path.join("bin");
-        let home = path.join("home");
-        fs::create_dir(&bin).unwrap();
-        private(&bin);
-        fs::create_dir(&home).unwrap();
-        private(&home);
-        let fake = bin.join("claude");
-        fs::write(&fake,r#"#!/usr/bin/python3
+const FAKE: &str = r#"#!/usr/bin/python3
 import json,os,sys,time
 args=sys.argv[1:]
 if args==['--version']:
@@ -50,12 +28,12 @@ if args==['auth','status']:
     print(json.dumps(out));sys.exit(1 if mode=='logout' else 0)
 print(json.dumps({'arguments':args,'env':dict(os.environ),'cwd':os.getcwd(),'stdin_tty':sys.stdin.isatty()}))
 sys.exit(int(os.environ.get('FAKE_CLAUDE_EXIT','0')))
-"#).unwrap();
-        fs::set_permissions(&fake, fs::Permissions::from_mode(0o700)).unwrap();
-        // Never the real app: records argv/env/stdio per launch, writes Electron-like
-        // data into --user-data-dir unless told to ignore it, then exits or lingers.
-        let desktop = bin.join("claude-desktop");
-        fs::write(&desktop, r#"#!/usr/bin/python3
+"#;
+
+/// Never the real app: records argv/env/stdio per launch, writes Electron-like data
+/// into --user-data-dir unless told to ignore it, then exits or lingers (`long`;
+/// with FAKE_DESKTOP_LOCK it holds a live SingletonLock meanwhile).
+const FAKE_DESKTOP: &str = r#"#!/usr/bin/python3
 import json,os,socket,sys,time
 args=sys.argv[1:]
 record={'arguments':args,'env':dict(os.environ),'session_leader':os.getsid(0)==os.getpid(),
@@ -73,39 +51,13 @@ if os.environ.get('FAKE_DESKTOP_MODE')=='long':
         if lock:os.remove(lock)
     except OSError:pass
 sys.exit(int(os.environ.get('FAKE_DESKTOP_EXIT','0')))
-"#).unwrap();
-        fs::set_permissions(&desktop, fs::Permissions::from_mode(0o700)).unwrap();
-        let root = path.join("root");
-        Self {
-            path,
-            root,
-            bin,
-            home,
-        }
-    }
-    fn command(&self) -> Command {
-        let mut command = Command::new(env!("CARGO_BIN_EXE_roost"));
-        command
-            .env_clear()
-            .env("ROOST_DIR", &self.root)
-            .env("HOME", &self.home)
-            .env("PATH", format!("{}:/usr/bin:/bin", self.bin.display()))
-            .env("SHELL", "/bin/bash")
-            .env("FAKE_DESKTOP_RECORD", self.path.join("desktop.jsonl"))
-            .current_dir(&self.path);
-        command
-    }
-    fn run(&self, args: &[&str]) -> Output {
-        self.command().args(args).output().unwrap()
-    }
-    fn ok(&self, args: &[&str]) -> Output {
-        let out = self.run(args);
-        assert!(
-            out.status.success(),
-            "{args:?}: {}",
-            String::from_utf8_lossy(&out.stderr)
-        );
-        out
+"#;
+
+impl Fixture {
+    fn new() -> Self {
+        let f = Fixture::with_fakes("cli", &[("claude", FAKE), ("claude-desktop", FAKE_DESKTOP)]);
+        let record = f.path.join("desktop.jsonl");
+        f.with_var("FAKE_DESKTOP_RECORD", record)
     }
     fn add(&self, name: &str) {
         self.ok(&["add", name]);
@@ -134,23 +86,6 @@ sys.exit(int(os.environ.get('FAKE_DESKTOP_EXIT','0')))
     fn desktop_folder(&self, name: &str) -> PathBuf {
         self.root.join("desktop").join(self.registration_id(name))
     }
-    fn upstream(&self, name: &str) -> PathBuf {
-        let path = self.home.join(".ccm/profiles").join(name);
-        fs::create_dir_all(&path).unwrap();
-        path
-    }
-}
-impl Drop for Fixture {
-    fn drop(&mut self) {
-        let _ = fs::remove_dir_all(&self.path);
-    }
-}
-fn private(path: &Path) {
-    fs::set_permissions(path, fs::Permissions::from_mode(0o700)).unwrap();
-}
-fn parsed(output: &Output) -> Value {
-    serde_json::from_slice(&output.stdout)
-        .unwrap_or_else(|e| panic!("{e}: {}", String::from_utf8_lossy(&output.stdout)))
 }
 fn input(command: &mut Command, bytes: &[u8]) -> Output {
     let mut child = command
