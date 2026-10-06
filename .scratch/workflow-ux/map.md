@@ -34,6 +34,7 @@ Roost remembers which profile each project uses, shows profiles in a readable ta
 - [Color the profile picker like `roost ls`](issues/14-picker-colors.md): picker rows share the `ls` styles; confirmed by the user.
 - [Open a profile picker from `roost desktop` without a name](issues/15-desktop-picker.md): Desktop picker with running/signed-in state, launching detached.
 - [Let a profile borrow the existing Claude Desktop data folder](issues/16-desktop-link-existing.md): `roost desktop --link NAME` opens the signed-in Desktop with that profile's configuration.
+- [Refuse missing set item sources and skip missing link targets](issues/17-missing-skill-sources.md): no more dangling skill links.
 - [Investigate injected plugin behavior](issues/06-injected-plugin-behavior.md): injection works as ADR 0001 assumes (`name@inline`, per-profile opt-out, config and data per profile); inject `installPath` from the store's `installed_plugins.json` at every launch; no claude.ai org marketplaces in the store; ADR accepted.
 
 ## Not yet specified
