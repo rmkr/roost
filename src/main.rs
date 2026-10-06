@@ -74,7 +74,7 @@ impl Outcome {
 
 fn initial_data(action: &Action) -> Value {
     match action {
-        Action::List { .. } => json!({"profiles":[]}),
+        Action::List { .. } => json!({"project":null,"profiles":[]}),
         Action::Status { name, .. } => {
             json!({"name":name,"kind":null,"reported_logged_in":null,"auth_method":null,"config_directory":null,"scope":null})
         }
@@ -197,7 +197,7 @@ fn dispatch(action: Action, data: &mut Value) -> Result<Outcome> {
                 vec![]
             };
             let lines = table::profiles(&profiles, table::stdout_color());
-            *data = json!({"profiles":profiles});
+            *data = json!({"project":null,"profiles":profiles});
             let mut output = Outcome::lines(lines);
             if store.as_ref().is_some_and(Store::pending) {
                 output

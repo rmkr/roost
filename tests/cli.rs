@@ -160,23 +160,77 @@ fn human_list_is_a_plain_aligned_table_when_piped() {
     assert!(out.status.success());
     let text = String::from_utf8(out.stdout).unwrap();
     assert!(!text.contains('\x1b'), "{text}");
-    let work = f.root.join("profiles/Work");
     let lines: Vec<&str> = text.lines().collect();
-    assert_eq!(lines[0], "Profile   Kind           State   Directory");
     assert_eq!(
-        lines[1],
-        format!(
-            "personal  default_alias  active  {}",
-            f.home.join(".claude").display()
-        )
+        lines,
+        [
+            "Profile   Kind           Token  Launchers",
+            "personal  default_alias  –      ready",
+            "Work      owned          –      ready",
+            "",
+            "○ 2 profiles · 0 upstream · hidden: Path",
+        ]
     );
+}
+
+#[test]
+fn human_list_shows_token_launcher_state_and_upstream_count() {
+    let f = Fixture::new();
+    f.add("Work");
+    f.add("Gone");
+    f.ok(&["remove", "Gone"]);
+    let old = f.upstream("Old");
+    f.ok(&["register", "Old", "--path", old.to_str().unwrap()]);
+    let set = input(f.command().args(["token", "Work", "--stdin"]), b"fake-token\n");
+    assert!(set.status.success());
+    let text = String::from_utf8(f.ok(&["ls", "--retained"]).stdout).unwrap();
     assert_eq!(
-        lines[2],
-        format!("Work      owned          active  {}", work.display())
+        text.lines().collect::<Vec<_>>(),
+        [
+            "Profile  Kind      Token  Launchers",
+            "Gone     owned     –      not_required",
+            "Old      upstream  –      ready",
+            "Work     owned     ✓      ready",
+            "",
+            "○ 3 profiles · 1 upstream · hidden: Path",
+        ]
     );
-    assert_eq!(lines[3], "");
-    assert_eq!(lines[4], "○ 2 profiles · 0 upstream");
-    assert_eq!(lines.len(), 5);
+}
+
+#[test]
+fn json_list_records_carry_every_spec_key_without_probes_by_default() {
+    let f = Fixture::new();
+    f.add("Work");
+    let value = parsed(&f.ok(&["list", "--json"]));
+    let data = value["data"].as_object().unwrap();
+    let mut keys: Vec<&str> = data.keys().map(String::as_str).collect();
+    keys.sort();
+    assert_eq!(keys, ["profiles", "project"]);
+    let record = &value["data"]["profiles"][0];
+    let mut keys: Vec<&str> = record
+        .as_object()
+        .unwrap()
+        .keys()
+        .map(String::as_str)
+        .collect();
+    keys.sort();
+    assert_eq!(
+        keys,
+        [
+            "directory",
+            "kind",
+            "last_used",
+            "launchers",
+            "most_recent",
+            "name",
+            "probe",
+            "selected",
+            "sets",
+            "state",
+            "token_present"
+        ]
+    );
+    assert_eq!(record["probe"], Value::Null);
 }
 
 #[test]

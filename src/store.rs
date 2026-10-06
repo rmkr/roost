@@ -798,7 +798,9 @@ impl Store {
                 Ok(json!({"path":path,"condition":condition}))
             }).collect::<Result<Vec<_>>>()?;
             launchers.sort_by_key(|v| v["path"].as_str().unwrap_or("").to_owned());
-            Ok(json!({"name":r.name,"kind":r.kind,"state":r.state,"directory":directory,"token_present":token_present,"launchers":launchers}))
+            // sets/last_used/selected/most_recent are placeholders until sets (05) and
+            // selection (04) fill them; probe is filled only by `list --full`.
+            Ok(json!({"name":r.name,"kind":r.kind,"state":r.state,"directory":directory,"token_present":token_present,"launchers":launchers,"sets":[],"last_used":null,"selected":false,"most_recent":false,"probe":null}))
         }).collect()
     }
     fn linked_default(&self, dir: &Directory) -> Result<bool> {
