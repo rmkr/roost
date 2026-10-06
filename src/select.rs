@@ -1,0 +1,540 @@
+//! Selected profile per project, `roost switch`, bare `roost` and last use.
+//!
+//! Selections and last-use times live in the manager's `state.json`, keyed by
+//! registration ID; nothing is ever written into upstream or default data.
+use crate::{
+    Error, Outcome, Result, launch, platform, sets,
+    store::{
+        Kind, OpenMode, Registration, State, Store,
+        side::{Selection, Timestamp},
+    },
+    table,
+};
+use serde_json::{Value, json};
+use std::{
+    ffi::OsString,
+    fs,
+    io::Read,
+    path::{Path, PathBuf},
+};
+
+/// The current project key and any safe warnings from computing it.
+pub struct Project {
+    pub key: Result<PathBuf>,
+    pub warnings: Vec<String>,
+}
+
+/// Computes the project key for the current directory (see [`project_key`]).
+pub fn project() -> Project {
+    match std::env::current_dir() {
+        Ok(cwd) => project_key(&cwd),
+        Err(e) => Project {
+            key: Err(Error::new(
+                "io",
+                format!("Cannot read the current directory: {e}"),
+            )),
+            warnings: vec![],
+        },
+    }
+}
+
+/// Walks from `cwd` toward the root to the first `.git` entry. A directory is the
+/// git directory; a `gitdir: PATH` file names it relative to the file's directory.
+/// A `commondir` file in the git directory names the shared common directory, so all
+/// worktrees of a repository share one key. Without `.git` the key is `cwd`; a
+/// malformed `.git` file or `commondir` falls back to `cwd` with a warning. Git is
+/// never run and `GIT_DIR`/`GIT_COMMON_DIR` are never read.
+pub fn project_key(cwd: &Path) -> Project {
+    let fallback = |warning: Option<String>| Project {
+        key: checked_key(cwd),
+        warnings: warning.into_iter().collect(),
+    };
+    for directory in cwd.ancestors() {
+        let dot_git = directory.join(".git");
+        if fs::symlink_metadata(&dot_git).is_err() {
+            continue;
+        }
+        return match common_directory(directory, &dot_git) {
+            Some(common) => Project {
+                key: checked_key(&common),
+                warnings: vec![],
+            },
+            None => fallback(Some(format!(
+                "Malformed git metadata at {}; using the current directory as the project",
+                dot_git.display()
+            ))),
+        };
+    }
+    fallback(None)
+}
+
+fn checked_key(path: &Path) -> Result<PathBuf> {
+    platform::absolute(path).map_err(|_| {
+        Error::new(
+            "unsafe_path",
+            "The project path is not valid Unicode or contains a line break",
+        )
+    })
+}
+
+/// Reads a small single-line file, without its trailing line ending.
+fn single_line(path: &Path) -> Option<String> {
+    let mut bytes = Vec::new();
+    fs::File::open(path)
+        .ok()?
+        .take(4097)
+        .read_to_end(&mut bytes)
+        .ok()?;
+    if bytes.len() > 4096 {
+        return None;
+    }
+    let text = String::from_utf8(bytes).ok()?;
+    let text = text
+        .strip_suffix('\n')
+        .map(|t| t.strip_suffix('\r').unwrap_or(t))
+        .unwrap_or(&text);
+    (!text.is_empty() && !text.contains(['\r', '\n', '\0'])).then(|| text.to_owned())
+}
+
+fn common_directory(directory: &Path, dot_git: &Path) -> Option<PathBuf> {
+    let metadata = fs::metadata(dot_git).ok()?;
+    let git_directory = if metadata.is_dir() {
+        dot_git.to_owned()
+    } else if metadata.is_file() {
+        let line = single_line(dot_git)?;
+        let target = line.strip_prefix("gitdir:")?.trim_start();
+        (!target.is_empty()).then(|| directory.join(target))?
+    } else {
+        return None;
+    };
+    if !git_directory.is_dir() {
+        return None;
+    }
+    let commondir = git_directory.join("commondir");
+    match fs::symlink_metadata(&commondir) {
+        Err(_) => Some(git_directory),
+        Ok(_) => Some(git_directory.join(single_line(&commondir)?)).filter(|p| p.is_dir()),
+    }
+}
+
+/// The key for a selection command: prints fallback warnings, refuses unsafe keys.
+fn selection_key() -> Result<PathBuf> {
+    let project = project();
+    for warning in project.warnings {
+        eprintln!("warning: {warning}");
+    }
+    project.key
+}
+
+fn now() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |d| d.as_secs())
+}
+
+fn open_launch(root: &Path) -> Result<Store> {
+    Store::open(root, false, OpenMode::Launch).map_err(|e| {
+        if e.code == "not_found" && e.next_step.is_none() {
+            e.next("Create a profile with roost add NAME")
+        } else {
+            e
+        }
+    })
+}
+
+/// Records a launch of `registration` as its last use. Default aliases record
+/// nothing. Failure warns on stderr; the launch continues.
+pub fn launched(store: &Store, registration: &Registration) {
+    if registration.kind == Kind::DefaultAlias {
+        return;
+    }
+    let at = now();
+    let id = &registration.registration_id;
+    let result = store.update_state(|state| {
+        match state.last_used.iter_mut().find(|t| &t.registration_id == id) {
+            Some(time) => time.at = at,
+            None => state.last_used.push(Timestamp {
+                registration_id: id.clone(),
+                at,
+            }),
+        }
+        Ok(())
+    });
+    if let Err(e) = result {
+        eprintln!(
+            "warning: Could not record the last use of {}: {}",
+            registration.name, e.message
+        );
+    }
+}
+
+fn record_selection(store: &Store, project: &Path, registration: &Registration) -> Result<()> {
+    store.update_state(|state| {
+        state.selections.retain(|s| s.project != project);
+        state.selections.push(Selection {
+            project: project.to_owned(),
+            registration_id: registration.registration_id.clone(),
+        });
+        Ok(())
+    })
+}
+
+/// Prepares, records last use, reconciles links, releases the lock and hands off.
+fn start(
+    store: Store,
+    registration: &Registration,
+    allow_auth_env: bool,
+    arguments: &[OsString],
+) -> Result<Outcome> {
+    let command = launch::prepare(&store, registration, allow_auth_env)?;
+    launched(&store, registration);
+    sets::reconcile_at_launch(&store, registration);
+    drop(store);
+    Ok(Outcome {
+        exit: launch::execute(command, arguments)?,
+        ..Outcome::quiet()
+    })
+}
+
+/// Bare `roost`: launches this project's selection, or asks with the picker.
+pub fn launch_selected(allow_auth_env: bool, arguments: &[OsString]) -> Result<Outcome> {
+    let key = selection_key()?;
+    let root = platform::root()?;
+    let store = open_launch(&root)?;
+    let selected = match store.read_state_unfiltered() {
+        Ok(state) => state
+            .selections
+            .into_iter()
+            .find(|s| s.project == key)
+            .map(|s| s.registration_id),
+        Err(e) => {
+            eprintln!("warning: Selection state unavailable: {}", e.message);
+            None
+        }
+    };
+    let current = selected.as_ref().map(|id| {
+        store
+            .registry
+            .registrations
+            .iter()
+            .find(|r| &r.registration_id == id)
+    });
+    let (store, registration) = match current {
+        Some(Some(r)) if r.state == State::Active => {
+            let r = r.clone();
+            (store, r)
+        }
+        stale => {
+            match stale {
+                Some(Some(r)) => eprintln!(
+                    "warning: The profile selected for this project ({}) is no longer active; choose another",
+                    r.name
+                ),
+                Some(None) => eprintln!(
+                    "warning: The profile selected for this project no longer exists; choose another"
+                ),
+                None => (),
+            }
+            pick(store, &root, &key)?
+        }
+    };
+    start(store, &registration, allow_auth_env, arguments)
+}
+
+/// Shows the picker with the lock released, then reacquires, revalidates the
+/// choice and records the selection (failure warns).
+fn pick(store: Store, root: &Path, key: &Path) -> Result<(Store, Registration)> {
+    let active = store
+        .registry
+        .registrations
+        .iter()
+        .any(|r| r.state == State::Active);
+    if !active {
+        return Err(Error::new("not_found", "No active profiles to choose from")
+            .next("Create a profile with roost add NAME"));
+    }
+    use std::io::IsTerminal;
+    if !(std::io::stdin().is_terminal() && std::io::stderr().is_terminal()) {
+        return Err(Error::new(
+            "usage",
+            "No profile is selected for this project and no terminal is available to choose one",
+        )
+        .next("roost switch NAME selects one for this project; roost run NAME launches once"));
+    }
+    let mut records = store.profiles(false)?;
+    let _ = annotate(&store, &mut records, Some(key));
+    let _ = sets::annotate(&store, &mut records);
+    let choices: Vec<Registration> = records
+        .iter()
+        .map(|record| {
+            store
+                .registry
+                .registrations
+                .iter()
+                .find(|r| r.state == State::Active && record["name"] == r.name.as_str())
+                .cloned()
+                .ok_or_else(|| Error::new("ownership", "Profile list changed while reading"))
+        })
+        .collect::<Result<_>>()?;
+    let lines = table::profiles(&records, false, false, None);
+    let initial = records
+        .iter()
+        .position(|r| r["most_recent"] == true)
+        .unwrap_or(0);
+    let root_id = store.root_id.clone();
+    drop(store);
+    let index = platform::pick(&lines[0], &lines[1..=records.len()], initial)?;
+    let chosen = &choices[index];
+    let store = open_launch(root)?;
+    let current = store
+        .registry
+        .registrations
+        .iter()
+        .find(|r| r.registration_id == chosen.registration_id);
+    if store.root_id != root_id || current != Some(chosen) {
+        return Err(
+            Error::new("ownership", "Profile changed while the picker was open")
+                .next("Run roost again to choose from the current profiles"),
+        );
+    }
+    if let Err(e) = record_selection(&store, key, chosen) {
+        eprintln!(
+            "warning: Could not remember {} for this project: {}",
+            chosen.name, e.message
+        );
+    }
+    Ok((store, chosen.clone()))
+}
+
+/// `roost switch`: select NAME for this project and launch it, only select it
+/// (`no_launch`), or clear this project's selection (`forget`).
+pub fn switch(
+    name: Option<&str>,
+    no_launch: bool,
+    forget: bool,
+    allow_auth_env: bool,
+    arguments: &[OsString],
+) -> Result<Outcome> {
+    let key = selection_key()?;
+    let store = open_launch(&platform::root()?)?;
+    let Some(name) = name.filter(|_| !forget) else {
+        let selected = store
+            .read_state_unfiltered()?
+            .selections
+            .iter()
+            .any(|s| s.project == key);
+        if selected {
+            store.update_state(|state| {
+                state.selections.retain(|s| s.project != key);
+                Ok(())
+            })?;
+        }
+        return Ok(Outcome::lines(vec![format!(
+            "{} {}",
+            if selected {
+                "Forgot the selection for"
+            } else {
+                "No selection to forget for"
+            },
+            key.display()
+        )]));
+    };
+    let registration = store.find(name, false)?.clone();
+    store.validate(&registration)?;
+    let recorded = record_selection(&store, &key, &registration);
+    if no_launch {
+        recorded?;
+        return Ok(Outcome::lines(vec![format!(
+            "Selected {} for {}",
+            registration.name,
+            key.display()
+        )]));
+    }
+    if let Err(e) = recorded {
+        eprintln!(
+            "warning: Could not remember {} for this project: {}",
+            registration.name, e.message
+        );
+    }
+    start(store, &registration, allow_auth_env, arguments)
+}
+
+/// Fills each ProfileRecord's `last_used`, `selected` (valid selection for
+/// `project`) and `most_recent`. Returns warnings when `state.json` is unreadable.
+pub fn annotate(store: &Store, profiles: &mut [Value], project: Option<&Path>) -> Vec<String> {
+    let state = match store.read_state() {
+        Ok(state) => state,
+        Err(e) => return vec![format!("Selection state unavailable: {}", e.message)],
+    };
+    let selected = project.and_then(|p| {
+        state
+            .selections
+            .iter()
+            .find(|s| s.project == p)
+            .map(|s| s.registration_id.as_str())
+    });
+    let mut most_recent: Option<&Timestamp> = None;
+    for time in &state.last_used {
+        if most_recent.is_none_or(|m| time.at > m.at) {
+            most_recent = Some(time);
+        }
+    }
+    for profile in profiles.iter_mut() {
+        let Some(registration) = store
+            .registry
+            .registrations
+            .iter()
+            .find(|r| profile["name"] == r.name.as_str())
+        else {
+            continue;
+        };
+        let id = registration.registration_id.as_str();
+        let last_used = state
+            .last_used
+            .iter()
+            .find(|t| t.registration_id == id)
+            .map(|t| t.at);
+        profile["last_used"] = json!(last_used);
+        profile["selected"] = json!(selected == Some(id) && registration.state == State::Active);
+        profile["most_recent"] = json!(most_recent.is_some_and(|t| t.registration_id == id));
+    }
+    vec![]
+}
+
+/// List's `project` value and fallback warnings; null when the key is unsafe.
+pub fn list_project() -> (Option<PathBuf>, Vec<String>) {
+    let project = project();
+    (project.key.ok(), project.warnings)
+}
+
+/// After `remove`/`purge` commits: clears every selection naming `registration`,
+/// so a later profile with the same name inherits nothing. Returns warnings.
+pub fn forget_removed(store: &Store, registration: &Registration) -> Vec<String> {
+    let id = &registration.registration_id;
+    let named = store
+        .read_state_unfiltered()
+        .map(|state| state.selections.iter().any(|s| &s.registration_id == id));
+    let result = match named {
+        Ok(false) => Ok(()),
+        Ok(true) => store.update_state(|state| {
+            state.selections.retain(|s| &s.registration_id != id);
+            Ok(())
+        }),
+        Err(e) => Err(e),
+    };
+    match result {
+        Ok(()) => vec![],
+        Err(e) => vec![format!(
+            "Selections naming {} were not cleared: {}; run roost switch --forget in affected projects",
+            registration.name, e.message
+        )],
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    struct Temp(PathBuf);
+    impl Temp {
+        fn new() -> Self {
+            let path = std::env::temp_dir().join(format!(
+                "roost-select-test-{}",
+                platform::random_id().unwrap()
+            ));
+            fs::create_dir(&path).unwrap();
+            Self(path)
+        }
+        fn dir(&self, relative: &str) -> PathBuf {
+            let path = self.0.join(relative);
+            fs::create_dir_all(&path).unwrap();
+            path
+        }
+        fn file(&self, relative: &str, text: &str) {
+            fs::write(self.0.join(relative), text).unwrap();
+        }
+    }
+    impl Drop for Temp {
+        fn drop(&mut self) {
+            let _ = fs::remove_dir_all(&self.0);
+        }
+    }
+
+    fn key(cwd: &Path) -> (PathBuf, usize) {
+        let project = project_key(cwd);
+        (project.key.unwrap(), project.warnings.len())
+    }
+
+    #[test]
+    fn repository_and_its_worktrees_share_the_common_directory_key() {
+        let t = Temp::new();
+        let nested = t.dir("repo/src/deep");
+        t.dir("repo/.git/worktrees/wt");
+        t.file("repo/.git/worktrees/wt/commondir", "../..\n");
+        let worktree = t.dir("wt/sub");
+        t.file("wt/.git", "gitdir: ../repo/.git/worktrees/wt\n");
+        let common = t.0.join("repo/.git");
+        assert_eq!(key(&nested), (common.clone(), 0));
+        assert_eq!(key(&worktree), (common.clone(), 0));
+        // An absolute commondir and gitdir are honored as written.
+        t.dir("abs/.git/worktrees/x");
+        let other = t.dir("other");
+        t.file(
+            "other/.git",
+            &format!("gitdir: {}", t.0.join("abs/.git/worktrees/x").display()),
+        );
+        t.file(
+            "abs/.git/worktrees/x/commondir",
+            &t.0.join("abs/.git").display().to_string(),
+        );
+        assert_eq!(key(&other), (t.0.join("abs/.git"), 0));
+    }
+
+    #[test]
+    fn nested_repository_wins_and_non_git_uses_the_directory() {
+        let t = Temp::new();
+        t.dir("outer/.git");
+        let inner = t.dir("outer/vendor/inner/src");
+        t.dir("outer/vendor/inner/.git");
+        assert_eq!(key(&inner), (t.0.join("outer/vendor/inner/.git"), 0));
+        let plain = t.dir("plain/dir");
+        // The temp directory itself is not inside a repository in test runs.
+        let project = project_key(&plain);
+        if project.key.as_ref().unwrap().ends_with(".git") {
+            return;
+        }
+        assert_eq!(project.key.unwrap(), plain);
+    }
+
+    #[test]
+    fn malformed_git_metadata_falls_back_to_the_directory_with_a_warning() {
+        for (dot_git, commondir) in [
+            ("not a gitdir line\n", None),
+            ("gitdir: \n", None),
+            ("gitdir: missing/dir\n", None),
+            ("gitdir: gd\n", Some("")),
+            ("gitdir: gd\n", Some("a\nb\n")),
+            ("gitdir: gd\n", Some("nowhere\n")),
+        ] {
+            let t = Temp::new();
+            let cwd = t.dir("work");
+            t.dir("work/gd");
+            t.file("work/.git", dot_git);
+            if let Some(text) = commondir {
+                t.file("work/gd/commondir", text);
+            }
+            assert_eq!(key(&cwd), (cwd.clone(), 1), "{dot_git:?} {commondir:?}");
+        }
+    }
+
+    #[test]
+    fn line_breaks_in_the_key_are_unsafe() {
+        let t = Temp::new();
+        let cwd = t.dir("bad\nname");
+        let project = project_key(&cwd);
+        if project.key.as_ref().is_ok_and(|k| k.ends_with(".git")) {
+            return;
+        }
+        assert_eq!(project.key.unwrap_err().code, "unsafe_path");
+    }
+}

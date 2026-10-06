@@ -119,11 +119,15 @@ fn input(command: &mut Command, bytes: &[u8]) -> Output {
 fn help_version_and_usage_do_not_touch_storage() {
     let f = Fixture::new();
     assert!(
-        String::from_utf8(f.ok(&[]).stdout)
+        String::from_utf8(f.ok(&["--help"]).stdout)
             .unwrap()
             .contains("auth login")
     );
     assert_eq!(f.ok(&["--version"]).stdout, b"0.1.0\n");
+    // Bare roost without storage names roost add and creates nothing.
+    let bare = f.run(&[]);
+    assert_eq!(bare.status.code(), Some(1));
+    assert!(String::from_utf8_lossy(&bare.stderr).contains("roost add NAME"));
     assert!(
         f.command()
             .env("ROOST_DIR", "")
@@ -140,6 +144,19 @@ fn help_version_and_usage_do_not_touch_storage() {
         vec!["remove", "Work", "--yes"],
         vec!["token", "Work", "--stdin", "--clear"],
         vec!["unknown"],
+        vec!["--allow-auth-env", "--help"],
+        vec!["--allow-auth-env", "Work"],
+        vec!["--bogus"],
+        vec!["switch"],
+        vec!["switch", "--forget", "Work"],
+        vec!["switch", "--no-launch", "--forget"],
+        vec!["switch", "--no-launch", "--allow-auth-env", "Work"],
+        vec!["switch", "--allow-auth-env", "--forget"],
+        vec!["switch", "--no-launch", "Work", "--"],
+        vec!["switch", "--no-launch", "Work", "-p"],
+        vec!["switch", "--no-launch", "--no-launch", "Work"],
+        vec!["switch", "--unknown", "Work"],
+        vec!["switch", "CON"],
     ] {
         assert_eq!(f.run(&args).status.code(), Some(2), "{args:?}");
     }
@@ -998,6 +1015,14 @@ print(json.dumps(results))
     );
 }
 
+/// A separate project: its own `.git` directory, so its key never depends on
+/// whatever repository the temporary directory happens to sit in.
+fn repo(f: &Fixture, name: &str) -> PathBuf {
+    let path = f.path.join(name);
+    fs::create_dir_all(path.join(".git")).unwrap();
+    path
+}
+
 fn launched(output: &Output) -> Value {
     assert!(
         output.status.success(),
@@ -1012,8 +1037,8 @@ fn switch_selects_per_project_and_bare_roost_launches_it() {
     let f = Fixture::new();
     f.add("Work");
     f.add("Home");
-    let project = f.path.join("app");
-    fs::create_dir(&project).unwrap();
+    let project = repo(&f, "app");
+    let other = repo(&f, "other");
     let selected = f
         .command()
         .current_dir(&project)
@@ -1034,7 +1059,7 @@ fn switch_selects_per_project_and_bare_roost_launches_it() {
         json!(f.root.join("profiles/Work").to_str().unwrap())
     );
     // Another directory has no selection and no terminal: usage, never a picker.
-    let other = f.run(&[]);
+    let other = f.command().current_dir(&other).output().unwrap();
     assert_eq!(other.status.code(), Some(2));
     let stderr = String::from_utf8_lossy(&other.stderr);
     assert!(

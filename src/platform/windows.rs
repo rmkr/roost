@@ -124,6 +124,10 @@ pub fn stdout_width() -> Option<usize> {
 pub fn confirm(_: &str, _: bool) -> Result<()> {
     Err(unavailable())
 }
+/// The arrow-key picker is unverified on Windows: refuse.
+pub fn pick(_: &str, _: &[String], _: usize) -> Result<usize> {
+    Err(unavailable())
+}
 pub fn setup_path(_: &Path, _: Option<&str>, _: bool) -> Result<Vec<String>> {
     Err(Error::new(
         "io",
