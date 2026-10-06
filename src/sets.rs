@@ -323,17 +323,9 @@ fn subscriber(store: &Store, name: &str) -> Result<Registration> {
 pub fn command(action: SetAction, data: &mut Value) -> Result<Vec<String>> {
     let root = platform::root()?;
     if let SetAction::List { .. } = action {
-        let store = match Store::open(&root, false, OpenMode::Read) {
-            Ok(store) => store,
-            Err(e)
-                if e.code == "not_found"
-                    && std::fs::symlink_metadata(&root)
-                        .is_err_and(|e| e.kind() == std::io::ErrorKind::NotFound) =>
-            {
-                *data = json!({"sets":[]});
-                return Ok(vec!["No sets; create one with roost set create SET".into()]);
-            }
-            Err(e) => return Err(e),
+        let Some(store) = Store::open_if_present(&root)? else {
+            *data = json!({"sets":[]});
+            return Ok(vec!["No sets; create one with roost set create SET".into()]);
         };
         let sets = store.read_sets()?;
         let mut records: Vec<Value> = sets

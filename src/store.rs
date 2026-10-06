@@ -404,6 +404,23 @@ fn current_binding() -> Result<LauncherBinding> {
 }
 
 impl Store {
+    /// Opens an existing root read-only; `None` only when nothing exists at the
+    /// root path (manager storage was never initialized). Any other failure,
+    /// including a not_found for a partial root, is returned.
+    pub fn open_if_present(root: &Path) -> Result<Option<Self>> {
+        match Self::open(root, false, OpenMode::Read) {
+            Ok(store) => Ok(Some(store)),
+            Err(e)
+                if e.code == "not_found"
+                    && std::fs::symlink_metadata(root)
+                        .is_err_and(|e| e.kind() == std::io::ErrorKind::NotFound) =>
+            {
+                Ok(None)
+            }
+            Err(e) => Err(e),
+        }
+    }
+
     pub fn open(root: &Path, create: bool, mode: OpenMode) -> Result<Self> {
         let root = platform::absolute(root)?;
         let parent = Directory::open(

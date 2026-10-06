@@ -933,19 +933,11 @@ pub fn command(action: PluginAction, data: &mut Value) -> Result<(Vec<String>, V
 }
 
 fn list(root: &Path, data: &mut Value) -> Result<(Vec<String>, Vec<String>)> {
-    let store = match Store::open(root, false, OpenMode::Read) {
-        Ok(store) => store,
-        Err(e)
-            if e.code == "not_found"
-                && std::fs::symlink_metadata(root)
-                    .is_err_and(|e| e.kind() == std::io::ErrorKind::NotFound) =>
-        {
-            return Ok((
-                vec!["No store plugins; install one with roost plugin add PLUGIN".into()],
-                vec![],
-            ));
-        }
-        Err(e) => return Err(e),
+    let Some(store) = Store::open_if_present(root)? else {
+        return Ok((
+            vec!["No store plugins; install one with roost plugin add PLUGIN".into()],
+            vec![],
+        ));
     };
     let sets = store.read_sets()?;
     let state = store.read_state()?;

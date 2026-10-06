@@ -240,17 +240,7 @@ fn dispatch(action: Action, data: &mut Value) -> Result<Outcome> {
         }),
         Action::List { retained, full, .. } => {
             let root = platform::root()?;
-            let store = match open(&root, OpenMode::Read) {
-                Ok(store) => Some(store),
-                Err(e)
-                    if e.code == "not_found"
-                        && std::fs::symlink_metadata(&root)
-                            .is_err_and(|e| e.kind() == std::io::ErrorKind::NotFound) =>
-                {
-                    None
-                }
-                Err(e) => return Err(e),
-            };
+            let store = Store::open_if_present(&root)?;
             let mut profiles = if let Some(store) = &store {
                 store.profiles(retained)?
             } else {
@@ -623,8 +613,8 @@ fn doctor(data: &mut Value) -> Result<Outcome> {
         ));
     }
     let mut shadow_jobs = vec![];
-    match open(&root, OpenMode::Read) {
-        Ok(store) => {
+    match Store::open_if_present(&root) {
+        Ok(Some(store)) => {
             if store.pending() {
                 findings.push(finding("recovery","error","Pending operation requires classified recovery; purge deletion is never automatically continued".into(),Some(&root),Some("Retry the original acknowledged mutation after inspection; explicit purge retries require quiet writers".into())));
             }
@@ -678,19 +668,13 @@ fn doctor(data: &mut Value) -> Result<Outcome> {
                 }
             }
         }
-        Err(e)
-            if e.code == "not_found"
-                && std::fs::symlink_metadata(&root)
-                    .is_err_and(|e| e.kind() == std::io::ErrorKind::NotFound) =>
-        {
-            findings.push(finding(
-                "storage",
-                "warning",
-                "Manager storage is not initialized".into(),
-                Some(&root),
-                None,
-            ))
-        }
+        Ok(None) => findings.push(finding(
+            "storage",
+            "warning",
+            "Manager storage is not initialized".into(),
+            Some(&root),
+            None,
+        )),
         Err(e) => findings.push(finding(
             e.code,
             "error",
