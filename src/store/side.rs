@@ -32,6 +32,37 @@ pub struct StateFile {
     /// Optional on read and omitted while empty, so older documents stay valid.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub desktop_links: Vec<DesktopLink>,
+    /// What Roost wrote into each owned profile's `settings.json` (ADR 0003).
+    /// Optional on read and omitted while empty, so older documents stay valid.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub settings: Vec<SettingsRecord>,
+}
+/// Hook handlers and single-value keys Roost wrote into one owned profile's
+/// `settings.json`; only these are ever changed or removed by Roost.
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct SettingsRecord {
+    pub registration_id: String,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub hooks: Vec<HookRecord>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub status_line: Option<serde_json::Value>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub output_style: Option<serde_json::Value>,
+}
+impl SettingsRecord {
+    pub fn is_empty(&self) -> bool {
+        self.hooks.is_empty() && self.status_line.is_none() && self.output_style.is_none()
+    }
+}
+/// One hook handler Roost added under `hooks.<event>` in a group with `matcher`.
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct HookRecord {
+    pub event: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub matcher: Option<String>,
+    pub handler: serde_json::Value,
 }
 /// A project's selected profile; `project` is the absolute project key.
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
@@ -100,6 +131,10 @@ pub enum ItemKind {
     CommandSource,
     OutputStyle,
     OutputStyleSource,
+    /// A settings fragment file merged into owned profiles' `settings.json`.
+    Setting,
+    /// A directory whose immediate `*.json` files are settings fragments.
+    SettingSource,
 }
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
@@ -159,6 +194,7 @@ impl StateFile {
             desktop_launched: vec![],
             plugin_auto_update_at: None,
             desktop_links: vec![],
+            settings: vec![],
         }
     }
 }
@@ -179,10 +215,23 @@ impl SideFile for StateFile {
                 .chain(self.last_used.iter().map(|t| &t.registration_id))
                 .chain(self.links.iter().map(|l| &l.registration_id))
                 .chain(self.desktop_launched.iter().map(|t| &t.registration_id))
-                .chain(self.desktop_links.iter().map(|l| &l.registration_id)),
+                .chain(self.desktop_links.iter().map(|l| &l.registration_id))
+                .chain(self.settings.iter().map(|s| &s.registration_id)),
         )?;
         if self.desktop_links.len() > 1 {
             return Err(invalid(STATE));
+        }
+        unique(STATE, self.settings.iter().map(|s| &s.registration_id))?;
+        for record in &self.settings {
+            let valid = !record.is_empty()
+                && record.hooks.iter().all(|h| {
+                    !h.event.is_empty() && h.handler.get("type").is_some_and(|t| t.is_string())
+                })
+                && record.status_line.as_ref().is_none_or(|v| v.is_object())
+                && record.output_style.as_ref().is_none_or(|v| v.is_string());
+            if !valid {
+                return Err(invalid(STATE));
+            }
         }
         for selection in &self.selections {
             absolute(STATE, &selection.project)?;
@@ -221,6 +270,7 @@ impl SideFile for StateFile {
         self.links.retain(|l| keep(&l.registration_id));
         self.desktop_launched.retain(|t| keep(&t.registration_id));
         self.desktop_links.retain(|l| keep(&l.registration_id));
+        self.settings.retain(|s| keep(&s.registration_id));
     }
 }
 impl SetsFile {
@@ -811,6 +861,76 @@ mod tests {
             .unwrap_err();
         assert_eq!(error.code, "ownership");
         assert_eq!(store.read_state().unwrap().desktop_links.len(), 1);
+    }
+
+    #[test]
+    fn settings_records_are_optional_in_older_state_and_omitted_while_empty() {
+        let f = Fixture::new();
+        let mut store = f.open(OpenMode::Mutate).unwrap();
+        store.add("Work", false, None).unwrap();
+        let work = store.find("Work", false).unwrap().registration_id.clone();
+        // The user's existing state.json shape (with links and desktop_links).
+        let old = serde_json::json!({"schema_version":1,"root_id":store.root_id,
+            "selections":[],"last_used":[{"registration_id":work,"at":5}],"links":[],
+            "desktop_launched":[],"plugin_auto_update_at":null,
+            "desktop_links":[{"registration_id":work}]});
+        fs::write(f.root.join(STATE), serde_json::to_vec(&old).unwrap()).unwrap();
+        fs::set_permissions(f.root.join(STATE), fs::Permissions::from_mode(0o600)).unwrap();
+        assert!(store.read_state().unwrap().settings.is_empty());
+        store.update_state(|_| Ok(())).unwrap();
+        let text = fs::read_to_string(f.root.join(STATE)).unwrap();
+        assert!(!text.contains("settings"), "{text}");
+        let record = SettingsRecord {
+            registration_id: work.clone(),
+            hooks: vec![HookRecord {
+                event: "Stop".into(),
+                matcher: None,
+                handler: serde_json::json!({"type":"command","command":"x"}),
+            }],
+            status_line: None,
+            output_style: Some(serde_json::json!("terse")),
+        };
+        store
+            .update_state(|state| {
+                state.settings.push(record.clone());
+                Ok(())
+            })
+            .unwrap();
+        assert_eq!(
+            store.read_state().unwrap().settings,
+            std::slice::from_ref(&record)
+        );
+        let text = fs::read_to_string(f.root.join(STATE)).unwrap();
+        assert!(
+            !text.contains("matcher") && !text.contains("status_line"),
+            "{text}"
+        );
+        // One record per registration; handlers must be typed objects.
+        for bad in [
+            {
+                let mut twice = record.clone();
+                twice.output_style = None;
+                vec![record.clone(), twice]
+            },
+            vec![SettingsRecord {
+                hooks: vec![HookRecord {
+                    event: "Stop".into(),
+                    matcher: None,
+                    handler: serde_json::json!("x"),
+                }],
+                ..record.clone()
+            }],
+        ] {
+            let error = store
+                .update_state(|state| {
+                    state.settings = bad;
+                    Ok(())
+                })
+                .unwrap_err();
+            assert_eq!(error.code, "ownership");
+        }
+        // Refused writes leave the stored record as it was.
+        assert_eq!(store.read_state().unwrap().settings.len(), 1);
     }
 
     #[test]

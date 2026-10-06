@@ -200,13 +200,13 @@ pub enum SetAction {
     Add {
         set: String,
         #[command(flatten)]
-        item: ItemArgs,
+        item: Box<ItemArgs>,
     },
     /// Drop one item from a set
     Drop {
         set: String,
         #[command(flatten)]
-        item: ItemArgs,
+        item: Box<ItemArgs>,
     },
     /// Subscribe a profile to sets
     Subscribe {
@@ -307,6 +307,13 @@ pub struct ItemArgs {
     /// A directory whose every child .md file is an output style
     #[arg(long, value_name = "DIR")]
     pub output_styles_from: Option<PathBuf>,
+    /// A settings fragment (.json with hooks, statusLine or outputStyle), merged
+    /// into settings.json
+    #[arg(long, value_name = "FILE")]
+    pub setting: Option<PathBuf>,
+    /// A directory whose every child .json file is a settings fragment
+    #[arg(long, value_name = "DIR")]
+    pub settings_from: Option<PathBuf>,
     /// A plugin installed in the plugin store
     #[arg(long, value_name = "PLUGIN@MARKETPLACE")]
     pub plugin: Option<String>,

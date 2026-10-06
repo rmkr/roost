@@ -13,6 +13,9 @@
 //!   subagents, custom commands and output styles as `.md` files under `agents/`,
 //!   `commands/` and `output-styles/` (Claude loads each from the config directory
 //!   and follows symlinked files).
+//! - Settings fragments (`setting`, `setting_source`) are not links: they are
+//!   validated, conflict-checked and merged into `settings.json` by
+//!   [`crate::settings`], called from [`reconcile_at_launch`] after links.
 //! - Plugins: [`plugin_installed`] gates `set add --plugin`; [`plugin_items`] gives
 //!   a registration's subscribed plugin IDs for injection.
 
@@ -20,6 +23,7 @@ use crate::{
     Error, Result,
     cli::{ItemArgs, SetAction},
     platform::{self, Directory},
+    settings,
     store::{
         self, Kind, OpenMode, Registration, State, Store,
         side::{Item, ItemKind, LinkRecord, SetsFile, SharedSet, Subscription},
@@ -120,22 +124,29 @@ fn linkable(name: &str, select: Select) -> bool {
 /// check follows symlinks; a dangling link counts as missing. Only read, never
 /// written. Non-linked kinds (plugins) are not checked here.
 fn source_present(item: &Item) -> bool {
-    let Some(placement) = placement(item.kind) else {
+    if !LINKED.contains(&item.kind) && !settings::is_setting(item.kind) {
         return true;
-    };
+    }
     let Ok(metadata) = std::fs::metadata(&item.value) else {
         return false;
     };
-    if item.kind == placement.explicit && placement.select == Select::Markdown {
+    if file_kind(item.kind) {
         metadata.is_file()
     } else {
         metadata.is_dir()
     }
 }
 
+/// Whether a kind's source is a regular file: single Markdown items and settings
+/// fragments; everything else names a directory.
+fn file_kind(kind: ItemKind) -> bool {
+    kind == ItemKind::Setting
+        || placement(kind).is_some_and(|p| p.explicit == kind && p.select == Select::Markdown)
+}
+
 /// The source type [`source_present`] requires, for messages.
 fn source_type(kind: ItemKind) -> &'static str {
-    if placement(kind).is_some_and(|p| p.explicit == kind && p.select == Select::Markdown) {
+    if file_kind(kind) {
         "a regular file"
     } else {
         "a directory"
@@ -225,7 +236,10 @@ fn validate_set_name(name: &str) -> Result<()> {
 
 /// Items of every set `registration_id` subscribes to, with their set's name, in
 /// set order.
-fn subscribed<'a>(sets: &'a SetsFile, registration_id: &str) -> Vec<(&'a str, &'a Item)> {
+pub(crate) fn subscribed<'a>(
+    sets: &'a SetsFile,
+    registration_id: &str,
+) -> Vec<(&'a str, &'a Item)> {
     sets.sets
         .iter()
         .filter(|set| {
@@ -278,6 +292,7 @@ pub(crate) fn conflicts(sets: &SetsFile, registration: &Registration) -> Vec<Str
                 ));
             }
         }
+        found.extend(settings::conflicts(&items));
     }
     let mut plugins: BTreeMap<&str, BTreeSet<&str>> = BTreeMap::new();
     for (_, item) in items.iter().filter(|(_, i)| i.kind == ItemKind::Plugin) {
@@ -335,6 +350,8 @@ fn item(args: ItemArgs) -> Result<Item> {
         (ItemKind::CommandSource, args.commands_from),
         (ItemKind::OutputStyle, args.output_style),
         (ItemKind::OutputStyleSource, args.output_styles_from),
+        (ItemKind::Setting, args.setting),
+        (ItemKind::SettingSource, args.settings_from),
     ];
     if let Some((kind, p)) = paths.into_iter().find_map(|(k, p)| p.map(|p| (k, p))) {
         return path(kind, p);
@@ -495,7 +512,7 @@ pub fn command(action: SetAction, data: &mut Value) -> Result<Vec<String>> {
         }
         SetAction::Add { set, item: args } => {
             validate_set_name(&set)?;
-            let item = item(args)?;
+            let item = item(*args)?;
             if !source_present(&item) {
                 return Err(Error::new(
                     "not_found",
@@ -506,6 +523,9 @@ pub fn command(action: SetAction, data: &mut Value) -> Result<Vec<String>> {
                     ),
                 )
                 .next("Check the path, then add it again"));
+            }
+            if settings::is_setting(item.kind) {
+                settings::validate(&item)?;
             }
             if item.kind == ItemKind::Plugin && !plugin_installed(&store, &item.value)? {
                 return Err(Error::new(
@@ -531,7 +551,7 @@ pub fn command(action: SetAction, data: &mut Value) -> Result<Vec<String>> {
         }
         SetAction::Drop { set, item: args } => {
             validate_set_name(&set)?;
-            let item = item(args)?;
+            let item = item(*args)?;
             store.update_sets(|sets| {
                 find_set_mut(sets, &set)?.items.retain(|i| *i != item);
                 Ok(())
@@ -577,7 +597,7 @@ pub fn command(action: SetAction, data: &mut Value) -> Result<Vec<String>> {
             ));
             if registration.kind == Kind::Upstream {
                 lines.push(
-                    "Upstream profiles receive only plugin items; linked items (skills, instructions, agents, commands, output styles) are ignored"
+                    "Upstream profiles receive only plugin items; linked items (skills, instructions, agents, commands, output styles) and settings are ignored"
                         .into(),
                 );
             }
@@ -940,7 +960,9 @@ pub fn reconcile(store: &Store, registration: &Registration) -> Vec<String> {
 /// Reconciles before handing off to Claude, printing warnings to stderr (the
 /// launch outcome is never printed once the child is exec'd).
 pub fn reconcile_at_launch(store: &Store, registration: &Registration) {
-    for warning in reconcile(store, registration) {
+    let mut warnings = reconcile(store, registration);
+    warnings.extend(settings::reconcile(store, registration));
+    for warning in warnings {
         eprintln!("warning: {warning}");
     }
 }

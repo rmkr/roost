@@ -5,6 +5,7 @@ mod platform;
 mod plugins;
 mod select;
 mod sets;
+mod settings;
 mod store;
 mod table;
 
