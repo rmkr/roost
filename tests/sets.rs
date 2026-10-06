@@ -53,7 +53,10 @@ print(json.dumps({'arguments':args,'config':os.environ.get('CLAUDE_CONFIG_DIR')}
             .env_clear()
             .env("ROOST_DIR", &self.root)
             .env("HOME", &self.home)
-            .env("PATH", format!("{}:/usr/bin:/bin", self.path.join("bin").display()))
+            .env(
+                "PATH",
+                format!("{}:/usr/bin:/bin", self.path.join("bin").display()),
+            )
             .env("SHELL", "/bin/bash")
             .current_dir(&self.path);
         command
@@ -135,6 +138,16 @@ fn sets_are_created_marked_default_listed_and_deleted() {
     f.fails(&["set", "delete", "core"], "not_found");
     f.fails(&["set", "default", "core"], "not_found");
     assert_eq!(f.sets().as_array().unwrap().len(), 1);
+    f.ok(&["set", "subscribe", "work", "writing"]);
+    let text = String::from_utf8(f.ok(&["set", "list"]).stdout).unwrap();
+    assert_eq!(
+        text.lines().collect::<Vec<_>>(),
+        [
+            "Set      Default  Subscribers  Items",
+            "writing  yes      Work         —",
+        ]
+    );
+    f.fails(&["set", "help"], "unrecognized");
 }
 
 #[test]
@@ -166,7 +179,10 @@ fn items_are_stored_absolute_and_add_or_drop_is_idempotent() {
         "cannot be used",
     );
     f.fails(&["set", "add", "core", "--skill", "skills/synced"], "usage");
-    f.fails(&["set", "add", "core", "--skill", "skills/.hidden"], "usage");
+    f.fails(
+        &["set", "add", "core", "--skill", "skills/.hidden"],
+        "usage",
+    );
     f.fails(
         &["set", "add", "core", "--instruction", "notes/style.txt"],
         "usage",
@@ -174,7 +190,10 @@ fn items_are_stored_absolute_and_add_or_drop_is_idempotent() {
     f.fails(&["set", "add", "core", "--plugin", "bad id"], "usage");
     f.fails(&["set", "add", "core", "--plugin", "a@b@c"], "usage");
     // Plugins must be installed in the plugin store.
-    f.fails(&["set", "add", "core", "--plugin", "lint@tools"], "not_found");
+    f.fails(
+        &["set", "add", "core", "--plugin", "lint@tools"],
+        "not_found",
+    );
     f.fails(&["set", "add", "absent", "--skill", "x"], "not_found");
     // Sources are never created or written.
     assert!(!f.path.join("skills").exists() && !f.path.join("notes").exists());
@@ -242,7 +261,13 @@ fn launch_links_subscribed_skills_and_removes_only_recorded_links() {
     f.ok(&["set", "add", "core", "--skills-from", s(&source)]);
     f.ok(&["set", "add", "core", "--skill", s(&single)]);
     // Instruction items are stored but not linked yet.
-    f.ok(&["set", "add", "core", "--instruction", s(&f.path.join("rule.md"))]);
+    f.ok(&[
+        "set",
+        "add",
+        "core",
+        "--instruction",
+        s(&f.path.join("rule.md")),
+    ]);
     f.ok(&["add", "Work"]);
     let skills = f.profile("Work").join("skills");
     fs::create_dir(&skills).unwrap();
@@ -265,7 +290,11 @@ fn launch_links_subscribed_skills_and_removes_only_recorded_links() {
     );
     assert_eq!(fs::read_link(skills.join("gamma")).unwrap(), single);
     assert!(fs::symlink_metadata(skills.join("beta")).unwrap().is_dir());
-    assert!(fs::symlink_metadata(skills.join("synced")).unwrap().is_dir());
+    assert!(
+        fs::symlink_metadata(skills.join("synced"))
+            .unwrap()
+            .is_dir()
+    );
     assert!(!skills.join(".hidden").exists() && !skills.join("notes.md").exists());
     assert!(!f.profile("Work").join("rules").exists());
     let links = f.state()["links"].clone();
@@ -418,9 +447,19 @@ fn remove_keeps_records_and_purge_unlinks_without_following() {
     f.ok(&["add", "Work"]);
     f.ok(&["run", "Work"]);
     let link = f.profile("Work").join("skills/alpha");
-    assert!(fs::symlink_metadata(&link).unwrap().file_type().is_symlink());
+    assert!(
+        fs::symlink_metadata(&link)
+            .unwrap()
+            .file_type()
+            .is_symlink()
+    );
     f.ok(&["remove", "Work"]);
-    assert!(fs::symlink_metadata(&link).unwrap().file_type().is_symlink());
+    assert!(
+        fs::symlink_metadata(&link)
+            .unwrap()
+            .file_type()
+            .is_symlink()
+    );
     assert_eq!(f.state()["links"].as_array().unwrap().len(), 1);
     assert_eq!(f.sets()[0]["subscribers"], json!(["Work"]));
     f.ok(&["reuse", "Work"]);

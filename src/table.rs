@@ -4,11 +4,11 @@
 //! Callers build a `Table` by appending columns; each column is a header plus a
 //! cell function over the caller's row type, so features add columns without
 //! touching the renderer.
+use serde_json::Value;
 use std::ffi::OsStr;
 
 /// Terminal styling for one cell. Ignored unless color is enabled.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-#[allow(dead_code, reason = "style palette shared by later list columns")]
 pub enum Style {
     Plain,
     Bold,
@@ -60,6 +60,8 @@ pub struct Table<'a, R> {
     marker: Option<CellFn<'a, R>>,
     columns: Vec<Column<'a, R>>,
     summary: Option<String>,
+    hidden: Vec<String>,
+    width: Option<usize>,
 }
 impl<'a, R> Default for Table<'a, R> {
     fn default() -> Self {
@@ -67,6 +69,8 @@ impl<'a, R> Default for Table<'a, R> {
             marker: None,
             columns: Vec::new(),
             summary: None,
+            hidden: Vec::new(),
+            width: None,
         }
     }
 }
@@ -91,6 +95,17 @@ impl<'a, R> Table<'a, R> {
     /// Sets the summary line printed after a blank line.
     pub fn summary(mut self, text: impl Into<String>) -> Self {
         self.summary = Some(text.into());
+        self
+    }
+    /// Names a column left out of this view; the summary lists hidden columns.
+    pub fn hidden(mut self, header: &str) -> Self {
+        self.hidden.push(header.to_owned());
+        self
+    }
+    /// Limits rendered lines to `width` display columns (None: unlimited) by
+    /// hiding columns from the right; the first column is always shown.
+    pub fn width(mut self, width: Option<usize>) -> Self {
+        self.width = width;
         self
     }
     /// Renders header, rows and optional summary as lines without trailing padding.
@@ -129,6 +144,20 @@ impl<'a, R> Table<'a, R> {
                 2
             }
         };
+        let mut hidden = self.hidden.clone();
+        if let Some(limit) = self.width {
+            let line_width =
+                |k: usize| widths[..k].iter().sum::<usize>() + (0..k - 1).map(gap).sum::<usize>();
+            let first = usize::from(self.marker.is_some()) + 1;
+            let mut keep = count;
+            while keep > first && line_width(keep) > limit {
+                keep -= 1;
+            }
+            hidden.extend(grid[0][keep..].iter().map(|c| c.text.clone()));
+            for line in &mut grid {
+                line.truncate(keep);
+            }
+        }
         let mut lines: Vec<String> = grid
             .iter()
             .map(|line| {
@@ -145,8 +174,13 @@ impl<'a, R> Table<'a, R> {
             })
             .collect();
         if let Some(summary) = &self.summary {
+            let mut summary = summary.clone();
+            if !hidden.is_empty() {
+                summary.push_str(" · hidden: ");
+                summary.push_str(&hidden.join(", "));
+            }
             lines.push(String::new());
-            lines.push(summary.clone());
+            lines.push(summary);
         }
         lines
     }
@@ -176,24 +210,99 @@ pub fn stdout_color() -> bool {
 }
 
 /// The human `list` table over ProfileRecord values. Later columns append here.
-pub fn profiles(records: &[serde_json::Value], color: bool) -> Vec<String> {
-    let text = |key: &'static str| {
-        move |r: &serde_json::Value| Cell::plain(r[key].as_str().unwrap_or("-"))
-    };
+pub fn profiles(records: &[Value], full: bool, color: bool, width: Option<usize>) -> Vec<String> {
     let upstream = records.iter().filter(|r| r["kind"] == "upstream").count();
-    Table::new()
-        .column("Profile", |r: &serde_json::Value| {
+    let mut table = Table::new()
+        .column("Profile", |r: &Value| {
             Cell::new(r["name"].as_str().unwrap_or("?"), Style::Bold)
         })
-        .column("Kind", text("kind"))
-        .column("State", text("state"))
-        .column("Directory", text("directory"))
+        .column("Kind", |r: &Value| {
+            Cell::plain(r["kind"].as_str().unwrap_or("?"))
+        })
+        .column("Token", |r: &Value| match r["token_present"].as_bool() {
+            Some(true) => Cell::new("✓", Style::Green),
+            Some(false) => Cell::new("–", Style::Dim),
+            None => Cell::new("?", Style::Yellow),
+        })
+        .column("Launchers", |r: &Value| {
+            let condition = launcher_summary(&r["launchers"]);
+            let style = match condition {
+                "ready" => Style::Green,
+                "not_required" => Style::Dim,
+                "missing" | "stale" => Style::Yellow,
+                _ => Style::Red,
+            };
+            Cell::new(condition, style)
+        })
+        .column("Sets", |r: &Value| {
+            let names: Vec<&str> = r["sets"]
+                .as_array()
+                .into_iter()
+                .flatten()
+                .filter_map(Value::as_str)
+                .collect();
+            if names.is_empty() {
+                Cell::new("—", Style::Dim)
+            } else {
+                Cell::plain(names.join(","))
+            }
+        });
+    if full {
+        table = table
+            .column("Login", |r: &Value| {
+                probe_cell(r, |p| match p["reported_logged_in"].as_bool()? {
+                    true => Some(Cell::new("yes", Style::Green)),
+                    false => Some(Cell::new("no", Style::Yellow)),
+                })
+            })
+            .column("Auth", |r: &Value| {
+                probe_cell(r, |p| p["auth_method"].as_str().map(Cell::plain))
+            })
+            .column("Claude dir", |r: &Value| {
+                probe_cell(r, |p| p["config_directory"].as_str().map(Cell::plain))
+            });
+    }
+    table
+        .hidden("Path")
         .summary(format!(
             "○ {} profile{} · {upstream} upstream",
             records.len(),
             if records.len() == 1 { "" } else { "s" }
         ))
+        .width(width)
         .render(records, color)
+}
+
+/// A probed cell: `—` when the row is not probed (aliases, retained records),
+/// `?` when the probe failed or did not report the field.
+fn probe_cell(record: &Value, field: impl Fn(&Value) -> Option<Cell>) -> Cell {
+    match &record["probe"] {
+        Value::Null => Cell::new("—", Style::Dim),
+        probe => field(probe).unwrap_or_else(|| Cell::new("?", Style::Yellow)),
+    }
+}
+
+/// `ready` when every required launcher is ready, else the worst condition
+/// (`not_required` only when no launcher is required, as for retained records).
+fn launcher_summary(launchers: &Value) -> &'static str {
+    const RANK: [&str; 5] = ["ready", "missing", "stale", "collision", "unsafe"];
+    let all = launchers.as_array().map_or(&[][..], Vec::as_slice);
+    let required: Vec<&Value> = all
+        .iter()
+        .filter(|l| l["condition"] != "not_required")
+        .collect();
+    if required.is_empty() && !all.is_empty() {
+        return "not_required";
+    }
+    required
+        .iter()
+        .map(|l| {
+            RANK.iter()
+                .position(|c| l["condition"] == *c)
+                .unwrap_or(RANK.len() - 1)
+        })
+        .max()
+        .map_or("ready", |i| RANK[i])
 }
 
 /// Terminal column width: East Asian wide/fullwidth and emoji count 2, combining
@@ -291,6 +400,29 @@ mod tests {
                 "○ 2 profiles · @ selected here",
             ]
         );
+    }
+
+    #[test]
+    fn a_width_limit_hides_trailing_columns_and_names_them_in_the_summary() {
+        let lines = table()
+            .hidden("Path")
+            .summary("○ 2 profiles")
+            .width(Some(17))
+            .render(&rows(), false);
+        assert_eq!(
+            lines,
+            [
+                "  Profile   Token",
+                "@ personal  ✓",
+                "  w         –",
+                "",
+                "○ 2 profiles · hidden: Path, Kind",
+            ]
+        );
+        let lines = table().width(Some(24)).render(&rows(), false);
+        assert_eq!(lines[0], "  Profile   Token  Kind");
+        let lines = table().width(Some(1)).render(&rows(), false);
+        assert_eq!(lines[0], "  Profile");
     }
 
     #[test]

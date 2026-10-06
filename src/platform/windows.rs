@@ -117,6 +117,10 @@ pub fn restore_for_exec() -> Result<()> {
 pub fn token_input(_: bool) -> Result<String> {
     Err(unavailable())
 }
+/// Width fitting is unverified on Windows: render every column.
+pub fn stdout_width() -> Option<usize> {
+    None
+}
 pub fn confirm(_: &str, _: bool) -> Result<()> {
     Err(unavailable())
 }

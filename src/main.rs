@@ -75,7 +75,7 @@ impl Outcome {
 
 fn initial_data(action: &Action) -> Value {
     match action {
-        Action::List { .. } => json!({"profiles":[]}),
+        Action::List { .. } => json!({"project":null,"profiles":[]}),
         Action::Status { name, .. } => {
             json!({"name":name,"kind":null,"reported_logged_in":null,"auth_method":null,"config_directory":null,"scope":null})
         }
@@ -168,6 +168,52 @@ fn effective_directory(reg: &store::Registration) -> Result<PathBuf> {
     }
 }
 
+/// One `list --full` status probe: the record index and its prepared command, or
+/// why it could not be prepared. Built while the Store is open; run after it drops.
+type ProbeJob = (usize, Result<(std::process::Command, store::Registration)>);
+
+/// Prepares probes for active owned/upstream records; aliases and retained
+/// records are never probed and keep a null `probe`.
+fn probe_jobs(store: &Store, profiles: &[Value]) -> Vec<ProbeJob> {
+    profiles
+        .iter()
+        .enumerate()
+        .filter_map(|(index, record)| {
+            let reg = store.registry.registrations.iter().find(|r| {
+                r.state == State::Active
+                    && r.kind != Kind::DefaultAlias
+                    && record["name"] == r.name.as_str()
+                    && record["state"] == "active"
+            })?;
+            Some((
+                index,
+                launch::prepare(store, reg, false).map(|command| (command, reg.clone())),
+            ))
+        })
+        .collect()
+}
+
+/// Runs the prepared probes in parallel, fills each record's `probe` and returns
+/// safe warnings naming the profile. Failures leave every probe field null.
+fn run_probes(profiles: &mut [Value], jobs: Vec<ProbeJob>) -> Vec<String> {
+    let mut warnings = Vec::new();
+    for (index, result) in launch::probe_all(jobs) {
+        let name = profiles[index]["name"].as_str().unwrap_or("?").to_owned();
+        let probe = match result {
+            Ok(status) => {
+                warnings.extend(status.warnings.into_iter().map(|w| format!("{name}: {w}")));
+                json!({"reported_logged_in":status.data["reported_logged_in"],"auth_method":status.data["auth_method"],"config_directory":status.data["config_directory"]})
+            }
+            Err(e) => {
+                warnings.push(format!("{name}: status probe failed: {}", e.message));
+                json!({"reported_logged_in":null,"auth_method":null,"config_directory":null})
+            }
+        };
+        profiles[index]["probe"] = probe;
+    }
+    warnings
+}
+
 fn dispatch(action: Action, data: &mut Value) -> Result<Outcome> {
     match action {
         Action::Help { command } => Ok(Outcome::lines(vec![cli::help(command.as_deref())?])),
@@ -182,7 +228,7 @@ fn dispatch(action: Action, data: &mut Value) -> Result<Outcome> {
             apply,
         )?)),
         Action::Doctor { .. } => doctor(data),
-        Action::List { retained, .. } => {
+        Action::List { retained, full, .. } => {
             let root = platform::root()?;
             let store = match open(&root, OpenMode::Read) {
                 Ok(store) => Some(store),
@@ -195,24 +241,35 @@ fn dispatch(action: Action, data: &mut Value) -> Result<Outcome> {
                 }
                 Err(e) => return Err(e),
             };
-            let mut warnings = vec![];
-            let profiles = if let Some(store) = &store {
-                let mut profiles = store.profiles(retained)?;
-                warnings.extend(sets::annotate(store, &mut profiles));
-                profiles
+            let mut profiles = if let Some(store) = &store {
+                store.profiles(retained)?
             } else {
                 vec![]
             };
-            let lines = table::profiles(&profiles, table::stdout_color());
-            *data = json!({"profiles":profiles});
-            let mut output = Outcome::lines(lines);
-            output.warnings = warnings;
-            if store.as_ref().is_some_and(Store::pending) {
-                output
-                    .warnings
-                    .push("Pending operation: inspect roost doctor before recovery".into());
+            let mut warnings = Vec::new();
+            if let Some(store) = &store {
+                warnings.extend(sets::annotate(store, &mut profiles));
             }
-            Ok(output)
+            if store.as_ref().is_some_and(Store::pending) {
+                warnings.push("Pending operation: inspect roost doctor before recovery".into());
+            }
+            let jobs = match (&store, full) {
+                (Some(store), true) => probe_jobs(store, &profiles),
+                _ => vec![],
+            };
+            drop(store);
+            warnings.extend(run_probes(&mut profiles, jobs));
+            let lines = table::profiles(
+                &profiles,
+                full,
+                table::stdout_color(),
+                platform::stdout_width(),
+            );
+            *data = json!({"project":null,"profiles":profiles});
+            Ok(Outcome {
+                warnings,
+                ..Outcome::lines(lines)
+            })
         }
         Action::Where { name } => {
             let store = open(&platform::root()?, OpenMode::Read)?;

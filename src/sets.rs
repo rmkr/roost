@@ -149,8 +149,7 @@ fn not_found(name: &str) -> Error {
     Error::new("not_found", format!("No set named {name}")).next("List sets with roost set list")
 }
 fn validate_set_name(name: &str) -> Result<()> {
-    store::validate_name(name)
-        .map_err(|_| Error::new("usage", format!("Invalid set name {name}")))
+    store::validate_name(name).map_err(|_| Error::new("usage", format!("Invalid set name {name}")))
 }
 
 /// Items of every set `registration_id` subscribes to, in set order.
@@ -307,16 +306,14 @@ fn subscriber_names(store: &Store, sets: &SetsFile, set: &str) -> Vec<String> {
 /// A registration that may hold subscriptions.
 fn subscriber(store: &Store, name: &str) -> Result<Registration> {
     let registration = store.find(name, true)?.clone();
-    match registration.kind {
-        Kind::DefaultAlias => Err(Error::new(
+    // Upstream registrations are never retained: removal drops their record.
+    if registration.kind == Kind::DefaultAlias {
+        return Err(Error::new(
             "usage",
             "Default aliases receive no shared items",
-        )),
-        Kind::Upstream if registration.state != State::Active => store
-            .find(name, false)
-            .cloned(),
-        _ => Ok(registration),
+        ));
     }
+    Ok(registration)
 }
 
 /// Runs a `roost set` subcommand; returns human lines and sets `data` for JSON.
@@ -497,7 +494,11 @@ pub fn command(action: SetAction, data: &mut Value) -> Result<Vec<String>> {
                 }
                 Ok(())
             })?;
-            lines.push(format!("Subscribed {} to {}", registration.name, names.join(", ")));
+            lines.push(format!(
+                "Subscribed {} to {}",
+                registration.name,
+                names.join(", ")
+            ));
             if registration.kind == Kind::Upstream {
                 lines.push(
                     "Upstream profiles receive only plugin items; skills and instructions are ignored"
@@ -836,11 +837,7 @@ pub fn reconcile(store: &Store, registration: &Registration) -> Vec<String> {
                 "Skipped {}: existing content in the profile wins",
                 path.display()
             )),
-            Err(error) => warnings.push(format!(
-                "Skipped {}: {}",
-                path.display(),
-                error.message
-            )),
+            Err(error) => warnings.push(format!("Skipped {}: {}", path.display(), error.message)),
         }
     }
     let mut records = keep;

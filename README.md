@@ -64,6 +64,8 @@ roost list --retained
 roost reuse work
 ```
 
+`roost ls` prints an aligned table (colored on a terminal, plain when piped) and stays metadata-only; `roost ls --full` adds Login, Auth and Claude dir columns from bounded `claude auth status` probes run in parallel. Token presence is not login validity.
+
 Registration preserves upstream ownership: Roost does not write/clear borrowed tokens, repair borrowed permissions, change upstream launchers or purge upstream data. Claude still writes its own state when launched. Ordinary removal retains owned profile data/tokens; explicit `remove NAME --purge` deletes verified owned data only, after acknowledging quiet writers. Purge is not logout or credential revocation.
 
 Set owned manager tokens with hidden terminal input or explicit `roost token work --stdin`; never put token values on the command line. Isolated launches reject known inherited auth/provider overrides by default. Deliberate `roost run --allow-auth-env work` preserves caller auth and suppresses manager-token injection, while retaining filesystem/token safety checks. Default aliases are pass-through.

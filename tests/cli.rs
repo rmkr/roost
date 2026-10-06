@@ -160,23 +160,290 @@ fn human_list_is_a_plain_aligned_table_when_piped() {
     assert!(out.status.success());
     let text = String::from_utf8(out.stdout).unwrap();
     assert!(!text.contains('\x1b'), "{text}");
-    let work = f.root.join("profiles/Work");
     let lines: Vec<&str> = text.lines().collect();
-    assert_eq!(lines[0], "Profile   Kind           State   Directory");
     assert_eq!(
-        lines[1],
-        format!(
-            "personal  default_alias  active  {}",
-            f.home.join(".claude").display()
-        )
+        lines,
+        [
+            "Profile   Kind           Token  Launchers  Sets",
+            "personal  default_alias  –      ready      —",
+            "Work      owned          –      ready      —",
+            "",
+            "○ 2 profiles · 0 upstream · hidden: Path",
+        ]
     );
+}
+
+#[test]
+fn human_list_shows_token_launcher_state_and_upstream_count() {
+    let f = Fixture::new();
+    f.add("Work");
+    f.add("Gone");
+    f.ok(&["remove", "Gone"]);
+    let old = f.upstream("Old");
+    f.ok(&["register", "Old", "--path", old.to_str().unwrap()]);
+    let set = input(
+        f.command().args(["token", "Work", "--stdin"]),
+        b"fake-token\n",
+    );
+    assert!(set.status.success());
+    let text = String::from_utf8(f.ok(&["ls", "--retained"]).stdout).unwrap();
     assert_eq!(
-        lines[2],
-        format!("Work      owned          active  {}", work.display())
+        text.lines().collect::<Vec<_>>(),
+        [
+            "Profile  Kind      Token  Launchers     Sets",
+            "Gone     owned     –      not_required  —",
+            "Old      upstream  –      ready         —",
+            "Work     owned     ✓      ready         —",
+            "",
+            "○ 3 profiles · 1 upstream · hidden: Path",
+        ]
     );
-    assert_eq!(lines[3], "");
-    assert_eq!(lines[4], "○ 2 profiles · 0 upstream");
-    assert_eq!(lines.len(), 5);
+}
+
+#[test]
+fn json_list_records_carry_every_spec_key_without_probes_by_default() {
+    let f = Fixture::new();
+    f.add("Work");
+    let value = parsed(&f.ok(&["list", "--json"]));
+    let data = value["data"].as_object().unwrap();
+    let mut keys: Vec<&str> = data.keys().map(String::as_str).collect();
+    keys.sort();
+    assert_eq!(keys, ["profiles", "project"]);
+    let record = &value["data"]["profiles"][0];
+    let mut keys: Vec<&str> = record
+        .as_object()
+        .unwrap()
+        .keys()
+        .map(String::as_str)
+        .collect();
+    keys.sort();
+    assert_eq!(
+        keys,
+        [
+            "directory",
+            "kind",
+            "last_used",
+            "launchers",
+            "most_recent",
+            "name",
+            "probe",
+            "selected",
+            "sets",
+            "state",
+            "token_present"
+        ]
+    );
+    assert_eq!(record["probe"], Value::Null);
+}
+
+#[test]
+fn full_list_probes_isolated_active_rows_only() {
+    let f = Fixture::new();
+    f.add("Work");
+    f.add("Gone");
+    f.ok(&["remove", "Gone"]);
+    f.ok(&["add", "personal", "--link-default"]);
+    let work = f.root.join("profiles/Work");
+    let out = f.ok(&["list", "--full", "--retained", "--json"]);
+    assert!(
+        !String::from_utf8_lossy(&out.stdout).contains("fake-secret"),
+        "raw status leaked"
+    );
+    let value = parsed(&out);
+    let profiles = &value["data"]["profiles"];
+    assert_eq!(profiles[0]["name"], "Gone");
+    assert_eq!(profiles[0]["probe"], Value::Null);
+    assert_eq!(profiles[1]["name"], "personal");
+    assert_eq!(profiles[1]["probe"], Value::Null);
+    assert_eq!(
+        profiles[2]["probe"],
+        json!({"reported_logged_in":true,"auth_method":"claude.ai","config_directory":work.to_str().unwrap()})
+    );
+    assert_eq!(value["warnings"], json!([]));
+
+    let text = String::from_utf8(f.ok(&["ls", "--full"]).stdout).unwrap();
+    assert_eq!(
+        text.lines().collect::<Vec<_>>(),
+        [
+            "Profile   Kind           Token  Launchers  Sets  Login  Auth       Claude dir",
+            "personal  default_alias  –      ready      —     —      —          —",
+            &format!(
+                "Work      owned          –      ready      —     yes    claude.ai  {}",
+                work.display()
+            ),
+            "",
+            "○ 2 profiles · 0 upstream · hidden: Path",
+        ]
+    );
+}
+
+#[test]
+fn full_list_probe_failure_is_unknown_with_a_safe_warning() {
+    let f = Fixture::new();
+    f.add("Work");
+    let out = f
+        .command()
+        .args(["list", "--full", "--json"])
+        .env("FAKE_CLAUDE_MODE", "unknown")
+        .output()
+        .unwrap();
+    assert_eq!(out.status.code(), Some(0));
+    assert!(!String::from_utf8_lossy(&out.stdout).contains("fake-secret"));
+    let value = parsed(&out);
+    assert_eq!(
+        value["data"]["profiles"][0]["probe"],
+        json!({"reported_logged_in":null,"auth_method":null,"config_directory":null})
+    );
+    let warnings = value["warnings"].as_array().unwrap();
+    assert_eq!(warnings.len(), 1);
+    assert!(
+        warnings[0].as_str().unwrap().contains("Work"),
+        "{warnings:?}"
+    );
+
+    let out = f
+        .command()
+        .args(["ls", "--full"])
+        .env("FAKE_CLAUDE_MODE", "logout")
+        .output()
+        .unwrap();
+    assert_eq!(out.status.code(), Some(0));
+    let text = String::from_utf8(out.stdout).unwrap();
+    assert_eq!(
+        text.lines()
+            .nth(1)
+            .unwrap()
+            .split_whitespace()
+            .collect::<Vec<_>>()[5..7],
+        ["no", "none"]
+    );
+    let out = f
+        .command()
+        .args(["ls", "--full"])
+        .env("FAKE_CLAUDE_MODE", "malformed")
+        .output()
+        .unwrap();
+    assert_eq!(out.status.code(), Some(0));
+    let text = String::from_utf8(out.stdout).unwrap();
+    assert_eq!(
+        text.lines()
+            .nth(1)
+            .unwrap()
+            .split_whitespace()
+            .collect::<Vec<_>>()[5..],
+        ["?", "?", "?"]
+    );
+    let stderr = String::from_utf8(out.stderr).unwrap();
+    assert!(stderr.starts_with("warning: "), "{stderr}");
+    assert!(!stderr.contains("garbage"), "{stderr}");
+}
+
+#[test]
+fn terminal_list_is_colored_and_hides_columns_to_fit_the_width() {
+    let f = Fixture::new();
+    f.add("Work");
+    let script = r#"
+import errno,fcntl,json,os,pty,select,struct,sys,termios,time
+exe,root,binpath,home,no_color=sys.argv[1:]
+pid,fd=pty.fork()
+if pid==0:
+    fcntl.ioctl(1,termios.TIOCSWINSZ,struct.pack('HHHH',24,40,0,0))
+    env={'ROOST_DIR':root,'HOME':home,'PATH':binpath+':/usr/bin:/bin'}
+    if no_color:env['NO_COLOR']=no_color
+    os.execve(exe,[exe,'ls','--full'],env)
+data=b'';deadline=time.monotonic()+10
+while time.monotonic()<deadline:
+    if not select.select([fd],[],[],0.1)[0]:continue
+    try:chunk=os.read(fd,65536)
+    except OSError as e:
+        if e.errno==errno.EIO:break
+        raise
+    if not chunk:break
+    data+=chunk
+else:
+    os.kill(pid,9);raise RuntimeError('PTY deadline exceeded')
+os.close(fd);_,status=os.waitpid(pid,0)
+assert os.waitstatus_to_exitcode(status)==0,data.decode(errors='replace')
+print(json.dumps(data.decode().replace('\r\n','\n')))
+"#;
+    let run = |no_color: &str| -> String {
+        let out = Command::new("/usr/bin/python3")
+            .args([
+                "-c",
+                script,
+                env!("CARGO_BIN_EXE_roost"),
+                f.root.to_str().unwrap(),
+                f.bin.to_str().unwrap(),
+                f.home.to_str().unwrap(),
+                no_color,
+            ])
+            .env_clear()
+            .env("PATH", "/usr/bin:/bin")
+            .output()
+            .unwrap();
+        assert!(
+            out.status.success(),
+            "{}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        parsed(&out).as_str().unwrap().to_owned()
+    };
+    let colored = run("");
+    assert!(colored.contains("\x1b[1mProfile\x1b[0m"), "{colored:?}");
+    let plain = run("1");
+    assert_eq!(
+        plain.lines().collect::<Vec<_>>(),
+        [
+            "Profile  Kind   Token  Launchers  Sets",
+            "Work     owned  –      ready      —",
+            "",
+            "○ 1 profile · 0 upstream · hidden: Path, Login, Auth, Claude dir",
+        ]
+    );
+}
+
+#[test]
+fn full_list_probes_run_in_parallel_without_holding_the_lock() {
+    use std::time::{Duration, Instant};
+    let f = Fixture::new();
+    f.add("One");
+    f.add("Two");
+    let ready = f.path.join("ready");
+    let started = Instant::now();
+    let child = f
+        .command()
+        .args(["list", "--full", "--json"])
+        .env("FAKE_CLAUDE_MODE", "slow")
+        .env("FAKE_CLAUDE_READY", &ready)
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+    while !ready.exists() && started.elapsed() < Duration::from_secs(5) {
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    assert!(ready.exists(), "probe never started");
+    let added = Instant::now();
+    f.add("Three");
+    assert!(added.elapsed() < Duration::from_secs(3));
+    let out = child.wait_with_output().unwrap();
+    assert!(
+        started.elapsed() < Duration::from_secs(18),
+        "probes ran serially"
+    );
+    assert_eq!(out.status.code(), Some(0));
+    let value = parsed(&out);
+    assert_eq!(value["warnings"].as_array().unwrap().len(), 2);
+    for record in value["data"]["profiles"].as_array().unwrap() {
+        assert_eq!(record["probe"]["reported_logged_in"], Value::Null);
+    }
+}
+
+#[test]
+fn full_is_accepted_only_by_list() {
+    let f = Fixture::new();
+    assert_eq!(f.run(&["status", "x", "--full"]).status.code(), Some(2));
+    assert_eq!(f.run(&["doctor", "--full"]).status.code(), Some(2));
 }
 
 #[test]

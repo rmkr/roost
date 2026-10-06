@@ -45,6 +45,9 @@ pub enum Action {
     List {
         #[arg(long)]
         retained: bool,
+        /// Add bounded status probes (login, auth method, Claude directory)
+        #[arg(long)]
+        full: bool,
         #[arg(long)]
         json: bool,
     },
@@ -99,6 +102,7 @@ pub enum Action {
         json: bool,
     },
     /// Manage shared sets of skills, instructions and plugins
+    #[command(disable_help_subcommand = true)]
     Set {
         #[command(subcommand)]
         action: SetAction,
