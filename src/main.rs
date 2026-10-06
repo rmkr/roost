@@ -3,6 +3,7 @@ mod desktop;
 mod launch;
 mod platform;
 mod plugins;
+mod select;
 mod sets;
 mod store;
 mod table;
@@ -255,9 +256,10 @@ fn dispatch(action: Action, data: &mut Value) -> Result<Outcome> {
             } else {
                 vec![]
             };
-            let mut warnings = Vec::new();
+            let (project, mut warnings) = select::list_project();
             if let Some(store) = &store {
                 warnings.extend(sets::annotate(store, &mut profiles));
+                warnings.extend(select::annotate(store, &mut profiles, project.as_deref()));
             }
             if store.as_ref().is_some_and(Store::pending) {
                 warnings.push("Pending operation: inspect roost doctor before recovery".into());
@@ -274,7 +276,7 @@ fn dispatch(action: Action, data: &mut Value) -> Result<Outcome> {
                 table::stdout_color(),
                 platform::stdout_width(),
             );
-            *data = json!({"project":null,"profiles":profiles});
+            *data = json!({"project":project,"profiles":profiles});
             Ok(Outcome {
                 warnings,
                 ..Outcome::lines(lines)
@@ -301,7 +303,8 @@ fn dispatch(action: Action, data: &mut Value) -> Result<Outcome> {
         } => {
             let store = open(&platform::root()?, OpenMode::Launch)?;
             let reg = store.find(&name, false)?;
-            let command = launch::prepare(&store, reg, allow_auth_env)?;
+            let command = plugins::prepare(&store, reg, allow_auth_env)?;
+            select::launched(&store, reg);
             sets::reconcile_at_launch(&store, reg);
             drop(store);
             Ok(Outcome {
@@ -352,7 +355,8 @@ fn dispatch(action: Action, data: &mut Value) -> Result<Outcome> {
                     )),
                 );
             }
-            let command = launch::prepare(&store, reg, false)?;
+            let command = plugins::prepare(&store, reg, false)?;
+            select::launched(&store, reg);
             sets::reconcile_at_launch(&store, reg);
             drop(store);
             Ok(Outcome {
@@ -526,6 +530,8 @@ fn dispatch(action: Action, data: &mut Value) -> Result<Outcome> {
             }
             let messages = store.remove(&name, purge)?;
             let mut out = Outcome::lines(messages);
+            out.warnings
+                .extend(select::forget_removed(&store, &current));
             out.warnings.extend(sets::forget_removed(&store));
             Ok(out)
         }
@@ -537,6 +543,23 @@ fn dispatch(action: Action, data: &mut Value) -> Result<Outcome> {
                 ..Outcome::lines(lines)
             })
         }
+        Action::Switch {
+            allow_auth_env,
+            no_launch,
+            forget,
+            name,
+            arguments,
+        } => select::switch(
+            name.as_deref(),
+            no_launch,
+            forget,
+            allow_auth_env,
+            &arguments,
+        ),
+        Action::Launch {
+            allow_auth_env,
+            arguments,
+        } => select::launch_selected(allow_auth_env, &arguments),
         Action::Token { name, stdin, clear } => {
             let root = platform::root()?;
             let selection = {
@@ -606,6 +629,7 @@ fn doctor(data: &mut Value) -> Result<Outcome> {
             Some("Run roost setup-path; restart the terminal after applying".into()),
         ));
     }
+    let mut shadow_jobs = vec![];
     match open(&root, OpenMode::Read) {
         Ok(store) => {
             if store.pending() {
@@ -614,6 +638,11 @@ fn doctor(data: &mut Value) -> Result<Outcome> {
             match store.profiles(true) {
                 Ok(mut profiles) => {
                     let _ = sets::annotate(&store, &mut profiles);
+                    let _ = select::annotate(
+                        &store,
+                        &mut profiles,
+                        select::list_project().0.as_deref(),
+                    );
                     for p in &profiles {
                         for l in p["launchers"].as_array().into_iter().flatten() {
                             let condition = l["condition"].as_str().unwrap_or("unsafe");
@@ -625,6 +654,7 @@ fn doctor(data: &mut Value) -> Result<Outcome> {
                     }
                     data["profiles"] = json!(profiles);
                     findings.extend(desktop::findings(&store));
+                    shadow_jobs = plugins::shadow_jobs(&store);
                 }
                 Err(e) => findings.push(finding(
                     e.code,
@@ -676,6 +706,8 @@ fn doctor(data: &mut Value) -> Result<Outcome> {
             e.next_step,
         )),
     }
+    // Native probes run after the Store (and its lock) is released.
+    findings.extend(plugins::shadow_findings(shadow_jobs));
     findings.sort_by_key(|f| {
         (
             f["code"].as_str().unwrap_or("").to_owned(),

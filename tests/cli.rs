@@ -160,11 +160,15 @@ fn input(command: &mut Command, bytes: &[u8]) -> Output {
 fn help_version_and_usage_do_not_touch_storage() {
     let f = Fixture::new();
     assert!(
-        String::from_utf8(f.ok(&[]).stdout)
+        String::from_utf8(f.ok(&["--help"]).stdout)
             .unwrap()
             .contains("auth login")
     );
     assert_eq!(f.ok(&["--version"]).stdout, b"0.1.0\n");
+    // Bare roost without storage names roost add and creates nothing.
+    let bare = f.run(&[]);
+    assert_eq!(bare.status.code(), Some(1));
+    assert!(String::from_utf8_lossy(&bare.stderr).contains("roost add NAME"));
     assert!(
         f.command()
             .env("ROOST_DIR", "")
@@ -180,6 +184,19 @@ fn help_version_and_usage_do_not_touch_storage() {
         vec!["add", "Work", "--yes"],
         vec!["token", "Work", "--stdin", "--clear"],
         vec!["unknown"],
+        vec!["--allow-auth-env", "--help"],
+        vec!["--allow-auth-env", "Work"],
+        vec!["--bogus"],
+        vec!["switch"],
+        vec!["switch", "--forget", "Work"],
+        vec!["switch", "--no-launch", "--forget"],
+        vec!["switch", "--no-launch", "--allow-auth-env", "Work"],
+        vec!["switch", "--allow-auth-env", "--forget"],
+        vec!["switch", "--no-launch", "Work", "--"],
+        vec!["switch", "--no-launch", "Work", "-p"],
+        vec!["switch", "--no-launch", "--no-launch", "Work"],
+        vec!["switch", "--unknown", "Work"],
+        vec!["switch", "CON"],
     ] {
         assert_eq!(f.run(&args).status.code(), Some(2), "{args:?}");
     }
@@ -204,11 +221,11 @@ fn human_list_is_a_plain_aligned_table_when_piped() {
     assert_eq!(
         lines,
         [
-            "Profile   Kind           Token  Launchers  Sets",
-            "personal  default_alias  –      ready      —",
-            "Work      owned          –      ready      —",
+            "  Profile   Kind           Token  Launchers  Sets  Last used",
+            "  personal  default_alias  –      ready      —     never",
+            "  Work      owned          –      ready      —     never",
             "",
-            "○ 2 profiles · 0 upstream · hidden: Path",
+            "○ 2 profiles · 0 upstream · @ selected here · ^ last used · hidden: Path",
         ]
     );
 }
@@ -230,12 +247,12 @@ fn human_list_shows_token_launcher_state_and_upstream_count() {
     assert_eq!(
         text.lines().collect::<Vec<_>>(),
         [
-            "Profile  Kind      Token  Launchers     Sets",
-            "Gone     owned     –      not_required  —",
-            "Old      upstream  –      ready         —",
-            "Work     owned     ✓      ready         —",
+            "  Profile  Kind      Token  Launchers     Sets  Last used",
+            "  Gone     owned     –      not_required  —     never",
+            "  Old      upstream  –      ready         —     never",
+            "  Work     owned     ✓      ready         —     never",
             "",
-            "○ 3 profiles · 1 upstream · hidden: Path",
+            "○ 3 profiles · 1 upstream · @ selected here · ^ last used · hidden: Path",
         ]
     );
 }
@@ -305,14 +322,14 @@ fn full_list_probes_isolated_active_rows_only() {
     assert_eq!(
         text.lines().collect::<Vec<_>>(),
         [
-            "Profile   Kind           Token  Launchers  Sets  Login  Auth       Claude dir",
-            "personal  default_alias  –      ready      —     —      —          —",
+            "  Profile   Kind           Token  Launchers  Sets  Last used  Login  Auth       Claude dir",
+            "  personal  default_alias  –      ready      —     never      —      —          —",
             &format!(
-                "Work      owned          –      ready      —     yes    claude.ai  {}",
+                "  Work      owned          –      ready      —     never      yes    claude.ai  {}",
                 work.display()
             ),
             "",
-            "○ 2 profiles · 0 upstream · hidden: Path",
+            "○ 2 profiles · 0 upstream · @ selected here · ^ last used · hidden: Path",
         ]
     );
 }
@@ -354,7 +371,7 @@ fn full_list_probe_failure_is_unknown_with_a_safe_warning() {
             .nth(1)
             .unwrap()
             .split_whitespace()
-            .collect::<Vec<_>>()[5..7],
+            .collect::<Vec<_>>()[6..8],
         ["no", "none"]
     );
     let out = f
@@ -370,7 +387,7 @@ fn full_list_probe_failure_is_unknown_with_a_safe_warning() {
             .nth(1)
             .unwrap()
             .split_whitespace()
-            .collect::<Vec<_>>()[5..],
+            .collect::<Vec<_>>()[6..],
         ["?", "?", "?"]
     );
     let stderr = String::from_utf8(out.stderr).unwrap();
@@ -434,10 +451,10 @@ print(json.dumps(data.decode().replace('\r\n','\n')))
     assert_eq!(
         plain.lines().collect::<Vec<_>>(),
         [
-            "Profile  Kind   Token  Launchers  Sets",
-            "Work     owned  –      ready      —",
+            "  Profile  Kind   Token  Launchers  Sets",
+            "  Work     owned  –      ready      —",
             "",
-            "○ 1 profile · 0 upstream · hidden: Path, Login, Auth, Claude dir",
+            "○ 1 profile · 0 upstream · @ selected here · ^ last used · hidden: Path, Last used, Login, Auth, Claude dir",
         ]
     );
 }
@@ -1038,6 +1055,92 @@ print(json.dumps(results))
     );
 }
 
+/// A separate project: its own `.git` directory, so its key never depends on
+/// whatever repository the temporary directory happens to sit in.
+fn repo(f: &Fixture, name: &str) -> PathBuf {
+    let path = f.path.join(name);
+    fs::create_dir_all(path.join(".git")).unwrap();
+    path
+}
+
+fn launched(output: &Output) -> Value {
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    parsed(output)
+}
+
+#[test]
+fn switch_selects_per_project_and_bare_roost_launches_it() {
+    let f = Fixture::new();
+    f.add("Work");
+    f.add("Home");
+    let project = repo(&f, "app");
+    let other = repo(&f, "other");
+    let selected = f
+        .command()
+        .current_dir(&project)
+        .args(["switch", "--no-launch", "work"])
+        .output()
+        .unwrap();
+    assert!(selected.status.success(), "{selected:?}");
+    let probe = launched(
+        &f.command()
+            .current_dir(&project)
+            .args(["--", "--help", "-p", ""])
+            .output()
+            .unwrap(),
+    );
+    assert_eq!(probe["arguments"], json!(["--help", "-p", ""]));
+    assert_eq!(
+        probe["env"]["CLAUDE_CONFIG_DIR"],
+        json!(f.root.join("profiles/Work").to_str().unwrap())
+    );
+    // Another directory has no selection and no terminal: usage, never a picker.
+    let other = f.command().current_dir(&other).output().unwrap();
+    assert_eq!(other.status.code(), Some(2));
+    let stderr = String::from_utf8_lossy(&other.stderr);
+    assert!(
+        stderr.contains("roost switch NAME") && stderr.contains("roost run NAME"),
+        "{stderr}"
+    );
+    // switch NAME launches like run and moves the selection.
+    let probe = launched(
+        &f.command()
+            .current_dir(&project)
+            .args(["switch", "Home", "--", "--", "x"])
+            .output()
+            .unwrap(),
+    );
+    assert_eq!(probe["arguments"], json!(["--", "x"]));
+    let probe = launched(&f.command().current_dir(&project).output().unwrap());
+    assert_eq!(
+        probe["env"]["CLAUDE_CONFIG_DIR"],
+        json!(f.root.join("profiles/Home").to_str().unwrap())
+    );
+    // Forget clears; forgetting again still succeeds.
+    for _ in 0..2 {
+        let out = f
+            .command()
+            .current_dir(&project)
+            .args(["switch", "--forget"])
+            .output()
+            .unwrap();
+        assert!(out.status.success(), "{out:?}");
+    }
+    assert_eq!(
+        f.command()
+            .current_dir(&project)
+            .output()
+            .unwrap()
+            .status
+            .code(),
+        Some(2)
+    );
+}
+
 #[test]
 fn desktop_gives_owned_and_upstream_profiles_their_own_data_folder() {
     let f = Fixture::new();
@@ -1402,4 +1505,369 @@ fn desktop_launch_reconciles_subscribed_skill_links() {
     let _ = fs::remove_file(&link);
     f.ok(&["desktop", "--foreground", "Work"]);
     assert_eq!(fs::read_link(&link).unwrap(), skill);
+}
+
+#[test]
+fn list_marks_selection_and_most_recent_launch_from_run_and_launchers() {
+    let f = Fixture::new();
+    f.add("Work");
+    f.add("Home");
+    f.ok(&["add", "personal", "--link-default"]);
+    let old = f.upstream("Old");
+    f.ok(&["register", "Old", "--path", old.to_str().unwrap()]);
+    let app = repo(&f, "app");
+    let in_app = |args: &[&str]| f.command().current_dir(&app).args(args).output().unwrap();
+    assert!(in_app(&["switch", "--no-launch", "Work"]).status.success());
+    // A launcher records the upstream registration's last use in manager storage.
+    let launcher = f.root.join("bin/roost-Old");
+    launched(
+        &Command::new(&launcher)
+            .env_clear()
+            .env("HOME", &f.home)
+            .env("PATH", format!("{}:/usr/bin:/bin", f.bin.display()))
+            .output()
+            .unwrap(),
+    );
+    assert!(
+        fs::read_dir(&old).unwrap().next().is_none(),
+        "upstream data untouched"
+    );
+    std::thread::sleep(std::time::Duration::from_millis(1100));
+    launched(&f.run(&["run", "Home"]));
+    // Default-alias launches record nothing.
+    launched(&f.run(&["run", "personal"]));
+    let value = parsed(&in_app(&["list", "--json"]));
+    assert_eq!(
+        value["data"]["project"],
+        json!(app.join(".git").to_str().unwrap())
+    );
+    let by_name = |name: &str| {
+        value["data"]["profiles"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|p| p["name"] == name)
+            .unwrap()
+            .clone()
+    };
+    let (work, home, old, personal) = (
+        by_name("Work"),
+        by_name("Home"),
+        by_name("Old"),
+        by_name("personal"),
+    );
+    assert_eq!(
+        (&work["selected"], &work["most_recent"]),
+        (&json!(true), &json!(false))
+    );
+    assert_eq!(work["last_used"], Value::Null);
+    assert_eq!(
+        (&home["selected"], &home["most_recent"]),
+        (&json!(false), &json!(true))
+    );
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_secs();
+    let at = home["last_used"].as_u64().unwrap();
+    assert!(at <= now && at + 60 > now, "{at} {now}");
+    assert!(old["last_used"].as_u64().unwrap() < at);
+    assert_eq!(old["most_recent"], json!(false));
+    assert_eq!(personal["last_used"], Value::Null);
+    // Outside the project nothing is selected.
+    let elsewhere = parsed(
+        &f.command()
+            .current_dir(repo(&f, "elsewhere"))
+            .args(["list", "--json"])
+            .output()
+            .unwrap(),
+    );
+    assert!(
+        elsewhere["data"]["profiles"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .all(|p| p["selected"] == false)
+    );
+    let text = String::from_utf8(in_app(&["ls"]).stdout).unwrap();
+    assert_eq!(
+        text.lines().collect::<Vec<_>>(),
+        [
+            "  Profile   Kind           Token  Launchers  Sets  Last used",
+            "^ Home      owned          –      ready      —     now",
+            "  Old       upstream       –      ready      —     now",
+            "  personal  default_alias  –      ready      —     never",
+            "@ Work      owned          –      ready      —     never",
+            "",
+            "○ 4 profiles · 1 upstream · @ selected here · ^ last used · hidden: Path",
+        ]
+    );
+}
+
+#[test]
+fn remove_and_purge_clear_selections_so_a_same_name_profile_inherits_nothing() {
+    let f = Fixture::new();
+    let app = repo(&f, "app");
+    let in_app = |args: &[&str]| f.command().current_dir(&app).args(args).output().unwrap();
+    let selected_names = || -> Vec<String> {
+        parsed(&in_app(&["list", "--json", "--retained"]))["data"]["profiles"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter(|p| p["selected"] == true)
+            .map(|p| p["name"].as_str().unwrap().to_owned())
+            .collect()
+    };
+    f.add("Work");
+    assert!(in_app(&["switch", "--no-launch", "Work"]).status.success());
+    launched(&in_app(&["run", "Work"]));
+    assert_eq!(selected_names(), ["Work"]);
+    // Ordinary remove retains the owned profile and its last use, not the selection.
+    f.ok(&["remove", "Work"]);
+    let state = fs::read_to_string(f.root.join("state.json")).unwrap();
+    assert_eq!(
+        serde_json::from_str::<Value>(&state).unwrap()["selections"],
+        json!([])
+    );
+    let record = &parsed(&in_app(&["list", "--json", "--retained"]))["data"]["profiles"][0];
+    assert!(record["last_used"].is_u64(), "{record}");
+    f.ok(&["reuse", "Work"]);
+    assert!(selected_names().is_empty());
+    let bare = in_app(&[]);
+    assert_eq!(bare.status.code(), Some(2));
+    assert!(!String::from_utf8_lossy(&bare.stderr).contains("warning"));
+    // Purge, then a new profile with the same name starts with nothing.
+    assert!(in_app(&["switch", "--no-launch", "Work"]).status.success());
+    f.ok(&["remove", "Work", "--purge", "--yes"]);
+    f.add("Work");
+    assert!(selected_names().is_empty());
+    let record = &parsed(&in_app(&["list", "--json"]))["data"]["profiles"][0];
+    assert_eq!(record["last_used"], Value::Null);
+    assert_eq!(in_app(&[]).status.code(), Some(2));
+    // Removing a selected upstream registration drops its selection too.
+    let old = f.upstream("Old");
+    f.ok(&["register", "Old", "--path", old.to_str().unwrap()]);
+    assert!(in_app(&["switch", "--no-launch", "Old"]).status.success());
+    f.ok(&["remove", "Old"]);
+    let state = fs::read_to_string(f.root.join("state.json")).unwrap();
+    assert_eq!(
+        serde_json::from_str::<Value>(&state).unwrap()["selections"],
+        json!([])
+    );
+}
+
+#[test]
+fn default_alias_selection_is_remembered_but_records_no_last_use() {
+    let f = Fixture::new();
+    f.ok(&["add", "personal", "--link-default"]);
+    let app = repo(&f, "app");
+    let in_app = |args: &[&str]| f.command().current_dir(&app).args(args).output().unwrap();
+    assert!(
+        in_app(&["switch", "--no-launch", "PERSONAL"])
+            .status
+            .success()
+    );
+    let probe = launched(
+        &f.command()
+            .current_dir(&app)
+            .env("CLAUDE_CONFIG_DIR", "/caller/dir")
+            .output()
+            .unwrap(),
+    );
+    assert_eq!(probe["env"]["CLAUDE_CONFIG_DIR"], json!("/caller/dir"));
+    let record = &parsed(&in_app(&["list", "--json"]))["data"]["profiles"][0];
+    assert_eq!(record["selected"], json!(true));
+    assert_eq!(record["last_used"], Value::Null);
+    assert_eq!(record["most_recent"], json!(false));
+}
+
+#[test]
+fn stale_selection_warns_naming_the_profile_before_asking() {
+    let f = Fixture::new();
+    f.add("Work");
+    f.add("Gone");
+    let app = repo(&f, "app");
+    let registry: Value =
+        serde_json::from_str(&fs::read_to_string(f.root.join("registry.json")).unwrap()).unwrap();
+    let id = |name: &str| {
+        registry["registrations"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|r| r["name"] == name)
+            .unwrap()["registration_id"]
+            .clone()
+    };
+    f.ok(&["remove", "Gone"]);
+    // A selection left naming a retained registration (for example after a failed
+    // clean-up) is stale: warn, then fall through to the picker rules.
+    let state = json!({"schema_version":1,"root_id":registry["root_id"],
+        "selections":[{"project":app.join(".git"),"registration_id":id("Gone")}],
+        "last_used":[],"links":[],"desktop_launched":[],"plugin_auto_update_at":null});
+    let path = f.root.join("state.json");
+    fs::write(&path, serde_json::to_vec(&state).unwrap()).unwrap();
+    fs::set_permissions(&path, fs::Permissions::from_mode(0o600)).unwrap();
+    let out = f.command().current_dir(&app).output().unwrap();
+    assert_eq!(out.status.code(), Some(2));
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        stderr.contains("warning") && stderr.contains("Gone"),
+        "{stderr}"
+    );
+}
+
+#[test]
+fn state_write_failure_warns_and_still_launches() {
+    let f = Fixture::new();
+    f.add("Work");
+    let app = repo(&f, "app");
+    let path = f.root.join("state.json");
+    fs::write(&path, b"not json").unwrap();
+    fs::set_permissions(&path, fs::Permissions::from_mode(0o600)).unwrap();
+    for args in [vec!["run", "Work"], vec!["switch", "Work"]] {
+        let out = f.command().current_dir(&app).args(&args).output().unwrap();
+        launched(&out);
+        assert!(
+            String::from_utf8_lossy(&out.stderr).contains("warning"),
+            "{args:?}"
+        );
+    }
+    let out = f
+        .command()
+        .current_dir(&app)
+        .args(["switch", "--no-launch", "Work"])
+        .output()
+        .unwrap();
+    assert_eq!(out.status.code(), Some(1));
+    assert_eq!(fs::read(&path).unwrap(), b"not json");
+    // An unknown profile is refused before any state is touched.
+    assert_eq!(
+        f.command()
+            .current_dir(&app)
+            .args(["switch", "--no-launch", "Nobody"])
+            .output()
+            .unwrap()
+            .status
+            .code(),
+        Some(1)
+    );
+}
+
+/// Runs bare `roost` in each project under a PTY, sending keys once the picker
+/// shows. Returns `[{exit, picker, launched}]`, `launched` being the fake Claude's
+/// CLAUDE_CONFIG_DIR or null.
+fn pick_in_pty(f: &Fixture, cases: &[(&Path, &[&str])]) -> Value {
+    let script = r#"
+import errno,json,os,pty,select,sys,time
+exe,root,binpath,home,cases=sys.argv[1:]
+results=[]
+for cwd,keys in json.loads(cases):
+    pid,fd=pty.fork()
+    if pid==0:
+        os.chdir(cwd)
+        os.execve(exe,[exe],{'ROOST_DIR':root,'HOME':home,'PATH':binpath+':/usr/bin:/bin'})
+    data=b'';sent=False;deadline=time.monotonic()+10
+    while time.monotonic()<deadline:
+        if not select.select([fd],[],[],0.1)[0]:continue
+        try:chunk=os.read(fd,65536)
+        except OSError as e:
+            if e.errno==errno.EIO:break
+            raise
+        if not chunk:break
+        data+=chunk
+        if not sent and b'Choose a profile' in data:
+            time.sleep(0.1)
+            for key in keys:
+                os.write(fd,key.encode('latin-1'));time.sleep(0.1)
+            sent=True
+    else:
+        os.kill(pid,9);raise RuntimeError('PTY deadline exceeded: %r'%data)
+    os.close(fd);_,status=os.waitpid(pid,0)
+    text=data.decode(errors='replace')
+    launched=None
+    for line in text.replace('\r','\n').split('\n'):
+        if '{' in line:launched=json.loads(line[line.index('{'):])['env'].get('CLAUDE_CONFIG_DIR')
+    results.append({'exit':os.waitstatus_to_exitcode(status),'picker':'Choose a profile' in text,'launched':launched})
+print(json.dumps(results))
+"#;
+    let cases: Vec<Value> = cases
+        .iter()
+        .map(|(cwd, keys)| json!([cwd.to_str().unwrap(), keys]))
+        .collect();
+    let out = Command::new("/usr/bin/python3")
+        .args([
+            "-c",
+            script,
+            env!("CARGO_BIN_EXE_roost"),
+            f.root.to_str().unwrap(),
+            f.bin.to_str().unwrap(),
+            f.home.to_str().unwrap(),
+            &serde_json::to_string(&cases).unwrap(),
+        ])
+        .env_clear()
+        .env("PATH", "/usr/bin:/bin")
+        .output()
+        .unwrap();
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    parsed(&out)
+}
+
+#[test]
+fn picker_highlights_last_used_moves_with_keys_and_remembers_the_choice() {
+    let f = Fixture::new();
+    f.add("Work");
+    f.add("Home");
+    launched(&f.run(&["run", "Work"]));
+    let work = f.root.join("profiles/Work");
+    let home = f.root.join("profiles/Home");
+    let projects: Vec<PathBuf> = ["a", "b", "c", "d"].iter().map(|p| repo(&f, p)).collect();
+    let results = pick_in_pty(
+        &f,
+        &[
+            // Enter takes the initial highlight: the most recently launched.
+            (&projects[0], &["\r"]),
+            (&projects[1], &["k", "\r"]),
+            (&projects[2], &["\x1b[A", "\x1b[B", "j", "\x1bOA", "\r"]),
+            (&projects[3], &["k", "j", "\n"]),
+        ],
+    );
+    let expect = |path: &Path| json!({"exit":0,"picker":true,"launched":path.to_str().unwrap()});
+    assert_eq!(
+        results,
+        json!([expect(&work), expect(&home), expect(&home), expect(&work)])
+    );
+    // The choice is remembered: no picker, no terminal needed.
+    let probe = launched(&f.command().current_dir(&projects[1]).output().unwrap());
+    assert_eq!(
+        probe["env"]["CLAUDE_CONFIG_DIR"],
+        json!(home.to_str().unwrap())
+    );
+}
+
+#[test]
+fn picker_cancels_with_130_and_no_state_change_and_shows_for_one_profile() {
+    let f = Fixture::new();
+    f.add("Work");
+    let app = repo(&f, "app");
+    let results = pick_in_pty(
+        &f,
+        &[
+            (&app, &["\x1b"]),
+            (&app, &["q"]),
+            (&app, &["\x03"]),
+            (&app, &["\x04"]),
+        ],
+    );
+    let cancelled = json!({"exit":130,"picker":true,"launched":null});
+    assert_eq!(results, json!([cancelled, cancelled, cancelled, cancelled]));
+    assert!(!f.root.join("state.json").exists());
+    let results = pick_in_pty(&f, &[(&app, &["\r"])]);
+    assert_eq!(
+        results,
+        json!([{"exit":0,"picker":true,"launched":f.root.join("profiles/Work").to_str().unwrap()}])
+    );
 }

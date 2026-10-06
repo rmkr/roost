@@ -133,6 +133,26 @@ pub enum Action {
         registration_id: String,
         arguments: Vec<OsString>,
     },
+    /// Select a profile for this project and launch it; manager options precede NAME
+    Switch {
+        #[arg(long)]
+        allow_auth_env: bool,
+        /// Only record the selection
+        #[arg(long)]
+        no_launch: bool,
+        /// Clear this project's selection
+        #[arg(long)]
+        forget: bool,
+        name: Option<String>,
+        #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
+        arguments: Vec<OsString>,
+    },
+    /// Bare `roost`: launch the profile selected for this project.
+    #[command(skip)]
+    Launch {
+        allow_auth_env: bool,
+        arguments: Vec<OsString>,
+    },
 }
 
 /// `roost set ...` subcommands.
@@ -284,6 +304,9 @@ impl Action {
             | Self::Desktop { name, .. }
             | Self::Set {
                 action: SetAction::Subscribe { name, .. } | SetAction::Unsubscribe { name, .. },
+            }
+            | Self::Switch {
+                name: Some(name), ..
             } => Some(name),
             _ => None,
         }
@@ -367,6 +390,12 @@ fn parse_from(args: Vec<OsString>) -> std::result::Result<Action, clap::Error> {
             });
         }
     }
+    if let Some(action) = parse_launch(&args)? {
+        return Ok(action);
+    }
+    if args.get(1).is_some_and(|v| v == "switch") {
+        return parse_switch(&args);
+    }
     let cli = Cli::try_parse_from(args)?;
     if cli.version {
         if cli.command.is_some() {
@@ -375,6 +404,100 @@ fn parse_from(args: Vec<OsString>) -> std::result::Result<Action, clap::Error> {
         return Ok(Action::Version);
     }
     Ok(cli.command.unwrap_or(Action::Help { command: None }))
+}
+
+/// Bare `roost`: only an optional leading `--allow-auth-env`, then nothing or `--`
+/// and an opaque tail. Anything else is a command or switch for clap.
+fn parse_launch(args: &[OsString]) -> std::result::Result<Option<Action>, clap::Error> {
+    let allow_auth_env = args.get(1).is_some_and(|v| v == "--allow-auth-env");
+    let index = if allow_auth_env { 2 } else { 1 };
+    let arguments = match args.get(index) {
+        None => vec![],
+        Some(v) if v == "--" => args[index + 1..].to_vec(),
+        Some(_) if allow_auth_env => {
+            return Err(usage(
+                "--allow-auth-env launches the selected profile; pass Claude arguments after --",
+            ));
+        }
+        Some(_) => return Ok(None),
+    };
+    Ok(Some(Action::Launch {
+        allow_auth_env,
+        arguments,
+    }))
+}
+
+/// `switch` shares run's single boundary: manager switches precede NAME and the
+/// tail after NAME (one optional `--` consumed) belongs to Claude.
+fn parse_switch(args: &[OsString]) -> std::result::Result<Action, clap::Error> {
+    let (mut allow_auth_env, mut no_launch, mut forget) = (false, false, false);
+    let mut index = 2;
+    while let Some(value) = args.get(index) {
+        let flag = if value == "--allow-auth-env" {
+            &mut allow_auth_env
+        } else if value == "--no-launch" {
+            &mut no_launch
+        } else if value == "--forget" {
+            &mut forget
+        } else if value == "--help" || value == "-h" {
+            return Cli::try_parse_from([
+                OsString::from("roost"),
+                OsString::from("switch"),
+                OsString::from("--help"),
+            ])
+            .map(|_| unreachable!());
+        } else {
+            break;
+        };
+        if *flag {
+            return Err(usage(format!(
+                "{} may be supplied only once",
+                value.to_string_lossy()
+            )));
+        }
+        *flag = true;
+        index += 1;
+    }
+    if [allow_auth_env, no_launch, forget]
+        .into_iter()
+        .filter(|v| *v)
+        .count()
+        > 1
+    {
+        return Err(usage(
+            "--allow-auth-env, --no-launch and --forget cannot be combined",
+        ));
+    }
+    let name = match args.get(index) {
+        None if forget => None,
+        None => return Err(usage("switch requires NAME")),
+        Some(_) if forget => return Err(usage("switch --forget takes no NAME")),
+        Some(value) => {
+            let name = value
+                .to_str()
+                .ok_or_else(|| usage("profile NAME must be ASCII"))?;
+            if name.starts_with('-') {
+                return Err(usage(
+                    "unknown switch manager option; manager options precede NAME",
+                ));
+            }
+            Some(name.to_owned())
+        }
+    };
+    let mut tail = args.get(index + 1..).unwrap_or_default().to_vec();
+    if no_launch && !tail.is_empty() {
+        return Err(usage("switch --no-launch takes no Claude arguments"));
+    }
+    if tail.first().is_some_and(|v| v == OsStr::new("--")) {
+        tail.remove(0);
+    }
+    Ok(Action::Switch {
+        allow_auth_env,
+        no_launch,
+        forget,
+        name,
+        arguments: tail,
+    })
 }
 
 pub fn help(command: Option<&str>) -> crate::Result<String> {

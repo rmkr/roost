@@ -79,7 +79,6 @@ impl<'a, R> Table<'a, R> {
         Self::default()
     }
     /// Adds an unlabeled leading marker column (for example `@`/`^`).
-    #[allow(dead_code, reason = "marker column arrives with selection (04)")]
     pub fn marker(mut self, cell: impl Fn(&R) -> Cell + 'a) -> Self {
         self.marker = Some(Box::new(cell));
         self
@@ -212,7 +211,19 @@ pub fn stdout_color() -> bool {
 /// The human `list` table over ProfileRecord values. Later columns append here.
 pub fn profiles(records: &[Value], full: bool, color: bool, width: Option<usize>) -> Vec<String> {
     let upstream = records.iter().filter(|r| r["kind"] == "upstream").count();
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |d| d.as_secs());
     let mut table = Table::new()
+        .marker(|r: &Value| {
+            if r["selected"] == true {
+                Cell::new("@", Style::Green)
+            } else if r["most_recent"] == true {
+                Cell::new("^", Style::Yellow)
+            } else {
+                Cell::plain(" ")
+            }
+        })
         .column("Profile", |r: &Value| {
             Cell::new(r["name"].as_str().unwrap_or("?"), Style::Bold)
         })
@@ -246,6 +257,12 @@ pub fn profiles(records: &[Value], full: bool, color: bool, width: Option<usize>
             } else {
                 Cell::plain(names.join(","))
             }
+        })
+        .column("Last used", move |r: &Value| {
+            match r["last_used"].as_u64() {
+                Some(at) => Cell::plain(relative_time(at, now)),
+                None => Cell::new("never", Style::Dim),
+            }
         });
     if full {
         table = table
@@ -265,12 +282,23 @@ pub fn profiles(records: &[Value], full: bool, color: bool, width: Option<usize>
     table
         .hidden("Path")
         .summary(format!(
-            "○ {} profile{} · {upstream} upstream",
+            "○ {} profile{} · {upstream} upstream · @ selected here · ^ last used",
             records.len(),
             if records.len() == 1 { "" } else { "s" }
         ))
         .width(width)
         .render(records, color)
+}
+
+/// Relative age of a Unix-seconds time: `now` under a minute, then `Nm`, `Nh`, `Nd`.
+/// A time in the future counts as `now`.
+pub fn relative_time(at: u64, now: u64) -> String {
+    match now.saturating_sub(at) {
+        age if age < 60 => "now".into(),
+        age if age < 3600 => format!("{}m", age / 60),
+        age if age < 86400 => format!("{}h", age / 3600),
+        age => format!("{}d", age / 86400),
+    }
 }
 
 /// A probed cell: `—` when the row is not probed (aliases, retained records),
@@ -351,6 +379,24 @@ fn char_width(c: char) -> usize {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn last_use_is_shown_as_a_coarse_relative_age() {
+        let now = 1_800_000_000;
+        for (age, text) in [
+            (0, "now"),
+            (59, "now"),
+            (60, "1m"),
+            (3599, "59m"),
+            (3600, "1h"),
+            (86399, "23h"),
+            (86400, "1d"),
+            (30 * 86400, "30d"),
+        ] {
+            assert_eq!(relative_time(now - age, now), text, "{age}");
+        }
+        assert_eq!(relative_time(now + 10, now), "now");
+    }
 
     struct Row {
         name: &'static str,

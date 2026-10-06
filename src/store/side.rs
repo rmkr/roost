@@ -258,6 +258,11 @@ impl Store {
     pub fn read_state(&self) -> Result<StateFile> {
         self.read_side()
     }
+    /// Like `read_state`, but keeps records naming registrations absent from the
+    /// registry, so a stale selection can still be reported.
+    pub fn read_state_unfiltered(&self) -> Result<StateFile> {
+        self.read_side_unfiltered()
+    }
     /// Reads `sets.json` (empty when absent). Any mode; never creates or repairs.
     pub fn read_sets(&self) -> Result<SetsFile> {
         self.read_side()
@@ -312,6 +317,12 @@ impl Store {
     }
 
     fn read_side<T: SideFile>(&self) -> Result<T> {
+        let mut value: T = self.read_side_unfiltered()?;
+        value.retain_registered(&known(&self.registry));
+        Ok(value)
+    }
+
+    fn read_side_unfiltered<T: SideFile>(&self) -> Result<T> {
         if file_state(&self.directory, T::NAME, true)?.is_none() {
             return Ok(T::empty_for(&self.root_id));
         }
@@ -319,12 +330,11 @@ impl Store {
             .directory
             .read(T::NAME, true, LIMIT)?
             .ok_or_else(|| err("unsafe_path", format!("{} changed while reading", T::NAME)))?;
-        let mut value: T = parse(&bytes, T::NAME)?;
+        let value: T = parse(&bytes, T::NAME)?;
         if value.header() != (1, self.root_id.as_str()) {
             return Err(invalid(T::NAME));
         }
         value.check()?;
-        value.retain_registered(&known(&self.registry));
         Ok(value)
     }
 

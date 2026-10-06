@@ -703,6 +703,164 @@ pub fn prompt_line(prompt: &str) -> Result<String> {
         .map_err(|_| Error::new("usage", "Terminal input is not valid UTF-8"))
 }
 
+/// One key read by the picker.
+#[derive(Debug, PartialEq, Eq)]
+enum Key {
+    Up,
+    Down,
+    Choose,
+    Cancel,
+    Other,
+}
+
+/// Decodes one keypress from the front of `bytes`, returning it and its length.
+/// A lone ESC at the end of the buffer is ambiguous; `None` asks for more input.
+fn decode_key(bytes: &[u8]) -> Option<(Key, usize)> {
+    Some(match bytes {
+        [] => return None,
+        [0x1b] => return None,
+        [0x1b, b'[' | b'O', b'A', ..] => (Key::Up, 3),
+        [0x1b, b'[' | b'O', b'B', ..] => (Key::Down, 3),
+        [0x1b, b'[' | b'O'] => return None,
+        [0x1b, b'[' | b'O', rest @ ..] => {
+            // Skip any other CSI/SS3 sequence through its final byte.
+            let end = rest
+                .iter()
+                .position(|b| (0x40..=0x7e).contains(b))
+                .map_or(bytes.len(), |i| i + 3);
+            (Key::Other, end)
+        }
+        [0x1b, ..] => (Key::Cancel, 1),
+        [b'k', ..] => (Key::Up, 1),
+        [b'j', ..] => (Key::Down, 1),
+        [b'\r' | b'\n', ..] => (Key::Choose, 1),
+        [b'q' | 3 | 4, ..] => (Key::Cancel, 1),
+        [_, ..] => (Key::Other, 1),
+    })
+}
+
+/// Waits up to `timeout` milliseconds for input on `descriptor`; `None` on timeout,
+/// an empty vector at EOF.
+fn read_ready(descriptor: libc::c_int, timeout: libc::c_int) -> Result<Option<Vec<u8>>> {
+    let mut poll = libc::pollfd {
+        fd: descriptor,
+        events: libc::POLLIN,
+        revents: 0,
+    };
+    let ready = unsafe { libc::poll(&mut poll, 1, timeout) };
+    if ready < 0 {
+        if std::io::Error::last_os_error().kind() == std::io::ErrorKind::Interrupted {
+            return Ok(None);
+        }
+        return Err(Error::new("io", "Cannot wait for input"));
+    }
+    if ready == 0 {
+        return Ok(None);
+    }
+    let mut buffer = [0_u8; 64];
+    let count = unsafe { libc::read(descriptor, buffer.as_mut_ptr().cast(), buffer.len()) };
+    if count < 0 {
+        if std::io::Error::last_os_error().kind() == std::io::ErrorKind::Interrupted {
+            return Ok(None);
+        }
+        return Err(Error::new("io", "Cannot read input"));
+    }
+    Ok(Some(buffer[..count as usize].to_vec()))
+}
+
+/// Single-choice picker on stderr reading keys from the terminal on stdin. Up/Down
+/// or k/j move, Enter chooses; Ctrl-C, Esc, `q` or EOF cancel (exit 130). The
+/// terminal mode is restored and the list erased on every exit.
+pub fn pick(header: &str, rows: &[String], initial: usize) -> Result<usize> {
+    if rows.is_empty() {
+        return Err(Error::new("not_found", "Nothing to choose from"));
+    }
+    if cancelled() {
+        return Err(Error::cancelled());
+    }
+    let descriptor = libc::STDIN_FILENO;
+    let mut mode = std::mem::MaybeUninit::<libc::termios>::uninit();
+    if unsafe { libc::tcgetattr(descriptor, mode.as_mut_ptr()) } != 0 {
+        return Err(Error::new("io", "Cannot inspect terminal mode"));
+    }
+    let original = unsafe { mode.assume_init() };
+    let mut raw = original;
+    // Keep ISIG so Ctrl-C still raises SIGINT and reaches the cancel handler.
+    raw.c_lflag &= !(libc::ECHO | libc::ICANON);
+    raw.c_cc[libc::VMIN] = 1;
+    raw.c_cc[libc::VTIME] = 0;
+    if unsafe { libc::tcsetattr(descriptor, libc::TCSANOW, &raw) } != 0 {
+        return Err(Error::new("io", "Cannot switch terminal mode"));
+    }
+    let guard = TerminalMode {
+        descriptor,
+        original,
+    };
+    let mut out = std::io::stderr();
+    let height = rows.len() + 2;
+    let draw = |current: usize, first: bool| -> String {
+        let mut text = String::new();
+        if !first {
+            text.push_str(&format!("\x1b[{height}A"));
+        }
+        text.push_str("\r\x1b[2KChoose a profile for this project (↑/↓, Enter; Esc cancels)\n");
+        text.push_str(&format!("\r\x1b[2K  {header}\n"));
+        for (index, row) in rows.iter().enumerate() {
+            if index == current {
+                text.push_str(&format!("\r\x1b[2K\x1b[7m> {row}\x1b[0m\n"));
+            } else {
+                text.push_str(&format!("\r\x1b[2K  {row}\n"));
+            }
+        }
+        text
+    };
+    let mut current = initial.min(rows.len() - 1);
+    let _ = write!(out, "\x1b[?25l{}", draw(current, true));
+    let _ = out.flush();
+    let mut pending: Vec<u8> = Vec::new();
+    let result = loop {
+        if cancelled() {
+            break Err(Error::cancelled());
+        }
+        // A lone ESC waits briefly for the rest of an arrow-key sequence.
+        let timeout = if pending.is_empty() { 100 } else { 50 };
+        match read_ready(descriptor, timeout) {
+            Err(e) => break Err(e),
+            Ok(Some(bytes)) if bytes.is_empty() => break Err(Error::cancelled()),
+            Ok(Some(bytes)) => pending.extend(bytes),
+            Ok(None) if pending.is_empty() => continue,
+            // Timed out after a partial escape: a bare Esc.
+            Ok(None) => break Err(Error::cancelled()),
+        }
+        let mut chosen = None;
+        while let Some((key, used)) = decode_key(&pending) {
+            pending.drain(..used);
+            match key {
+                Key::Up => current = current.saturating_sub(1),
+                Key::Down => current = (current + 1).min(rows.len() - 1),
+                Key::Choose => chosen = Some(Ok(current)),
+                Key::Cancel => chosen = Some(Err(Error::cancelled())),
+                Key::Other => (),
+            }
+            if chosen.is_some() {
+                break;
+            }
+        }
+        if let Some(result) = chosen {
+            break result;
+        }
+        let _ = write!(out, "{}", draw(current, false));
+        let _ = out.flush();
+    };
+    let _ = write!(out, "\x1b[{height}A\r\x1b[J\x1b[?25h");
+    let _ = out.flush();
+    drop(guard);
+    if cancelled() {
+        return Err(Error::cancelled());
+    }
+    result
+}
+
 mod path_setup;
 pub use path_setup::setup_path;
 

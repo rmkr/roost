@@ -30,8 +30,9 @@ pub fn run(name: &str, foreground: bool) -> Result<i32> {
     }
     let mut store = Store::open(&platform::root()?, false, OpenMode::Launch)?;
     let registration = store.find(name, false)?.clone();
-    let env = launch::profile_env(&store, &registration, false)?;
+    let mut env = launch::profile_env(&store, &registration, false)?;
     let program = launch::resolve_program("claude-desktop")?;
+    crate::plugins::at_launch(&store, &registration, &mut env);
     let host = linux::hostname();
     let others_running = |store: &Store, own: Option<&str>| {
         let roost = store

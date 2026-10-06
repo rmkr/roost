@@ -7,9 +7,9 @@
 //!
 //! Extension points:
 //! - Link kinds: [`PLACEMENTS`] maps item kinds to a profile subdirectory and how a
-//!   source expands; [`LINKED`] lists the kinds reconciled at launch. Instruction
-//!   linking (`rules/`) is enabled by appending `Instruction`/`InstructionSource`
-//!   to `LINKED`.
+//!   source expands; [`LINKED`] lists the kinds reconciled at launch: skills under
+//!   `skills/` and instruction fragments under `rules/` (config-dir `rules/` loads
+//!   like `~/.claude/rules/`, so no `CLAUDE.md` import block is needed).
 //! - Plugins: [`plugin_installed`] gates `set add --plugin`; [`plugin_items`] gives
 //!   a registration's subscribed plugin IDs for injection.
 
@@ -61,7 +61,12 @@ const PLACEMENTS: [Placement; 2] = [
     },
 ];
 /// Item kinds linked into owned profiles at launch.
-const LINKED: &[ItemKind] = &[ItemKind::Skill, ItemKind::SkillSource];
+const LINKED: &[ItemKind] = &[
+    ItemKind::Skill,
+    ItemKind::SkillSource,
+    ItemKind::Instruction,
+    ItemKind::InstructionSource,
+];
 /// Claude-managed per-account names that are never linked, replaced or removed.
 const SYNCED: &str = "synced";
 
