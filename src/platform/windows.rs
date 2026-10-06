@@ -20,6 +20,7 @@ impl Directory {
     pub fn open(_: &Path, _: bool) -> Result<Self> {
         Err(unavailable())
     }
+    #[cfg(test)]
     pub fn create(_: &Path) -> Result<Self> {
         Err(unavailable())
     }
