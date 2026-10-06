@@ -21,6 +21,7 @@ const JOURNAL: &str = ".roost-operation.json";
 const LOCK: &str = ".roost-lock";
 const LIMIT: usize = 4 * 1024 * 1024;
 
+mod desktop;
 pub mod side;
 
 #[derive(Clone, Copy, Debug, Serialize, Deserialize, PartialEq, Eq)]
@@ -93,6 +94,7 @@ enum Operation {
     Purge,
     TokenSet,
     TokenClear,
+    DesktopCreate,
 }
 #[derive(Clone, Copy, Debug, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
@@ -111,6 +113,7 @@ enum Role {
     Registry,
     Marker,
     StagingDirectory,
+    DesktopData,
 }
 #[derive(Clone, Copy, Debug, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
@@ -869,7 +872,10 @@ impl Store {
         Ok(())
     }
     fn mutation_ready(&self) -> Result<()> {
-        if !self.mode.journaled() {
+        self.journal_ready(false)
+    }
+    fn journal_ready(&self, launch_allowed: bool) -> Result<()> {
+        if !self.mode.journaled() && !(launch_allowed && self.desktop_create_allowed()) {
             return Err(err("ownership", "Read-only store cannot mutate"));
         }
         self.check_root()?;
@@ -958,7 +964,7 @@ impl Store {
         self.directory.sync()
     }
     fn begin(&mut self, operation: Operation, id: Option<String>) -> Result<Directory> {
-        self.mutation_ready()?;
+        self.journal_ready(operation == Operation::DesktopCreate)?;
         let operation_id = platform::random_id()?;
         let next_generation = self
             .registry
@@ -1275,6 +1281,7 @@ impl Store {
                 let _ = parent.open_file(name, true, false)?;
                 Ok(entry.is_file && entry.nlink == 1)
             }
+            Role::DesktopData => self.desktop_matches(&parent, name, &entry, artifact.action),
             Role::Marker => {
                 let marker: ProfileMarker = read_record(&parent, name)?;
                 Ok(entry.is_file
@@ -1308,7 +1315,7 @@ impl Store {
         let parent = self.parent_for(&a.destination)?;
         let name = file_name(&a.destination)?;
         if a.action == Action::Delete {
-            parent.remove(name, a.role == Role::Profile)?;
+            parent.remove(name, matches!(a.role, Role::Profile | Role::DesktopData))?;
         } else {
             let staged = a
                 .staged
@@ -1491,6 +1498,8 @@ impl Store {
             Operation::TokenSet | Operation::TokenClear => {
                 registration.is_some_and(|r| r.kind == Kind::Owned && r.state == State::Active)
             }
+            Operation::DesktopCreate => registration
+                .is_some_and(|r| r.kind != Kind::DefaultAlias && r.state == State::Active),
         };
         if !mapping_valid {
             return Err(recovery(
@@ -1540,6 +1549,11 @@ impl Store {
                         }
                 }
                 Role::StagingDirectory => a.action == Action::Create,
+                Role::DesktopData => match j.operation {
+                    Operation::DesktopCreate => a.action == Action::Create,
+                    Operation::Purge | Operation::Remove => a.action == Action::Delete,
+                    _ => false,
+                },
             };
             if !action_valid {
                 return Err(recovery("Artifact action conflicts with operation"));
@@ -1619,6 +1633,10 @@ impl Store {
                     }
                     None
                 }
+                Role::DesktopData => {
+                    self.validate_desktop_artifact(a, j.registration_id.as_ref())?;
+                    None
+                }
             };
             if let Some(name) = name {
                 validate_name(&name).map_err(|_| recovery("Invalid profile name in journal"))?;
@@ -1656,7 +1674,7 @@ impl Store {
                             && s.launcher_form.is_none()
                             && s.registry_generation.is_some()
                     }
-                    Role::Token | Role::StagingDirectory => {
+                    Role::Token | Role::StagingDirectory | Role::DesktopData => {
                         s.profile_id.is_none()
                             && s.launcher_binding.is_none()
                             && s.launcher_form.is_none()
@@ -1707,6 +1725,9 @@ impl Store {
         }
         if journal.operation == Operation::Reuse {
             return self.rollback_refresh();
+        }
+        if journal.operation == Operation::DesktopCreate {
+            return self.recover_desktop_create();
         }
         let mut published = Vec::new();
         for (index, a) in journal.artifacts.iter().enumerate() {
@@ -1822,7 +1843,7 @@ impl Store {
                     self.commit(self.registry.clone(), &stage)
                 }
             }
-            Operation::Purge => unreachable!(),
+            Operation::Purge | Operation::DesktopCreate => unreachable!(),
         }
     }
     fn rollback_refresh(&mut self) -> Result<()> {
@@ -2200,8 +2221,15 @@ impl Store {
         }
         let scope = if purge {
             format!(
-                "Permanently delete verified owned profile data at {}. Stop all sessions and other writers first. Native login is not revoked.{}",
+                "Permanently delete verified owned profile data at {}{}. Stop all sessions and other writers first. Native login is not revoked.{}",
                 r.directory.as_ref().unwrap().display(),
+                match self.desktop_folder(&r) {
+                    Ok(Some(folder)) => format!(
+                        " and its Claude Desktop data folder at {}",
+                        folder.display()
+                    ),
+                    _ => String::new(),
+                },
                 if self.pending() {
                     " This retries a partial irreversible deletion."
                 } else {
@@ -2226,8 +2254,19 @@ impl Store {
         if purge {
             return self.purge(&r);
         }
+        let desktop = if r.kind == Kind::Upstream {
+            self.desktop_deletion(&r)?
+        } else {
+            None
+        };
         let stage = self.begin(Operation::Remove, Some(r.registration_id.clone()))?;
         self.delete_launchers(&r)?;
+        if let Some(desktop) = desktop {
+            // Roost's own Desktop folder (the upstream profile's Desktop sign-in),
+            // confirmed by the caller; borrowed upstream data is never touched.
+            self.record(desktop)?;
+            self.delete_desktop(self.intent.as_ref().unwrap().artifacts.len() - 1)?;
+        }
         let mut next = self.registry.clone();
         if r.kind == Kind::Owned {
             next.registrations
@@ -2291,6 +2330,17 @@ impl Store {
                     action: Action::Delete,
                     completed: false,
                 })?;
+            }
+            if !self
+                .intent
+                .as_ref()
+                .unwrap()
+                .artifacts
+                .iter()
+                .any(|a| a.role == Role::DesktopData)
+                && let Some(desktop) = self.desktop_deletion(r)?
+            {
+                self.record(desktop)?;
             }
         }
         let journal = self.intent.clone().unwrap();
@@ -2384,6 +2434,9 @@ impl Store {
                 .position(|a| a.role == Role::Profile)
                 .unwrap();
             self.publish(index)?;
+        }
+        if let Some(index) = artifacts.iter().position(|a| a.role == Role::DesktopData) {
+            self.delete_desktop(index)?;
         }
         let registry_index = artifacts
             .iter()

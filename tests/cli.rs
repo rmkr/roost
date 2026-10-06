@@ -52,6 +52,22 @@ print(json.dumps({'arguments':args,'env':dict(os.environ),'cwd':os.getcwd(),'std
 sys.exit(int(os.environ.get('FAKE_CLAUDE_EXIT','0')))
 "#).unwrap();
         fs::set_permissions(&fake, fs::Permissions::from_mode(0o700)).unwrap();
+        // Never the real app: records argv/env/stdio per launch, writes Electron-like
+        // data into --user-data-dir unless told to ignore it, then exits or lingers.
+        let desktop = bin.join("claude-desktop");
+        fs::write(&desktop, r#"#!/usr/bin/python3
+import json,os,sys,time
+args=sys.argv[1:]
+record={'arguments':args,'env':dict(os.environ),'session_leader':os.getsid(0)==os.getpid(),
+        'stdin':os.readlink('/proc/self/fd/0'),'stdout':os.readlink('/proc/self/fd/1'),'stderr':os.readlink('/proc/self/fd/2')}
+with open(os.environ['FAKE_DESKTOP_RECORD'],'a') as f:f.write(json.dumps(record)+'\n')
+data=[a.split('=',1)[1] for a in args if a.startswith('--user-data-dir=')]
+if data and not os.environ.get('FAKE_DESKTOP_IGNORE_DIR'):open(os.path.join(data[0],'Preferences'),'w').close()
+print('chromium console noise');print('[ERROR] gpu noise',file=sys.stderr)
+if os.environ.get('FAKE_DESKTOP_MODE')=='long':time.sleep(8)
+sys.exit(int(os.environ.get('FAKE_DESKTOP_EXIT','0')))
+"#).unwrap();
+        fs::set_permissions(&desktop, fs::Permissions::from_mode(0o700)).unwrap();
         let root = path.join("root");
         Self {
             path,
@@ -68,6 +84,7 @@ sys.exit(int(os.environ.get('FAKE_CLAUDE_EXIT','0')))
             .env("HOME", &self.home)
             .env("PATH", format!("{}:/usr/bin:/bin", self.bin.display()))
             .env("SHELL", "/bin/bash")
+            .env("FAKE_DESKTOP_RECORD", self.path.join("desktop.jsonl"))
             .current_dir(&self.path);
         command
     }
@@ -85,6 +102,30 @@ sys.exit(int(os.environ.get('FAKE_CLAUDE_EXIT','0')))
     }
     fn add(&self, name: &str) {
         self.ok(&["add", name]);
+    }
+    /// Every fake `claude-desktop` launch so far, oldest first.
+    fn desktop_launches(&self) -> Vec<Value> {
+        fs::read_to_string(self.path.join("desktop.jsonl"))
+            .unwrap_or_default()
+            .lines()
+            .map(|line| serde_json::from_str(line).unwrap())
+            .collect()
+    }
+    fn registration_id(&self, name: &str) -> String {
+        let registry: Value =
+            serde_json::from_slice(&fs::read(self.root.join("registry.json")).unwrap()).unwrap();
+        registry["registrations"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|r| r["name"] == name)
+            .unwrap()["registration_id"]
+            .as_str()
+            .unwrap()
+            .to_owned()
+    }
+    fn desktop_folder(&self, name: &str) -> PathBuf {
+        self.root.join("desktop").join(self.registration_id(name))
     }
     fn upstream(&self, name: &str) -> PathBuf {
         let path = self.home.join(".ccm/profiles").join(name);
@@ -137,7 +178,6 @@ fn help_version_and_usage_do_not_touch_storage() {
         vec!["add", "CON"],
         vec!["add", "bad name"],
         vec!["add", "Work", "--yes"],
-        vec!["remove", "Work", "--yes"],
         vec!["token", "Work", "--stdin", "--clear"],
         vec!["unknown"],
     ] {
@@ -729,4 +769,355 @@ print(json.dumps(results))
             {"action":"token","exit":1,"replacement_preserved":true,"replacement_token_present":false}
         ])
     );
+}
+
+#[test]
+fn desktop_gives_owned_and_upstream_profiles_their_own_data_folder() {
+    let f = Fixture::new();
+    f.add("Work");
+    let upstream = f.upstream("Up");
+    f.ok(&["register", "Up", "--path", upstream.to_str().unwrap()]);
+    let out = f.ok(&["desktop", "--foreground", "work"]);
+    assert_eq!(
+        String::from_utf8_lossy(&out.stdout),
+        "chromium console noise\n"
+    );
+    let folder = f.desktop_folder("Work");
+    let launch = &f.desktop_launches()[0];
+    assert_eq!(
+        launch["arguments"],
+        json!([format!("--user-data-dir={}", folder.display())])
+    );
+    assert_eq!(
+        launch["env"]["CLAUDE_CONFIG_DIR"],
+        f.root.join("profiles/Work").to_str().unwrap()
+    );
+    assert_eq!(launch["env"]["DISABLE_AUTOUPDATER"], "1");
+    assert_eq!(
+        fs::metadata(&folder).unwrap().permissions().mode() & 0o777,
+        0o700
+    );
+    let marker: Value =
+        serde_json::from_slice(&fs::read(folder.join(".roost-desktop.json")).unwrap()).unwrap();
+    assert_eq!(marker["schema_version"], 1);
+    assert_eq!(marker["registration_id"], f.registration_id("Work"));
+    let state: Value =
+        serde_json::from_slice(&fs::read(f.root.join("state.json")).unwrap()).unwrap();
+    assert_eq!(
+        state["desktop_launched"][0]["registration_id"],
+        f.registration_id("Work")
+    );
+    assert_eq!(
+        state["last_used"][0]["registration_id"],
+        f.registration_id("Work")
+    );
+    // The folder is created once and reused.
+    f.ok(&["desktop", "--foreground", "Work"]);
+    assert_eq!(f.desktop_launches()[1]["arguments"], launch["arguments"]);
+
+    let before: Vec<_> = fs::read_dir(&upstream).unwrap().collect();
+    f.ok(&["desktop", "--foreground", "Up"]);
+    let launch = &f.desktop_launches()[2];
+    assert_eq!(
+        launch["arguments"],
+        json!([format!(
+            "--user-data-dir={}",
+            f.desktop_folder("Up").display()
+        )])
+    );
+    assert_eq!(
+        launch["env"]["CLAUDE_CONFIG_DIR"],
+        upstream.to_str().unwrap()
+    );
+    assert_eq!(fs::read_dir(&upstream).unwrap().count(), before.len());
+    // Doctor stays clean of Desktop findings and the root stays valid.
+    let doctor = parsed(&f.run(&["doctor", "--json"]));
+    assert!(
+        !doctor.to_string().contains("desktop_data_not_isolated"),
+        "{doctor}"
+    );
+    f.ok(&["list"]);
+}
+
+#[test]
+fn desktop_default_alias_launches_plain_with_the_caller_environment() {
+    let f = Fixture::new();
+    f.ok(&["add", "personal", "--link-default"]);
+    let out = f
+        .command()
+        .args(["desktop", "--foreground", "personal"])
+        .env("CLAUDE_CONFIG_DIR", "/caller/choice")
+        .env("ANTHROPIC_API_KEY", "fake-caller-key")
+        .output()
+        .unwrap();
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let launch = &f.desktop_launches()[0];
+    assert_eq!(launch["arguments"], json!([]));
+    assert_eq!(launch["env"]["CLAUDE_CONFIG_DIR"], "/caller/choice");
+    assert_eq!(launch["env"]["ANTHROPIC_API_KEY"], "fake-caller-key");
+    assert!(launch["env"].get("DISABLE_AUTOUPDATER").is_none());
+    assert!(!f.root.join("desktop").exists());
+    assert!(!f.root.join("state.json").exists());
+}
+
+#[test]
+fn desktop_detaches_by_default_and_reports_an_early_exit() {
+    let f = Fixture::new();
+    f.add("Work");
+    let out = f
+        .command()
+        .args(["desktop", "Work"])
+        .env("FAKE_DESKTOP_MODE", "long")
+        .output()
+        .unwrap();
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert!(out.stdout.is_empty());
+    assert_eq!(
+        String::from_utf8_lossy(&out.stderr),
+        "Started Claude Desktop for Work\n"
+    );
+    let launch = &f.desktop_launches()[0];
+    assert_eq!(launch["session_leader"], true);
+    for stream in ["stdin", "stdout", "stderr"] {
+        assert_eq!(launch[stream], "/dev/null", "{stream}");
+    }
+
+    let out = f
+        .command()
+        .args(["desktop", "Work"])
+        .env("FAKE_DESKTOP_EXIT", "3")
+        .output()
+        .unwrap();
+    assert_eq!(out.status.code(), Some(1));
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(stderr.contains("claude_unavailable"), "{stderr}");
+    assert!(stderr.contains("exit status 3"), "{stderr}");
+    assert!(
+        stderr.contains("roost desktop --foreground Work"),
+        "{stderr}"
+    );
+    assert!(!stderr.contains("noise"), "{stderr}");
+
+    // Foreground keeps Desktop's console and returns its result.
+    let out = f
+        .command()
+        .args(["desktop", "--foreground", "Work"])
+        .env("FAKE_DESKTOP_EXIT", "4")
+        .output()
+        .unwrap();
+    assert_eq!(out.status.code(), Some(4));
+    assert!(String::from_utf8_lossy(&out.stderr).contains("gpu noise"));
+}
+
+fn hostname() -> String {
+    fs::read_to_string("/proc/sys/kernel/hostname")
+        .unwrap()
+        .trim()
+        .to_owned()
+}
+
+#[test]
+fn desktop_refuses_a_running_profile_and_warns_about_other_instances() {
+    let f = Fixture::new();
+    f.add("Work");
+    f.add("Other");
+    f.ok(&["desktop", "--foreground", "Work"]);
+    let lock = f.desktop_folder("Work").join("SingletonLock");
+    let live = format!("{}-{}", hostname(), std::process::id());
+    std::os::unix::fs::symlink(&live, &lock).unwrap();
+    let out = f.run(&["desktop", "--foreground", "Work"]);
+    assert_eq!(out.status.code(), Some(1));
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        stderr.contains("desktop_running: this profile's Desktop is already running"),
+        "{stderr}"
+    );
+    assert_eq!(f.desktop_launches().len(), 1);
+
+    // Another profile still launches, with the Cowork warning.
+    let out = f.ok(&["desktop", "--foreground", "Other"]);
+    assert!(String::from_utf8_lossy(&out.stderr).contains("Cowork is untested"));
+
+    // A stale lock (dead PID or another host) is not running.
+    let mut child = Command::new("/bin/true").spawn().unwrap();
+    let dead = child.id();
+    child.wait().unwrap();
+    fs::remove_file(&lock).unwrap();
+    std::os::unix::fs::symlink(format!("{}-{dead}", hostname()), &lock).unwrap();
+    let out = f.ok(&["desktop", "--foreground", "Work"]);
+    assert!(!String::from_utf8_lossy(&out.stderr).contains("Cowork"));
+    fs::remove_file(&lock).unwrap();
+    std::os::unix::fs::symlink(format!("elsewhere-{}", std::process::id()), &lock).unwrap();
+    f.ok(&["desktop", "--foreground", "Work"]);
+
+    // The conventional Desktop folder counts as another instance, for aliases too.
+    let conventional = f.home.join(".config/Claude");
+    fs::create_dir_all(&conventional).unwrap();
+    std::os::unix::fs::symlink(&live, conventional.join("SingletonLock")).unwrap();
+    let out = f.ok(&["desktop", "--foreground", "Work"]);
+    assert!(String::from_utf8_lossy(&out.stderr).contains("Cowork is untested"));
+    f.ok(&["add", "personal", "--link-default"]);
+    fs::remove_file(conventional.join("SingletonLock")).unwrap();
+    fs::remove_file(&lock).unwrap();
+    std::os::unix::fs::symlink(&live, &lock).unwrap();
+    let out = f.ok(&["desktop", "--foreground", "personal"]);
+    assert!(String::from_utf8_lossy(&out.stderr).contains("Cowork is untested"));
+}
+
+#[test]
+fn desktop_needs_the_app_on_path_and_an_active_profile() {
+    let f = Fixture::new();
+    f.add("Work");
+    fs::remove_file(f.bin.join("claude-desktop")).unwrap();
+    // The fixture bin alone, so no real claude-desktop can ever be selected.
+    let out = f
+        .command()
+        .env("PATH", &f.bin)
+        .args(["desktop", "Work"])
+        .output()
+        .unwrap();
+    assert_eq!(out.status.code(), Some(1));
+    assert!(String::from_utf8_lossy(&out.stderr).contains("claude_unavailable"));
+    assert!(!f.root.join("desktop").exists());
+    f.ok(&["remove", "Work"]);
+    let out = f
+        .command()
+        .env("PATH", &f.bin)
+        .args(["desktop", "Work"])
+        .output()
+        .unwrap();
+    assert!(String::from_utf8_lossy(&out.stderr).contains("not_found"));
+}
+
+#[test]
+fn desktop_folder_follows_remove_purge_and_upstream_lifecycle() {
+    let f = Fixture::new();
+    f.add("Work");
+    f.ok(&["desktop", "--foreground", "Work"]);
+    let folder = f.desktop_folder("Work");
+    let outside = f.path.join("outside");
+    fs::create_dir(&outside).unwrap();
+    fs::write(outside.join("keep"), "preserve").unwrap();
+    std::os::unix::fs::symlink(&outside, folder.join("linked")).unwrap();
+    fs::create_dir(folder.join("Local Storage")).unwrap();
+    fs::write(folder.join("Local Storage/leveldb"), "x").unwrap();
+    // `--yes` without --purge means nothing for an owned profile.
+    assert_eq!(f.run(&["remove", "Work", "--yes"]).status.code(), Some(2));
+    f.ok(&["remove", "Work"]);
+    assert!(folder.join("Preferences").exists());
+    let out = f.ok(&["remove", "Work", "--purge", "--yes"]);
+    assert!(String::from_utf8_lossy(&out.stderr).contains(folder.to_str().unwrap()));
+    assert!(!folder.exists());
+    assert_eq!(
+        fs::read_to_string(outside.join("keep")).unwrap(),
+        "preserve"
+    );
+
+    let upstream = f.upstream("Up");
+    fs::write(upstream.join("settings.json"), "{}").unwrap();
+    f.ok(&["register", "Up", "--path", upstream.to_str().unwrap()]);
+    f.ok(&["desktop", "--foreground", "Up"]);
+    let folder = f.desktop_folder("Up");
+    assert_eq!(
+        f.run(&["remove", "Up", "--purge", "--yes"]).status.code(),
+        Some(1)
+    );
+    // Deleting the Desktop sign-in needs confirmation; without a terminal, --yes.
+    let mut command = f.command();
+    command.args(["remove", "Up"]);
+    unsafe {
+        use std::os::unix::process::CommandExt;
+        command.pre_exec(|| {
+            libc::setsid();
+            Ok(())
+        });
+    }
+    let out = command.output().unwrap();
+    assert_eq!(
+        out.status.code(),
+        Some(2),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert!(folder.exists());
+    f.ok(&["where", "Up"]);
+    let out = f.ok(&["remove", "Up", "--yes"]);
+    assert!(String::from_utf8_lossy(&out.stderr).contains(folder.to_str().unwrap()));
+    assert!(!folder.exists());
+    assert_eq!(
+        fs::read_to_string(upstream.join("settings.json")).unwrap(),
+        "{}"
+    );
+    assert!(!f.run(&["where", "Up"]).status.success());
+    // Without a Desktop folder upstream removal needs no confirmation.
+    f.ok(&["register", "Up", "--path", upstream.to_str().unwrap()]);
+    f.ok(&["remove", "Up"]);
+    let doctor = parsed(&f.run(&["doctor", "--json"]));
+    assert!(
+        doctor["data"]["findings"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .all(|x| x["severity"] == "warning"),
+        "{doctor}"
+    );
+}
+
+#[test]
+fn doctor_warns_when_desktop_ignored_its_data_folder() {
+    let f = Fixture::new();
+    f.add("Work");
+    let out = f
+        .command()
+        .args(["desktop", "--foreground", "Work"])
+        .env("FAKE_DESKTOP_IGNORE_DIR", "1")
+        .output()
+        .unwrap();
+    assert!(out.status.success());
+    let doctor = parsed(&f.run(&["doctor", "--json"]));
+    let finding = doctor["data"]["findings"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|x| x["code"] == "desktop_data_not_isolated")
+        .unwrap_or_else(|| panic!("{doctor}"))
+        .clone();
+    assert_eq!(finding["severity"], "warning");
+    assert_eq!(finding["path"], f.desktop_folder("Work").to_str().unwrap());
+    f.ok(&["desktop", "--foreground", "Work"]);
+    let doctor = parsed(&f.run(&["doctor", "--json"]));
+    assert!(!doctor.to_string().contains("desktop_data_not_isolated"));
+}
+
+#[test]
+fn partial_desktop_deletion_keeps_the_journal_until_an_explicit_purge_retry() {
+    let f = Fixture::new();
+    f.add("Work");
+    f.ok(&["desktop", "--foreground", "Work"]);
+    let folder = f.desktop_folder("Work");
+    let stuck = folder.join("Cache");
+    fs::create_dir(&stuck).unwrap();
+    fs::write(stuck.join("entry"), "x").unwrap();
+    fs::set_permissions(&stuck, fs::Permissions::from_mode(0o500)).unwrap();
+    let out = f.run(&["remove", "Work", "--purge", "--yes"]);
+    fs::set_permissions(&stuck, fs::Permissions::from_mode(0o700)).unwrap();
+    assert_eq!(out.status.code(), Some(1));
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(stderr.contains("Partial deletion"), "{stderr}");
+    assert!(folder.join(".roost-desktop.json").exists());
+    assert!(f.root.join(".roost-operation.json").exists());
+    assert!(!f.run(&["desktop", "--foreground", "Work"]).status.success());
+    assert_eq!(f.desktop_launches().len(), 1);
+    f.ok(&["remove", "Work", "--purge", "--yes"]);
+    assert!(!folder.exists());
+    assert!(!f.root.join(".roost-operation.json").exists());
+    assert!(!f.root.join("profiles/Work").exists());
 }
