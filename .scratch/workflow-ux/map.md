@@ -1,7 +1,7 @@
 # Make Roost simpler to work with day to day
 
 Labels: workflow-ux
-Status: resolved
+Status: open
 
 ## Destination
 
@@ -41,11 +41,11 @@ Roost remembers which profile each project uses, shows profiles in a readable ta
 
 ## Not yet specified
 
-None in scope; see Later.
+- How settings and hooks are shared (ticket 21 pending design).
 
 ## Later
 
-- Shared agents, commands and output-styles (linked like skills), and hooks/settings (status line, hooks) through a shared `--settings` file: agreed as later item kinds, deferred by the user on 2026-10-06 to a future round.
+- Shared hooks/settings (status line, hooks) through a shared `--settings` file: being designed in a grilling session (2026-10-06); becomes ticket 21 and the user-present migration ticket 22.
 
 ## Out of scope
 
