@@ -30,6 +30,7 @@ Roost remembers which profile each project uses, shows profiles in a readable ta
 - [Move the personal profile's hand-made skill links onto a set](issues/08-migrate-personal-skills.md): `personal` and `work` subscribe to default set `core` (65 skills, plannotator and ponytail).
 - [Split the user's global CLAUDE.md into instruction fragments](issues/12-split-global-instructions.md): fragments in `~/.agents/instructions` via `core`; verified each loads once.
 - [Open the picker from `roost switch` without a name](issues/13-switch-picker.md): `roost switch` alone picks and launches, like `wt switch`.
+- [Color the profile picker like `roost ls`](issues/14-picker-colors.md): picker rows share the `ls` styles; confirmed by the user.
 - [Investigate injected plugin behavior](issues/06-injected-plugin-behavior.md): injection works as ADR 0001 assumes (`name@inline`, per-profile opt-out, config and data per profile); inject `installPath` from the store's `installed_plugins.json` at every launch; no claude.ai org marketplaces in the store; ADR accepted.
 
 ## Not yet specified
