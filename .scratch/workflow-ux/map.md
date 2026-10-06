@@ -37,6 +37,7 @@ Roost remembers which profile each project uses, shows profiles in a readable ta
 - [Refuse missing set item sources and skip missing link targets](issues/17-missing-skill-sources.md): no more dangling skill links.
 - [Drop the `^` last-used marker](issues/18-drop-last-used-marker.md): only `@` marks this project's selection.
 - [Close a profile's Desktop from the picker or `--close`](issues/19-desktop-close.md): graceful, PID-verified close; no force-kill.
+- [Share agents, commands and output-styles through sets](issues/20-share-agents-commands-styles.md): three more linked item kinds.
 - [Investigate injected plugin behavior](issues/06-injected-plugin-behavior.md): injection works as ADR 0001 assumes (`name@inline`, per-profile opt-out, config and data per profile); inject `installPath` from the store's `installed_plugins.json` at every launch; no claude.ai org marketplaces in the store; ADR accepted.
 
 ## Not yet specified

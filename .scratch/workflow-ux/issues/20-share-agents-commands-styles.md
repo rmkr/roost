@@ -2,7 +2,7 @@
 
 Type: task
 Labels: workflow-ux
-Status: claimed
+Status: resolved
 Assignee: Claude subagent ticket-20
 Parent: [Make Roost simpler to work with day to day](../map.md)
 Blocked by: none
@@ -26,3 +26,7 @@ Docs check (inspection only):
 - Local Claude Code 2.1.291 bundle (strings only, not run): `agents`, `commands` and `output-styles` are among the userConfigDir directory names, and an internal note says the user output-styles folder is resolved from the config home honoring `CLAUDE_CONFIG_DIR`. All three load through the same `loadMarkdownFilesForSubdir` path, whose directory walker follows a symlink by stat-ing its target and keeps it when that is a regular `.md` file (the ripgrep fallback runs with `--follow --glob *.md`); same-inode duplicates are deduplicated. So symlinked `.md` files are followed for all three kinds; no exception found. Not verified with a real launch.
 
 Implementation (branch `ticket/20-share-agents-commands-styles`): new `ItemKind`s `agent`, `agent_source`, `command`, `command_source`, `output_style`, `output_style_source` (older `sets.json` still reads; unit test), CLI flags `--agent`/`--agents-from`, `--command`/`--commands-from`, `--output-style`/`--output-styles-from`, three `PLACEMENTS` (Markdown select) and `LINKED` entries; reconciliation, recording, conflicts, purge and missing-source handling unchanged. `set list` text/JSON show the kinds through the existing item rendering; the `ls` Sets column/field is set names only, so it needs no change. The upstream subscribe note now names all linked kinds. Spec amended: ITEM grammar, set list ItemKind, side-file link paths, shared sets section, A16. Tests in `tests/sets.rs` cover each kind via explicit file and whole-dir source, dot-names/links/non-`.md`/directories skipped, existing file wins, a 0775 folder tightened to 0700, unsubscribe removes recorded links, add validation, listing, conflicts, upstream/alias get nothing, and purge unlinks without following.
+
+## Answer
+
+2026-10-06: Merged into `main` (c825666) and installed. Sets gain `--agent`/`--agents-from`, `--command`/`--commands-from` and `--output-style`/`--output-styles-from`, linked as `.md` files into owned profiles' `agents/`, `commands/` and `output-styles/` with the existing reconciliation; old `sets.json` files still read. Claude 2.1.291's loader follows symlinked `.md` files for all three (from its strings; not yet observed in a live session).
