@@ -490,12 +490,7 @@ fn dispatch(action: Action, data: &mut Value) -> Result<Outcome> {
                 let root_id = store.root_id.clone();
                 drop(store);
                 if purge {
-                    platform::confirm(
-                        &format!(
-                            "Purge {scope}. Stop sessions/external writers first. This deletes owned data, not native logout or token revocation."
-                        ),
-                        yes,
-                    )?;
+                    platform::confirm(&scope, yes)?;
                 } else if let Some(folder) = &desktop {
                     platform::confirm(
                         &format!(
