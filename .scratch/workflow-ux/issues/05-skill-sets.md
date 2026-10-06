@@ -2,7 +2,7 @@
 
 Type: task
 Labels: workflow-ux
-Status: claimed
+Status: resolved
 Assignee: Claude subagent ticket-05
 Parent: [Make Roost simpler to work with day to day](../map.md)
 Blocked by: 01, 10
@@ -21,3 +21,7 @@ Implement the skill half of [design: shared sets](../design.md#shared-sets): `ro
 - `ls`: the `sets` placeholder is filled by `sets::annotate`; Sets column after Launchers.
 - Tests: `tests/sets.rs` (A16 cases, except instruction linking, which is ticket 11).
 - Extension: ticket 11 adds `ItemKind::Instruction`/`InstructionSource` to `sets::LINKED` (placement `rules/` and `.md` expansion already exist in `PLACEMENTS`); ticket 07 replaces `plugin_installed` and uses `sets::plugin_items(&SetsFile, registration_id)` for injection.
+
+## Answer
+
+2026-10-06: Merged into `workflow-ux` (branch head bef0a27). `src/sets.rs` adds the `set` commands, default and copied subscriptions on `add`, launch-time skill link reconciliation in owned profiles (`run` and launchers now open `OpenMode::Launch`), remove/purge record handling and the Sets column. All item kinds are stored; instruction linking (ticket 11) appends to `LINKED`, and plugin checks/injection (ticket 07) replace `plugin_installed` and use `plugin_items`. `Store::add` now accepts a copy source that is exactly a verified owned profile directory, as the amended spec allows.
