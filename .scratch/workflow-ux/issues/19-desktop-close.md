@@ -24,3 +24,7 @@ User decisions 2026-10-06 (Q63, Q64):
 ## Answer
 
 2026-10-06: Merged into `workflow-ux` (2a90d0b) and installed. `x` in the Desktop picker and `roost desktop --close NAME` send SIGTERM only to a pidfd-pinned PID verified as the PATH `claude-desktop` (binary via `/proc/PID/exe`, or a script via its interpreter's cmdline), wait up to 10 seconds, and never force-kill. The key hint sits on the picker title line like the other pickers; a failed PID check reports `ownership` and a timeout `desktop_running`.
+
+### 2026-10-06: verified on the real app
+
+The user confirmed that `x` in the `roost desktop` picker closes the real Claude Desktop (deb 2.19675.1); the `/proc/PID/exe` binary check matched the installed app.
