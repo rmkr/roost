@@ -83,6 +83,7 @@ pub fn run(name: &str, foreground: bool) -> Result<i32> {
                 error.message
             ));
         }
+        crate::sets::reconcile_at_launch(&store, &registration);
         drop(store);
         let mut argument = std::ffi::OsString::from("--user-data-dir=");
         argument.push(folder.as_os_str());

@@ -184,10 +184,6 @@ pub enum OpenMode {
     RetryPurge,
     /// Launch preparation: like Read (no recovery, no journaled mutation), but may
     /// replace side files (`state.json`, `sets.json`) while no intent is pending.
-    #[allow(
-        dead_code,
-        reason = "launch-time state writes arrive with tickets 04/05/07/09"
-    )]
     Launch,
 }
 impl OpenMode {
@@ -689,7 +685,7 @@ impl Store {
         }
         Ok(())
     }
-    fn profile_directory(&self, r: &Registration) -> Result<Directory> {
+    pub(crate) fn profile_directory(&self, r: &Registration) -> Result<Directory> {
         let path = r
             .directory
             .as_ref()
@@ -801,7 +797,9 @@ impl Store {
                 Ok(json!({"path":path,"condition":condition}))
             }).collect::<Result<Vec<_>>>()?;
             launchers.sort_by_key(|v| v["path"].as_str().unwrap_or("").to_owned());
-            Ok(json!({"name":r.name,"kind":r.kind,"state":r.state,"directory":directory,"token_present":token_present,"launchers":launchers}))
+            // sets/last_used/selected/most_recent are placeholders until sets (05) and
+            // selection (04) fill them; probe is filled only by `list --full`.
+            Ok(json!({"name":r.name,"kind":r.kind,"state":r.state,"directory":directory,"token_present":token_present,"launchers":launchers,"sets":[],"last_used":null,"selected":false,"most_recent":false,"probe":null}))
         }).collect()
     }
     fn linked_default(&self, dir: &Directory) -> Result<bool> {
@@ -1961,7 +1959,17 @@ impl Store {
         let source = copy.map(platform::absolute).transpose()?;
         if let Some(path) = &source {
             let directory = Directory::open(path, false)?;
-            self.no_overlap(path, &directory.identity()?, false)?;
+            let identity = directory.identity()?;
+            // Copying from an owned profile is allowed even though it lies inside the
+            // root: copy excludes Roost markers and tokens at every depth.
+            let owned_source = self.registry.registrations.iter().any(|r| {
+                r.kind == Kind::Owned
+                    && r.directory_identity.as_ref() == Some(&identity)
+                    && self.profile_directory(r).is_ok()
+            });
+            if !owned_source {
+                self.no_overlap(path, &identity, false)?;
+            }
         }
         let mut registration = Registration {
             registration_id: platform::random_id()?,

@@ -654,6 +654,20 @@ pub fn token_input(stdin: bool) -> Result<String> {
     validate_token(&bytes)
 }
 
+/// Column count of the terminal on stdout; None when stdout is not a terminal or
+/// reports no size.
+pub fn stdout_width() -> Option<usize> {
+    use std::io::IsTerminal;
+    let stdout = std::io::stdout();
+    if !stdout.is_terminal() {
+        return None;
+    }
+    rustix::termios::tcgetwinsize(&stdout)
+        .ok()
+        .map(|size| usize::from(size.ws_col))
+        .filter(|&width| width > 0)
+}
+
 pub fn confirm(scope: &str, yes: bool) -> Result<()> {
     eprintln!("{scope}\nStop writers for this scope before continuing.");
     if cancelled() {
