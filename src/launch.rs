@@ -178,12 +178,109 @@ fn auth_conflicts(mut lookup: impl FnMut(&str) -> Option<OsString>) -> Vec<&'sta
         .collect()
 }
 
-/// Constructs a command only: callers must release the Store before any child/probe.
-pub fn prepare(
+/// The environment a profile launch adds to the caller's environment. Isolated
+/// registrations set their configuration directory and update controls (plus an
+/// eligible manager token); pass-through aliases add nothing. Holds the token only
+/// until `apply`/`command` consumes it.
+pub struct ProfileEnv {
+    isolated: bool,
+    vars: Vec<(&'static str, OsString)>,
+}
+impl ProfileEnv {
+    fn isolated(directory: &Path, token: Option<String>) -> Self {
+        let mut vars = vec![
+            ("CLAUDE_CONFIG_DIR", directory.as_os_str().to_owned()),
+            ("DISABLE_AUTOUPDATER", OsString::from("1")),
+            ("FORCE_AUTOUPDATE_PLUGINS", OsString::from("1")),
+        ];
+        if let Some(value) = token {
+            vars.push(("CLAUDE_CODE_OAUTH_TOKEN", OsString::from(value)));
+        }
+        Self {
+            isolated: true,
+            vars,
+        }
+    }
+    fn pass_through() -> Self {
+        Self {
+            isolated: false,
+            vars: Vec::new(),
+        }
+    }
+    /// True for owned/upstream registrations; false for default aliases.
+    #[allow(
+        dead_code,
+        reason = "shared scaffold for plugin injection (07) and Desktop (09)"
+    )]
+    pub fn is_isolated(&self) -> bool {
+        self.isolated
+    }
+    /// Sets (or overrides) one variable on an isolated launch; ignored for aliases,
+    /// whose caller environment always passes through unchanged.
+    #[allow(
+        dead_code,
+        reason = "shared scaffold for plugin injection (07) and Desktop (09)"
+    )]
+    pub fn set(&mut self, name: &'static str, value: impl Into<OsString>) {
+        if !self.isolated {
+            return;
+        }
+        let value = value.into();
+        match self.vars.iter_mut().find(|(key, _)| *key == name) {
+            Some(slot) => slot.1 = value,
+            None => self.vars.push((name, value)),
+        }
+    }
+    /// Sets `name` to the caller's nonempty inherited value followed by `paths`,
+    /// joined with the platform path-list separator (for CLAUDE_CODE_PLUGIN_DIRS).
+    /// No-op for aliases or an empty list.
+    #[allow(dead_code, reason = "shared scaffold for plugin injection (07)")]
+    pub fn append_paths(&mut self, name: &'static str, paths: &[PathBuf]) -> Result<()> {
+        if !self.isolated || paths.is_empty() {
+            return Ok(());
+        }
+        let value = path_list(env::var_os(name), paths)?;
+        self.set(name, value);
+        Ok(())
+    }
+    /// Applies the variables to `command`, consuming any token value.
+    pub fn apply(self, command: &mut Command) {
+        for (name, value) in self.vars {
+            command.env(name, value);
+        }
+    }
+    /// A command for `program` with this environment applied.
+    pub fn command(self, program: PathBuf) -> Command {
+        let mut command = Command::new(program);
+        self.apply(&mut command);
+        command
+    }
+}
+
+fn path_list(inherited: Option<OsString>, paths: &[PathBuf]) -> Result<OsString> {
+    env::join_paths(
+        inherited
+            .filter(|value| !value.is_empty())
+            .into_iter()
+            .map(PathBuf::from)
+            .chain(paths.iter().cloned()),
+    )
+    .map_err(|_| {
+        Error::new(
+            "unsafe_path",
+            "Path list entry contains the path-list separator",
+        )
+    })
+}
+
+/// Validates a launch of `registration` (no pending intent, active, stored record,
+/// auth-environment conflicts, token protection) and returns its environment.
+/// Callers must release the Store before any child/probe.
+pub fn profile_env(
     store: &Store,
     registration: &Registration,
     allow_auth_env: bool,
-) -> Result<Command> {
+) -> Result<ProfileEnv> {
     if store.pending() {
         return Err(Error::new("ownership", "Pending operation blocks launch")
             .next("Inspect doctor and complete the pending operation before launching"));
@@ -210,30 +307,43 @@ pub fn prepare(
     } else {
         None
     };
-    let mut command = Command::new(resolve_claude()?);
-    if registration.kind != Kind::DefaultAlias {
-        let directory = registration
-            .directory
-            .as_ref()
-            .ok_or_else(|| Error::new("ownership", "Isolated profile has no directory"))?;
-        command
-            .env("CLAUDE_CONFIG_DIR", directory)
-            .env("DISABLE_AUTOUPDATER", "1")
-            .env("FORCE_AUTOUPDATE_PLUGINS", "1");
-        if !allow_auth_env && let Some(value) = token {
-            command.env("CLAUDE_CODE_OAUTH_TOKEN", value);
-        }
+    if registration.kind == Kind::DefaultAlias {
+        return Ok(ProfileEnv::pass_through());
     }
-    Ok(command)
+    let directory = registration
+        .directory
+        .as_ref()
+        .ok_or_else(|| Error::new("ownership", "Isolated profile has no directory"))?;
+    Ok(ProfileEnv::isolated(
+        directory,
+        token.filter(|_| !allow_auth_env),
+    ))
 }
 
-fn resolve_claude() -> Result<PathBuf> {
-    let path = env::var_os("PATH")
-        .ok_or_else(|| Error::new("claude_unavailable", "PATH does not select Claude"))?;
+/// Constructs the profile's Claude command only: callers must release the Store
+/// before any child/probe.
+pub fn prepare(
+    store: &Store,
+    registration: &Registration,
+    allow_auth_env: bool,
+) -> Result<Command> {
+    let env = profile_env(store, registration, allow_auth_env)?;
+    Ok(env.command(resolve_program("claude")?))
+}
+
+/// Resolves `name` through the caller's PATH like a shell would (Unix: first
+/// executable regular file; Windows: PATHEXT search requiring a native `.exe`).
+pub fn resolve_program(name: &str) -> Result<PathBuf> {
+    resolve_in(name, env::var_os("PATH"))
+}
+
+fn resolve_in(name: &str, path: Option<OsString>) -> Result<PathBuf> {
+    let path = path
+        .ok_or_else(|| Error::new("claude_unavailable", format!("PATH does not select {name}")))?;
     #[cfg(unix)]
     {
         for directory in env::split_paths(&path) {
-            let candidate = platform::absolute(&directory.join("claude"))?;
+            let candidate = platform::absolute(&directory.join(name))?;
             if let Ok(metadata) = candidate.metadata()
                 && metadata.is_file()
                 && rustix::fs::accessat(
@@ -257,10 +367,10 @@ fn resolve_claude() -> Result<PathBuf> {
             .ok_or_else(|| Error::new("claude_unavailable", "PATHEXT is not Unicode"))?;
         for directory in env::split_paths(&path) {
             for extension in extensions.split(';').filter(|s| !s.is_empty()) {
-                let candidate = platform::absolute(&directory.join(format!("claude{extension}")))?;
+                let candidate = platform::absolute(&directory.join(format!("{name}{extension}")))?;
                 if candidate.is_file() {
                     if !extension.eq_ignore_ascii_case(".exe") {
-                        return Err(Error::new("claude_unsupported", "PATH-selected Claude is not a native claude.exe").next("Select a native Claude installation first on PATH; batch shims are unsupported"));
+                        return Err(Error::new("claude_unsupported", format!("PATH-selected {name} is not a native {name}.exe")).next("Select a native installation first on PATH; batch shims are unsupported"));
                     }
                     return Ok(candidate);
                 }
@@ -269,9 +379,13 @@ fn resolve_claude() -> Result<PathBuf> {
     }
     Err(Error::new(
         "claude_unavailable",
-        "No executable Claude was found on PATH",
+        format!("No executable {name} was found on PATH"),
     )
-    .next("Make the existing shared Claude installation available on PATH"))
+    .next(if name == "claude" {
+        "Make the existing shared Claude installation available on PATH".to_owned()
+    } else {
+        format!("Make {name} available on PATH")
+    }))
 }
 
 struct Probe {
@@ -475,7 +589,7 @@ fn version_at(path: &OsStr) -> Result<String> {
     })
 }
 pub fn claude_info() -> Result<(PathBuf, String)> {
-    let path = resolve_claude()?;
+    let path = resolve_program("claude")?;
     let version = version_at(path.as_os_str())?;
     Ok((path, version))
 }
@@ -509,7 +623,10 @@ pub fn execute(mut command: Command, arguments: &[OsString]) -> Result<i32> {
 }
 pub fn update() -> Result<i32> {
     eprintln!("roost: updating the shared Claude installation");
-    execute(Command::new(resolve_claude()?), &[OsString::from("update")])
+    execute(
+        Command::new(resolve_program("claude")?),
+        &[OsString::from("update")],
+    )
 }
 
 pub struct Status {
@@ -618,6 +735,116 @@ mod tests {
                 }),
             }),
         }
+    }
+
+    fn envs(command: &Command) -> Vec<(String, Option<String>)> {
+        command
+            .get_envs()
+            .map(|(k, v)| {
+                (
+                    k.to_string_lossy().into_owned(),
+                    v.map(|v| v.to_string_lossy().into_owned()),
+                )
+            })
+            .collect()
+    }
+
+    #[test]
+    fn isolated_profile_environment_applies_to_any_program_and_extends() {
+        let mut env = ProfileEnv::isolated(Path::new("/profiles/Work"), Some("tok".into()));
+        assert!(env.is_isolated());
+        env.set("EXTRA", "1");
+        env.append_paths("CLAUDE_CODE_PLUGIN_DIRS", &[PathBuf::from("/store/a")])
+            .unwrap();
+        let command = env.command(PathBuf::from("/usr/bin/claude-desktop"));
+        assert_eq!(command.get_program(), "/usr/bin/claude-desktop");
+        let mut vars = envs(&command);
+        vars.sort();
+        let inherited = env::var_os("CLAUDE_CODE_PLUGIN_DIRS").filter(|v| !v.is_empty());
+        let plugin_dirs = env::join_paths(
+            inherited
+                .iter()
+                .map(PathBuf::from)
+                .chain([PathBuf::from("/store/a")]),
+        )
+        .unwrap();
+        let mut expected = vec![
+            ("CLAUDE_CODE_OAUTH_TOKEN".to_owned(), Some("tok".to_owned())),
+            (
+                "CLAUDE_CODE_PLUGIN_DIRS".to_owned(),
+                Some(plugin_dirs.to_string_lossy().into_owned()),
+            ),
+            (
+                "CLAUDE_CONFIG_DIR".to_owned(),
+                Some("/profiles/Work".to_owned()),
+            ),
+            ("DISABLE_AUTOUPDATER".to_owned(), Some("1".to_owned())),
+            ("EXTRA".to_owned(), Some("1".to_owned())),
+            ("FORCE_AUTOUPDATE_PLUGINS".to_owned(), Some("1".to_owned())),
+        ];
+        expected.sort();
+        assert_eq!(vars, expected);
+    }
+
+    #[test]
+    fn pass_through_environment_sets_nothing() {
+        let mut env = ProfileEnv::pass_through();
+        assert!(!env.is_isolated());
+        env.append_paths("CLAUDE_CODE_PLUGIN_DIRS", &[PathBuf::from("/store/a")])
+            .unwrap();
+        assert!(envs(&env.command(PathBuf::from("/bin/claude"))).is_empty());
+    }
+
+    #[test]
+    fn path_lists_follow_a_nonempty_inherited_value() {
+        let paths = [PathBuf::from("/a"), PathBuf::from("/b")];
+        let sep = if cfg!(windows) { ";" } else { ":" };
+        assert_eq!(
+            path_list(Some("/x".into()), &paths).unwrap(),
+            OsString::from(format!("/x{sep}/a{sep}/b"))
+        );
+        assert_eq!(
+            path_list(Some("".into()), &paths).unwrap(),
+            OsString::from(format!("/a{sep}/b"))
+        );
+        assert_eq!(path_list(None, &paths[..1]).unwrap(), OsString::from("/a"));
+        assert!(path_list(None, &[PathBuf::from(format!("/a{sep}b"))]).is_err());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn program_resolution_selects_the_first_executable_on_path() {
+        use std::os::unix::fs::PermissionsExt;
+        let base =
+            env::temp_dir().join(format!("roost-resolve-{}", platform::random_id().unwrap()));
+        let (first, second) = (base.join("first"), base.join("second"));
+        std::fs::create_dir_all(&first).unwrap();
+        std::fs::create_dir_all(&second).unwrap();
+        std::fs::write(first.join("claude-desktop"), "").unwrap();
+        std::fs::set_permissions(
+            first.join("claude-desktop"),
+            std::fs::Permissions::from_mode(0o600),
+        )
+        .unwrap();
+        std::fs::write(second.join("claude-desktop"), "").unwrap();
+        std::fs::set_permissions(
+            second.join("claude-desktop"),
+            std::fs::Permissions::from_mode(0o700),
+        )
+        .unwrap();
+        let path = env::join_paths([&first, &second]).unwrap();
+        assert_eq!(
+            resolve_in("claude-desktop", Some(path.clone())).unwrap(),
+            second.join("claude-desktop")
+        );
+        let missing = resolve_in("claude", Some(path)).err().unwrap();
+        assert_eq!(missing.code, "claude_unavailable");
+        assert!(missing.message.contains("claude"));
+        assert_eq!(
+            resolve_in("claude", None).err().unwrap().code,
+            "claude_unavailable"
+        );
+        std::fs::remove_dir_all(base).unwrap();
     }
 
     #[test]
