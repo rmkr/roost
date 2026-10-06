@@ -81,6 +81,9 @@ fn sets_are_created_marked_default_listed_and_deleted() {
 fn items_are_stored_absolute_and_add_or_drop_is_idempotent() {
     let f = Fixture::new();
     f.ok(&["set", "create", "core"]);
+    f.source("skills", &["review"]);
+    fs::create_dir(f.path.join("notes")).unwrap();
+    fs::write(f.path.join("notes/style.md"), "# style").unwrap();
     f.ok(&["set", "add", "core", "--skill", "skills/review"]);
     f.ok(&["set", "add", "core", "--skill", "skills/review"]);
     f.ok(&["set", "add", "core", "--skills-from", "skills"]);
@@ -123,7 +126,12 @@ fn items_are_stored_absolute_and_add_or_drop_is_idempotent() {
     );
     f.fails(&["set", "add", "absent", "--skill", "x"], "not_found");
     // Sources are never created or written.
-    assert!(!f.path.join("skills").exists() && !f.path.join("notes").exists());
+    assert_eq!(fs::read_dir(f.path.join("skills")).unwrap().count(), 1);
+    assert_eq!(fs::read_dir(f.path.join("notes")).unwrap().count(), 1);
+    assert_eq!(
+        fs::read_to_string(f.path.join("notes/style.md")).unwrap(),
+        "# style"
+    );
 }
 
 #[test]
@@ -604,4 +612,118 @@ fn upstream_and_alias_receive_no_instructions_and_purge_unlinks_without_followin
         "# style.md"
     );
     assert_eq!(f.state()["links"], json!([]));
+}
+
+#[test]
+fn add_refuses_missing_or_wrong_type_sources_and_leaves_sets_unchanged() {
+    let f = Fixture::new();
+    f.ok(&["set", "create", "core"]);
+    let library = f.source("library", &["alpha"]);
+    fs::write(library.join("note.md"), "a note").unwrap();
+    let before = fs::read(f.root.join("sets.json")).unwrap();
+    let base = f.path.display().to_string();
+    let refused = |args: &[&str], path: &str| {
+        let mut full = vec!["set", "add", "core"];
+        full.extend_from_slice(args);
+        let out = f.fails(&full, "not_found");
+        let stderr = String::from_utf8_lossy(&out.stderr);
+        assert!(stderr.contains(&format!("{base}/{path}")), "{stderr}");
+    };
+    // Missing sources of every kind.
+    refused(&["--skill", "library/absent"], "library/absent");
+    refused(&["--skills-from", "nowhere"], "nowhere");
+    refused(&["--instruction", "notes/style.md"], "notes/style.md");
+    refused(&["--instructions-from", "notes"], "notes");
+    // Wrong types: skills and sources are directories, instructions regular files.
+    refused(&["--skill", "library/note.md"], "library/note.md");
+    refused(&["--skills-from", "library/note.md"], "library/note.md");
+    fs::create_dir(library.join("dir.md")).unwrap();
+    refused(&["--instruction", "library/dir.md"], "library/dir.md");
+    refused(
+        &["--instructions-from", "library/note.md"],
+        "library/note.md",
+    );
+    // A dangling symlink is missing too.
+    symlink(f.path.join("gone"), library.join("dangling")).unwrap();
+    refused(&["--skill", "library/dangling"], "library/dangling");
+    assert_eq!(fs::read(f.root.join("sets.json")).unwrap(), before);
+    // Existing sources are accepted, and dropping never requires the source.
+    f.ok(&["set", "add", "core", "--skill", "library/alpha"]);
+    f.ok(&["set", "add", "core", "--instruction", "library/note.md"]);
+    f.ok(&["set", "drop", "core", "--skill", "library/absent"]);
+    assert_eq!(f.sets()[0]["items"].as_array().unwrap().len(), 2);
+}
+
+#[test]
+fn launch_skips_vanished_sources_with_one_warning_and_drops_their_links() {
+    let f = Fixture::new();
+    let library = f.source("library", &["alpha"]);
+    let solo = f.source("solo", &["gamma", "delta"]);
+    let notes = fragments(&f, "notes", &["style.md"]);
+    f.ok(&["set", "create", "core", "--default"]);
+    f.ok(&["set", "create", "extra", "--default"]);
+    f.ok(&["set", "add", "core", "--skills-from", s(&library)]);
+    f.ok(&["set", "add", "core", "--skill", s(&solo.join("gamma"))]);
+    f.ok(&["set", "add", "extra", "--skill", s(&solo.join("delta"))]);
+    f.ok(&[
+        "set",
+        "add",
+        "extra",
+        "--instruction",
+        s(&notes.join("style.md")),
+    ]);
+    f.ok(&["add", "Work"]);
+    let profile = f.profile("Work");
+    // The delta skill vanishes before the first launch: no dangling link.
+    fs::remove_dir_all(solo.join("delta")).unwrap();
+    let out = f.ok(&["run", "Work"]);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    let delta = solo.join("delta");
+    assert_eq!(stderr.lines().count(), 1, "{stderr}");
+    assert!(
+        stderr.contains("extra") && stderr.contains(s(&delta)),
+        "{stderr}"
+    );
+    assert!(fs::symlink_metadata(profile.join("skills/delta")).is_err());
+    assert!(fs::read_link(profile.join("skills/alpha")).is_ok());
+    assert!(fs::read_link(profile.join("skills/gamma")).is_ok());
+    assert!(fs::read_link(profile.join("rules/style.md")).is_ok());
+    // Sources vanishing after their links exist: one warning per item, naming its
+    // set and path; the recorded links leave by normal recorded-link cleanup.
+    fs::remove_dir_all(&library).unwrap();
+    fs::remove_dir_all(solo.join("gamma")).unwrap();
+    // A source replaced by the wrong type counts as vanished too.
+    fs::remove_file(notes.join("style.md")).unwrap();
+    fs::create_dir(notes.join("style.md")).unwrap();
+    let out = f.ok(&["run", "Work"]);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert_eq!(stderr.lines().count(), 4, "{stderr}");
+    for (set, path) in [
+        ("core", library.clone()),
+        ("core", solo.join("gamma")),
+        ("extra", delta.clone()),
+        ("extra", notes.join("style.md")),
+    ] {
+        assert!(
+            stderr
+                .lines()
+                .any(|l| l.contains(&format!("set {set}")) && l.contains(s(&path))),
+            "{set} {}: {stderr}",
+            path.display()
+        );
+    }
+    for link in [
+        "skills/alpha",
+        "skills/gamma",
+        "skills/delta",
+        "rules/style.md",
+    ] {
+        assert!(fs::symlink_metadata(profile.join(link)).is_err(), "{link}");
+    }
+    assert_eq!(f.state()["links"], json!([]));
+    // Items stay in their sets; a restored source links again at the next launch.
+    assert_eq!(f.sets()[0]["items"].as_array().unwrap().len(), 2);
+    fs::create_dir(&delta).unwrap();
+    f.ok(&["run", "Work"]);
+    assert_eq!(fs::read_link(profile.join("skills/delta")).unwrap(), delta);
 }

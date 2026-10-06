@@ -86,16 +86,54 @@ fn linkable(name: &str, select: Select) -> bool {
         && (select == Select::Directories || name.ends_with(".md"))
 }
 
+/// Whether a linked item's source exists with the type its kind needs: skills and
+/// sources are directories, instruction fragments regular files. The source is
+/// user data that Claude reaches through the link, so (like listing a source) the
+/// check follows symlinks; a dangling link counts as missing. Only read, never
+/// written. Non-linked kinds (plugins) are not checked here.
+fn source_present(item: &Item) -> bool {
+    let Some(placement) = placement(item.kind) else {
+        return true;
+    };
+    let Ok(metadata) = std::fs::metadata(&item.value) else {
+        return false;
+    };
+    if item.kind == placement.explicit && placement.select == Select::Markdown {
+        metadata.is_file()
+    } else {
+        metadata.is_dir()
+    }
+}
+
+/// The source type [`source_present`] requires, for messages.
+fn source_type(kind: ItemKind) -> &'static str {
+    if kind == ItemKind::Instruction {
+        "a regular file"
+    } else {
+        "a directory"
+    }
+}
+
 /// One desired link: profile-relative path and absolute target.
 type Links = BTreeMap<PathBuf, BTreeSet<PathBuf>>;
 
-/// Expands one item into desired links (relative path → target). Unreadable
-/// sources yield nothing and a warning; sources are only listed, never written.
-fn expand(item: &Item, links: &mut Links, warnings: &mut Vec<String>) {
+/// Expands one item of `set` into desired links (relative path → target). A
+/// vanished (missing or wrong-type) or unreadable source yields nothing and one
+/// warning naming the set and path, so its recorded links leave by the normal
+/// cleanup of links no longer desired; sources are only listed, never written.
+fn expand(set: &str, item: &Item, links: &mut Links, warnings: &mut Vec<String>) {
     let Some(placement) = placement(item.kind) else {
         return;
     };
     let value = PathBuf::from(&item.value);
+    if !source_present(item) {
+        warnings.push(format!(
+            "Skipped {} from set {set}: missing or not {}",
+            value.display(),
+            source_type(item.kind)
+        ));
+        return;
+    }
     let mut push = |name: &str, target: PathBuf| {
         links
             .entry(Path::new(placement.directory).join(name))
@@ -114,7 +152,7 @@ fn expand(item: &Item, links: &mut Links, warnings: &mut Vec<String>) {
         Ok(entries) => entries,
         Err(error) => {
             warnings.push(format!(
-                "Skipped source {}: {}",
+                "Skipped {} from set {set}: {}",
                 value.display(),
                 error.kind()
             ));
@@ -157,8 +195,9 @@ fn validate_set_name(name: &str) -> Result<()> {
     store::validate_name(name).map_err(|_| Error::new("usage", format!("Invalid set name {name}")))
 }
 
-/// Items of every set `registration_id` subscribes to, in set order.
-fn subscribed<'a>(sets: &'a SetsFile, registration_id: &str) -> Vec<&'a Item> {
+/// Items of every set `registration_id` subscribes to, with their set's name, in
+/// set order.
+fn subscribed<'a>(sets: &'a SetsFile, registration_id: &str) -> Vec<(&'a str, &'a Item)> {
     sets.sets
         .iter()
         .filter(|set| {
@@ -166,7 +205,7 @@ fn subscribed<'a>(sets: &'a SetsFile, registration_id: &str) -> Vec<&'a Item> {
                 s.registration_id == registration_id && s.set.eq_ignore_ascii_case(&set.name)
             })
         })
-        .flat_map(|set| set.items.iter())
+        .flat_map(|set| set.items.iter().map(|item| (set.name.as_str(), item)))
         .collect()
 }
 
@@ -174,8 +213,8 @@ fn subscribed<'a>(sets: &'a SetsFile, registration_id: &str) -> Vec<&'a Item> {
 pub fn plugin_items(sets: &SetsFile, registration_id: &str) -> Vec<String> {
     let mut ids: Vec<String> = subscribed(sets, registration_id)
         .into_iter()
-        .filter(|i| i.kind == ItemKind::Plugin)
-        .map(|i| i.value.clone())
+        .filter(|(_, i)| i.kind == ItemKind::Plugin)
+        .map(|(_, i)| i.value.clone())
         .collect();
     ids.sort();
     ids.dedup();
@@ -195,8 +234,8 @@ pub(crate) fn conflicts(sets: &SetsFile, registration: &Registration) -> Vec<Str
     if registration.kind == Kind::Owned {
         let mut links = Links::new();
         let mut ignored = vec![];
-        for item in &items {
-            expand(item, &mut links, &mut ignored);
+        for (set, item) in &items {
+            expand(set, item, &mut links, &mut ignored);
         }
         for (path, targets) in &links {
             if targets.len() > 1 {
@@ -213,7 +252,7 @@ pub(crate) fn conflicts(sets: &SetsFile, registration: &Registration) -> Vec<Str
         }
     }
     let mut plugins: BTreeMap<&str, BTreeSet<&str>> = BTreeMap::new();
-    for item in items.iter().filter(|i| i.kind == ItemKind::Plugin) {
+    for (_, item) in items.iter().filter(|(_, i)| i.kind == ItemKind::Plugin) {
         if let Some((name, marketplace)) = item.value.split_once('@') {
             plugins.entry(name).or_default().insert(marketplace);
         }
@@ -426,6 +465,17 @@ pub fn command(action: SetAction, data: &mut Value) -> Result<Vec<String>> {
         SetAction::Add { set, item: args } => {
             validate_set_name(&set)?;
             let item = item(args)?;
+            if !source_present(&item) {
+                return Err(Error::new(
+                    "not_found",
+                    format!(
+                        "{} is missing or not {}",
+                        item.value,
+                        source_type(item.kind)
+                    ),
+                )
+                .next("Check the path, then add it again"));
+            }
             if item.kind == ItemKind::Plugin && !plugin_installed(&store, &item.value)? {
                 return Err(Error::new(
                     "not_found",
@@ -752,11 +802,11 @@ pub fn reconcile(store: &Store, registration: &Registration) -> Vec<String> {
         }
     };
     let mut links = Links::new();
-    for item in subscribed(&sets, &registration.registration_id)
+    for (set, item) in subscribed(&sets, &registration.registration_id)
         .into_iter()
-        .filter(|i| LINKED.contains(&i.kind))
+        .filter(|(_, i)| LINKED.contains(&i.kind))
     {
-        expand(item, &mut links, &mut warnings);
+        expand(set, item, &mut links, &mut warnings);
     }
     let mut desired = BTreeMap::new();
     for (path, targets) in links {
