@@ -20,6 +20,7 @@ Roost remembers which profile each project uses, shows profiles in a readable ta
 <!-- Closed tickets only: linked title and a one-line gist; detail lives in the ticket. -->
 
 - [Amend the specification for workflow UX](issues/01-amend-spec.md): spec amended and accepted, with a separate plugin store lock and Desktop-folder deletion on upstream remove.
+- [Raise the minimum Claude version to 2.1.280](issues/02-raise-claude-floor.md): floor raised for `CLAUDE_CODE_PLUGIN_DIRS`.
 - [Lay shared scaffolding for the workflow UX features](issues/10-shared-scaffold.md): table renderer, link helpers, reusable profile environment, side-file store API and `Launch` open mode.
 - [Render `roost ls` as a worktrunk-style table](issues/03-ls-table.md): aligned table with summary line and width fitting; `--full` runs parallel probes.
 - [Remember the selected profile per project and add `roost switch`](issues/04-selected-profile.md): per-repo selection with picker, bare `roost`, `switch`, last-use recording and `ls` markers.
