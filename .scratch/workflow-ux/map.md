@@ -25,6 +25,7 @@ Roost remembers which profile each project uses, shows profiles in a readable ta
 - [Remember the selected profile per project and add `roost switch`](issues/04-selected-profile.md): per-repo selection with picker, bare `roost`, `switch`, last-use recording and `ls` markers.
 - [Add shared sets with linked skills](issues/05-skill-sets.md): `set` commands, default and copied subscriptions, launch-time skill links in owned profiles.
 - [Share instruction fragments through sets](issues/11-shared-instructions.md): fragments linked into owned profiles' `rules/`; no import fallback needed.
+- [Build the plugin store and `roost plugin` commands](issues/07-plugin-store.md): account-less store via Claude's installer, injected on every launch path; JSON shapes verified against real Claude.
 - [Investigate injected plugin behavior](issues/06-injected-plugin-behavior.md): injection works as ADR 0001 assumes (`name@inline`, per-profile opt-out, config and data per profile); inject `installPath` from the store's `installed_plugins.json` at every launch; no claude.ai org marketplaces in the store; ADR accepted.
 
 ## Not yet specified
