@@ -457,6 +457,57 @@ fn a_fragment_reached_through_a_link_and_its_real_path_counts_once() {
 }
 
 #[test]
+fn a_launch_interrupted_between_record_and_rewrite_recovers_without_orphans() {
+    let f = Fixture::new();
+    let dir = f.fragments(
+        "settings",
+        &[(
+            "a.json",
+            json!({"outputStyle":"terse","hooks":{"Stop":[{"hooks":[hook("a")]}]}}),
+        )],
+    );
+    f.ok(&["set", "create", "core", "--default"]);
+    f.ok(&["set", "add", "core", "--settings-from", s(&dir)]);
+    f.ok(&["add", "Work"]);
+    f.ok(&["run", "Work"]);
+    // The fragment changes; a launch records its write ahead (old and new hooks,
+    // the old single value), replaces settings.json and is interrupted before
+    // saving the final record.
+    let mut state = f.state();
+    state["settings"][0]["hooks"]
+        .as_array_mut()
+        .unwrap()
+        .push(json!({"event":"Stop","handler":hook("b")}));
+    fs::write(
+        f.root.join("state.json"),
+        serde_json::to_vec_pretty(&state).unwrap(),
+    )
+    .unwrap();
+    fs::write(
+        dir.join("a.json"),
+        json!({"outputStyle":"verbose","hooks":{"Stop":[{"hooks":[hook("b")]}]}}).to_string(),
+    )
+    .unwrap();
+    f.write_settings(
+        "Work",
+        &json!({"outputStyle":"verbose","hooks":{"Stop":[{"hooks":[hook("b")]}]}}).to_string(),
+    );
+    assert_eq!(f.state(), state);
+    // The next launch adopts the values it would have written, without warning.
+    let stderr = f.stderr_of(&["run", "Work"]);
+    assert!(stderr.is_empty(), "{stderr}");
+    let id = f.registration_id("Work");
+    assert_eq!(
+        f.state()["settings"],
+        json!([{"registration_id":id,"hooks":[{"event":"Stop","handler":hook("b")}],"output_style":"verbose"}])
+    );
+    // So nothing Roost wrote is left behind once the set goes away.
+    f.ok(&["set", "unsubscribe", "Work", "core"]);
+    f.ok(&["run", "Work"]);
+    assert_eq!(f.settings("Work"), json!({}));
+}
+
+#[test]
 fn a_rewrite_keeps_the_file_mode_and_a_new_file_is_private() {
     use std::os::unix::fs::PermissionsExt;
     let f = Fixture::new();

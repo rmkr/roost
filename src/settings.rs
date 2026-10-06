@@ -742,7 +742,9 @@ fn apply_single(
                     settings.set(key, value.clone());
                     Some(wanted)
                 }
-                Some(current) if *current == wanted => recorded.filter(|r| **r == wanted).cloned(),
+                // Already the desired value: Roost's when it managed the key (also
+                // after a launch interrupted before recording its replacement).
+                Some(current) if *current == wanted => recorded.map(|_| wanted),
                 Some(current) if Some(current) == recorded => {
                     settings.set(key, value.clone());
                     Some(wanted)
@@ -835,29 +837,17 @@ fn write_temp(
     crate::platform::file_identity(&file)
 }
 
-/// Atomic compare-and-replace: writes `bytes` (or removes the file for `None`)
-/// only when `settings.json` is still exactly `before`. A replacement keeps the
-/// mode of the file it replaces; a new file is private (0600). Returns the new
-/// identity.
-fn replace(
-    profile: &Directory,
-    before: &Snapshot,
-    bytes: Option<&[u8]>,
-) -> Result<Option<FileIdentity>> {
-    let changed = || {
-        Error::new(
-            "unsafe_path",
-            "settings.json changed while Roost was updating it",
-        )
-    };
-    let Some(bytes) = bytes else {
-        if snapshot(profile)? != *before {
-            return Err(changed());
-        }
-        profile.remove(SETTINGS, false)?;
-        profile.sync()?;
-        return Ok(None);
-    };
+/// Atomic compare-and-replace: writes `bytes` only when `settings.json` is still
+/// exactly `before` (same identity and bytes, or still absent). A replacement
+/// keeps the mode of the file it replaces; a new file is private (0600). Returns
+/// the new identity.
+///
+/// The check and the rename are two system calls, so a writer that replaces
+/// `settings.json` in the window between them is overwritten. POSIX has no
+/// compare-and-rename to close it; the window is a few microseconds under the
+/// Roost lock, and Claude itself writes the file only while it runs, which is
+/// after this launch-time reconciliation.
+fn replace(profile: &Directory, before: &Snapshot, bytes: &[u8]) -> Result<FileIdentity> {
     let temp = format!(".roost-settings-{}.tmp", crate::platform::random_id()?);
     let identity = match write_temp(profile, &temp, bytes, before.as_ref().map(|b| b.mode)) {
         Ok(identity) => identity,
@@ -869,14 +859,18 @@ fn replace(
     let unchanged = snapshot(profile).is_ok_and(|now| now == *before);
     if !unchanged {
         let _ = profile.remove(&temp, false);
-        return Err(changed());
+        return Err(Error::new(
+            "unsafe_path",
+            "settings.json changed while Roost was updating it",
+        ));
     }
+    // Unavoidable window: see above.
     if let Err(error) = profile.rename(&temp, profile, SETTINGS) {
         let _ = profile.remove(&temp, false);
         return Err(error);
     }
     profile.sync()?;
-    Ok(Some(identity))
+    Ok(identity)
 }
 
 /// Launch-time reconciliation of shared settings into an owned active profile's
@@ -969,48 +963,61 @@ pub(crate) fn reconcile(store: &Store, registration: &Registration) -> Vec<Strin
             &mut warnings,
         ),
     };
-    let mut written = None;
-    if document != original {
-        let mut text = document.render();
-        // A new file ends with a newline like the ones Claude writes; an existing
-        // file keeps its own ending.
-        if before.as_ref().is_none_or(|b| b.bytes.ends_with(b"\n")) {
-            text.push('\n');
-        }
-        match replace(&profile, &before, Some(text.as_bytes())) {
-            Ok(identity) => {
-                written = identity.map(|identity| SettingsFile {
-                    identity,
-                    bytes: text.into_bytes(),
-                    mode: 0,
-                })
-            }
-            Err(error) => {
-                skipped(&mut warnings, &error.message);
-                return warnings;
-            }
-        }
-    }
-    if record != recorded
-        && let Err(error) = store.update_state(|state| {
+    let save = |record: &SettingsRecord| {
+        store.update_state(|state| {
             state.settings.retain(|r| &r.registration_id != id);
             if !record.is_empty() {
-                state.settings.push(record);
+                state.settings.push(record.clone());
             }
             Ok(())
         })
+    };
+    if document == original {
+        if record != recorded
+            && let Err(error) = save(&record)
+        {
+            warnings.push(format!(
+                "Shared settings records not saved: {}",
+                error.message
+            ));
+        }
+        return warnings;
+    }
+    // Write-ahead: record everything Roost owns before or after this write, so a
+    // launch interrupted at any point leaves only recorded Roost entries (removed
+    // or re-added at the next launch), never unrecorded ones.
+    let ahead = recorded.union(&record);
+    if ahead != recorded
+        && let Err(error) = save(&ahead)
+    {
+        skipped(&mut warnings, &error.message);
+        return warnings;
+    }
+    let mut text = document.render();
+    // A new file ends with a newline like the ones Claude writes; an existing
+    // file keeps its own ending.
+    if before.as_ref().is_none_or(|b| b.bytes.ends_with(b"\n")) {
+        text.push('\n');
+    }
+    if let Err(error) = replace(&profile, &before, text.as_bytes()) {
+        skipped(&mut warnings, &error.message);
+        if ahead != recorded
+            && let Err(error) = save(&recorded)
+        {
+            warnings.push(format!(
+                "Shared settings records not restored: {}",
+                error.message
+            ));
+        }
+        return warnings;
+    }
+    if record != ahead
+        && let Err(error) = save(&record)
     {
         warnings.push(format!(
-            "Shared settings records not saved: {}",
+            "Shared settings records not saved: {}; corrected at the next launch",
             error.message
         ));
-        // Unrecorded entries would become the profile's own; undo this launch's write.
-        if let Some(written) = written {
-            let restore = before.as_ref().map(|b| b.bytes.as_slice());
-            if replace(&profile, &Some(written), restore).is_err() {
-                warnings.push("settings.json keeps this launch's shared settings".into());
-            }
-        }
     }
     warnings
 }
@@ -1055,27 +1062,30 @@ mod tests {
         fs::write(&file, "{\"a\": 1}").unwrap();
         let before = snapshot(&profile).unwrap();
         fs::write(&file, "{\"a\": 2}").unwrap();
-        let error = replace(&profile, &before, Some(b"{}")).unwrap_err();
+        let error = replace(&profile, &before, b"{}").unwrap_err();
         assert!(error.message.contains("changed"), "{}", error.message);
         assert_eq!(fs::read_to_string(&file).unwrap(), "{\"a\": 2}");
         // Same content, but a different object (replaced by another writer).
         let before = snapshot(&profile).unwrap();
         fs::write(temp.0.join("other"), "{\"a\": 2}").unwrap();
         fs::rename(temp.0.join("other"), &file).unwrap();
-        assert!(replace(&profile, &before, Some(b"{}")).is_err());
+        assert!(replace(&profile, &before, b"{}").is_err());
         // Created after an absent read.
         fs::remove_file(&file).unwrap();
         let before = snapshot(&profile).unwrap();
         assert!(before.is_none());
         fs::write(&file, "{\"b\": 1}").unwrap();
-        assert!(replace(&profile, &before, Some(b"{}")).is_err());
+        assert!(replace(&profile, &before, b"{}").is_err());
         assert_eq!(fs::read_to_string(&file).unwrap(), "{\"b\": 1}");
         assert_eq!(temp.names(), [SETTINGS]);
         // Unchanged: replaced atomically by a new object.
         let before = snapshot(&profile).unwrap();
-        let identity = replace(&profile, &before, Some(b"{}")).unwrap();
+        let identity = replace(&profile, &before, b"{}").unwrap();
         assert_eq!(fs::read_to_string(&file).unwrap(), "{}");
-        assert_eq!(snapshot(&profile).unwrap().map(|s| s.identity), identity);
+        assert_eq!(
+            snapshot(&profile).unwrap().map(|s| s.identity),
+            Some(identity)
+        );
         assert_eq!(temp.names(), [SETTINGS]);
     }
 

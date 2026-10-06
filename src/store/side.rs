@@ -54,6 +54,28 @@ impl SettingsRecord {
     pub fn is_empty(&self) -> bool {
         self.hooks.is_empty() && self.status_line.is_none() && self.output_style.is_none()
     }
+    /// Everything either record owns: every hook of both, and each single-value
+    /// key's value from `self` when it has one, else from `other`.
+    pub fn union(&self, other: &Self) -> Self {
+        let mut hooks = self.hooks.clone();
+        for hook in &other.hooks {
+            if !hooks.contains(hook) {
+                hooks.push(hook.clone());
+            }
+        }
+        Self {
+            registration_id: self.registration_id.clone(),
+            hooks,
+            status_line: self
+                .status_line
+                .clone()
+                .or_else(|| other.status_line.clone()),
+            output_style: self
+                .output_style
+                .clone()
+                .or_else(|| other.output_style.clone()),
+        }
+    }
 }
 /// One hook handler Roost added under `hooks.<event>` in a group with `matcher`.
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
