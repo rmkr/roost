@@ -457,6 +457,34 @@ fn a_fragment_reached_through_a_link_and_its_real_path_counts_once() {
 }
 
 #[test]
+fn a_rewrite_keeps_the_file_mode_and_a_new_file_is_private() {
+    use std::os::unix::fs::PermissionsExt;
+    let f = Fixture::new();
+    let dir = f.fragments(
+        "settings",
+        &[("a.json", json!({"hooks":{"Stop":[{"hooks":[hook("a")]}]}}))],
+    );
+    f.ok(&["set", "create", "core", "--default"]);
+    f.ok(&["set", "add", "core", "--settings-from", s(&dir)]);
+    f.ok(&["add", "Work"]);
+    f.ok(&["add", "New"]);
+    let mode = |name: &str| {
+        fs::metadata(f.settings_path(name))
+            .unwrap()
+            .permissions()
+            .mode()
+            & 0o7777
+    };
+    f.write_settings("Work", "{}");
+    fs::set_permissions(f.settings_path("Work"), fs::Permissions::from_mode(0o644)).unwrap();
+    f.ok(&["run", "Work"]);
+    assert!(f.settings_text("Work").contains("hooks"));
+    assert_eq!(mode("Work"), 0o644);
+    f.ok(&["run", "New"]);
+    assert_eq!(mode("New"), 0o600);
+}
+
+#[test]
 fn rewrites_keep_number_text_exactly() {
     let f = Fixture::new();
     let numbers =

@@ -76,6 +76,21 @@ pub(crate) fn open_user_file(path: &Path, follow: bool) -> Result<File> {
     Ok(file)
 }
 
+/// An opened file's permission bits (`0o777`).
+pub(crate) fn file_mode(file: &File) -> Result<u32> {
+    Ok(file
+        .metadata()
+        .map_err(|_| Error::new("io", "Cannot inspect opened file mode"))?
+        .mode()
+        & 0o777)
+}
+
+/// Sets an opened file's permission bits (`0o777`).
+pub(crate) fn set_file_mode(file: &File, mode: u32) -> Result<()> {
+    fs::fchmod(file, Mode::from_raw_mode(mode & 0o777))
+        .map_err(|e| Error::new("io", format!("Cannot set file mode: {e}")))
+}
+
 pub(crate) fn copy_mode(file: &File) -> Result<u32> {
     let metadata = file
         .metadata()

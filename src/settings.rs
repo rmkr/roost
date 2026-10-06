@@ -760,8 +760,21 @@ fn apply_single(
     }
 }
 
-/// `settings.json` as read: identity and exact bytes.
-type Snapshot = Option<(FileIdentity, Vec<u8>)>;
+/// `settings.json` as read: identity, exact bytes and permission bits. Two
+/// snapshots are the same file when identity and bytes match.
+#[derive(Debug)]
+struct SettingsFile {
+    identity: FileIdentity,
+    bytes: Vec<u8>,
+    mode: u32,
+}
+impl PartialEq for SettingsFile {
+    fn eq(&self, other: &Self) -> bool {
+        self.identity == other.identity && self.bytes == other.bytes
+    }
+}
+/// `settings.json` as read, or `None` when absent.
+type Snapshot = Option<SettingsFile>;
 
 /// Reads `settings.json` without following links; a link or multiply linked file
 /// is refused (never edited).
@@ -777,6 +790,7 @@ fn snapshot(profile: &Directory) -> Result<Snapshot> {
     }
     let file = profile.open_file(SETTINGS, false, false)?;
     let identity = crate::platform::file_identity(&file)?;
+    let mode = crate::platform::file_mode(&file)?;
     if identity != entry.identity {
         return Err(Error::new(
             "unsafe_path",
@@ -794,11 +808,37 @@ fn snapshot(profile: &Directory) -> Result<Snapshot> {
             "settings.json is larger than 4 MiB",
         ));
     }
-    Ok(Some((identity, bytes)))
+    Ok(Some(SettingsFile {
+        identity,
+        bytes,
+        mode,
+    }))
+}
+
+/// Writes a new private temporary, then gives it `mode` (when replacing a file).
+fn write_temp(
+    profile: &Directory,
+    temp: &str,
+    bytes: &[u8],
+    mode: Option<u32>,
+) -> Result<FileIdentity> {
+    use std::io::Write;
+    let mut file = profile.create_file(temp, 0o600)?;
+    let path = profile.path.join(temp);
+    file.write_all(bytes)
+        .map_err(|e| Error::io("write settings", &path, e))?;
+    if let Some(mode) = mode {
+        crate::platform::set_file_mode(&file, mode)?;
+    }
+    file.sync_all()
+        .map_err(|e| Error::io("flush settings", &path, e))?;
+    crate::platform::file_identity(&file)
 }
 
 /// Atomic compare-and-replace: writes `bytes` (or removes the file for `None`)
-/// only when `settings.json` is still exactly `before`. Returns the new identity.
+/// only when `settings.json` is still exactly `before`. A replacement keeps the
+/// mode of the file it replaces; a new file is private (0600). Returns the new
+/// identity.
 fn replace(
     profile: &Directory,
     before: &Snapshot,
@@ -819,7 +859,13 @@ fn replace(
         return Ok(None);
     };
     let temp = format!(".roost-settings-{}.tmp", crate::platform::random_id()?);
-    let identity = profile.write_new(&temp, bytes, 0o600)?;
+    let identity = match write_temp(profile, &temp, bytes, before.as_ref().map(|b| b.mode)) {
+        Ok(identity) => identity,
+        Err(error) => {
+            let _ = profile.remove(&temp, false);
+            return Err(error);
+        }
+    };
     let unchanged = snapshot(profile).is_ok_and(|now| now == *before);
     if !unchanged {
         let _ = profile.remove(&temp, false);
@@ -887,7 +933,7 @@ pub(crate) fn reconcile(store: &Store, registration: &Registration) -> Vec<Strin
     };
     let original = match &before {
         None => Json::Object(vec![]),
-        Some((_, bytes)) => match Json::parse(bytes) {
+        Some(read) => match Json::parse(&read.bytes) {
             Ok(document @ Json::Object(_)) => document,
             Ok(_) => {
                 skipped(&mut warnings, "settings.json is not a JSON object");
@@ -928,11 +974,17 @@ pub(crate) fn reconcile(store: &Store, registration: &Registration) -> Vec<Strin
         let mut text = document.render();
         // A new file ends with a newline like the ones Claude writes; an existing
         // file keeps its own ending.
-        if before.as_ref().is_none_or(|(_, b)| b.ends_with(b"\n")) {
+        if before.as_ref().is_none_or(|b| b.bytes.ends_with(b"\n")) {
             text.push('\n');
         }
         match replace(&profile, &before, Some(text.as_bytes())) {
-            Ok(identity) => written = identity.map(|i| (i, text.into_bytes())),
+            Ok(identity) => {
+                written = identity.map(|identity| SettingsFile {
+                    identity,
+                    bytes: text.into_bytes(),
+                    mode: 0,
+                })
+            }
             Err(error) => {
                 skipped(&mut warnings, &error.message);
                 return warnings;
@@ -954,7 +1006,7 @@ pub(crate) fn reconcile(store: &Store, registration: &Registration) -> Vec<Strin
         ));
         // Unrecorded entries would become the profile's own; undo this launch's write.
         if let Some(written) = written {
-            let restore = before.as_ref().map(|(_, bytes)| bytes.as_slice());
+            let restore = before.as_ref().map(|b| b.bytes.as_slice());
             if replace(&profile, &Some(written), restore).is_err() {
                 warnings.push("settings.json keeps this launch's shared settings".into());
             }
@@ -1023,7 +1075,7 @@ mod tests {
         let before = snapshot(&profile).unwrap();
         let identity = replace(&profile, &before, Some(b"{}")).unwrap();
         assert_eq!(fs::read_to_string(&file).unwrap(), "{}");
-        assert_eq!(snapshot(&profile).unwrap().map(|s| s.0), identity);
+        assert_eq!(snapshot(&profile).unwrap().map(|s| s.identity), identity);
         assert_eq!(temp.names(), [SETTINGS]);
     }
 

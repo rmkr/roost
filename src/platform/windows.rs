@@ -80,6 +80,12 @@ pub fn file_identity(_: &File) -> Result<FileIdentity> {
 pub(crate) fn open_user_file(_: &Path, _: bool) -> Result<File> {
     Err(unavailable())
 }
+pub(crate) fn file_mode(_: &File) -> Result<u32> {
+    Err(unavailable())
+}
+pub(crate) fn set_file_mode(_: &File, _: u32) -> Result<()> {
+    Err(unavailable())
+}
 pub(crate) fn copy_mode(_: &File) -> Result<u32> {
     Err(unavailable())
 }
