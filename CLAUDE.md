@@ -20,6 +20,8 @@ cargo clippy --locked --all-targets -- -D warnings     # must be clean
 cargo fmt --all -- --check
 ```
 
+CI (`.github/workflows/ci.yml`) runs these three on Linux and macOS for every PR and push to `main`.
+
 `tests/cli.rs` is `#![cfg(unix)]`. Each test builds a disposable fixture (temp dir with private perms, fake `HOME`, `ROOST_DIR`, and a fake `claude` written in Python at `bin/claude`), so `/usr/bin/python3` is required. The fake is steered by `FAKE_CLAUDE_*` env vars (version, mode, exit code). Never test against a real Claude binary, account, credentials, or the user's real PATH/startup files. Some ownership checks require real uid metadata and fail inside sandboxes that remap owners (e.g. to uid 65534); don't weaken those checks to make tests pass.
 
 ## Architecture
