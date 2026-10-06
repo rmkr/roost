@@ -32,7 +32,6 @@ pub fn run(name: &str, foreground: bool) -> Result<i32> {
     let registration = store.find(name, false)?.clone();
     let mut env = launch::profile_env(&store, &registration, false)?;
     let program = launch::resolve_program("claude-desktop")?;
-    crate::plugins::at_launch(&store, &registration, &mut env);
     let host = linux::hostname();
     let others_running = |store: &Store, own: Option<&str>| {
         let roost = store
@@ -75,6 +74,7 @@ pub fn run(name: &str, foreground: bool) -> Result<i32> {
         if others_running(&store, Some(id)) {
             warnings.push(COWORK.to_owned());
         }
+        let plugins = crate::plugins::claim(&store, &registration, &env);
         if let Err(error) = store.update_state(|state| {
             record_launch(state, id);
             Ok(())
@@ -86,6 +86,7 @@ pub fn run(name: &str, foreground: bool) -> Result<i32> {
         }
         crate::sets::reconcile_at_launch(&store, &registration);
         drop(store);
+        plugins.finish(&mut env);
         let mut argument = std::ffi::OsString::from("--user-data-dir=");
         argument.push(folder.as_os_str());
         let mut command = env.command(program);

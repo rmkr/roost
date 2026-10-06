@@ -573,51 +573,92 @@ fn prune(store: &Directory, record: &Record) -> Vec<String> {
 // ---------------------------------------------------------------------------
 // Launch: auto-update and injection
 
-/// Launch preparation for `run` and profile launchers: the profile environment,
-/// then (isolated launches only) a due auto-update and plugin injection. Warnings
-/// go to stderr; none of them stops the launch. Callers release the Store after.
-pub fn prepare(
-    store: &Store,
-    registration: &Registration,
-    allow_auth_env: bool,
-) -> Result<Command> {
-    let mut env = launch::profile_env(store, registration, allow_auth_env)?;
-    let program = launch::resolve_program("claude")?;
-    at_launch(store, registration, &mut env);
-    Ok(env.command(program))
+/// Store-plugin work for one launch. [`claim`] captures it under the root lock
+/// (subscribed plugin IDs, the verified store handle and, when due, the claimed
+/// auto-update timestamp); [`LaunchPlugins::finish`] runs after the caller has
+/// released the root lock: the auto-update under the store lock only, then
+/// injection from the record as it is after that update (so the launch already
+/// gets updated versions). Nothing here stops the launch; warnings go to stderr.
+pub struct LaunchPlugins {
+    store: Option<Directory>,
+    root_id: String,
+    wanted: Vec<String>,
+    update: bool,
+    warnings: Vec<String>,
 }
 
-/// Runs a due auto-update and injects subscribed store plugins into `env` (no-op
-/// for default aliases), printing warnings to stderr.
-pub fn at_launch(store: &Store, registration: &Registration, env: &mut ProfileEnv) {
+/// Under the held root lock: what this launch needs from the plugin store. A
+/// default alias (not isolated) gets nothing. A due auto-update writes its new
+/// timestamp here, first, so concurrent launches skip it.
+pub fn claim(store: &Store, registration: &Registration, env: &ProfileEnv) -> LaunchPlugins {
+    let mut plugins = LaunchPlugins {
+        store: None,
+        root_id: store.root_id.clone(),
+        wanted: vec![],
+        update: false,
+        warnings: vec![],
+    };
     if !env.is_isolated() {
-        return;
+        return plugins;
     }
-    let mut warnings = auto_update(store);
-    warnings.extend(inject(store, registration, env));
-    for warning in warnings {
-        eprintln!("warning: {warning}");
-    }
-}
-
-/// Sets `CLAUDE_CODE_PLUGIN_DIRS` for the dependency closure of the registration's
-/// subscribed store plugins. Missing, orphaned or unsafe directories and duplicate
-/// manifest names are skipped with warnings; an unreadable record skips injection.
-fn inject(store: &Store, registration: &Registration, env: &mut ProfileEnv) -> Vec<String> {
-    let mut warnings = vec![];
     let sets = match store.read_sets() {
         Ok(sets) => sets,
         Err(error) => {
-            return vec![format!("Skipped store plugins: {}", error.message)];
+            plugins
+                .warnings
+                .push(format!("Skipped store plugins: {}", error.message));
+            return plugins;
         }
     };
-    let wanted = sets::plugin_items(&sets, &registration.registration_id);
-    if wanted.is_empty() {
-        return warnings;
+    plugins.wanted = sets::plugin_items(&sets, &registration.registration_id);
+    plugins.update = sets.plugin_auto_update && claim_update(store, &mut plugins.warnings);
+    if plugins.update || !plugins.wanted.is_empty() {
+        match store.plugin_store() {
+            Ok(directory) => plugins.store = directory,
+            Err(error) => {
+                plugins.warnings.push(format!(
+                    "Skipped store plugins: {}; launching without them",
+                    error.message
+                ));
+                plugins.update = false;
+                plugins.wanted.clear();
+            }
+        }
     }
-    let (directory, record) = match read_record(store) {
-        Ok(Some((directory, record))) => (Some(directory), record),
-        Ok(None) => (None, Record::empty(&store.root_id)),
+    plugins
+}
+
+impl LaunchPlugins {
+    /// After the root lock is released: a claimed auto-update, then injection
+    /// into `env`, printing warnings to stderr.
+    pub fn finish(self, env: &mut ProfileEnv) {
+        let mut warnings = self.warnings;
+        if self.update
+            && let Some(directory) = &self.store
+        {
+            warnings.extend(auto_update(directory, &self.root_id));
+        }
+        if !self.wanted.is_empty() {
+            warnings.extend(inject(self.store.as_ref(), &self.root_id, self.wanted, env));
+        }
+        for warning in warnings {
+            eprintln!("warning: {warning}");
+        }
+    }
+}
+
+/// Sets `CLAUDE_CODE_PLUGIN_DIRS` for the dependency closure of the `wanted`
+/// subscribed store plugins. Missing, orphaned or unsafe directories and duplicate
+/// manifest names are skipped with warnings; an unreadable record skips injection.
+fn inject(
+    directory: Option<&Directory>,
+    root_id: &str,
+    wanted: Vec<String>,
+    env: &mut ProfileEnv,
+) -> Vec<String> {
+    let mut warnings = vec![];
+    let record = match directory.map(|d| read_record_in(d, root_id)).transpose() {
+        Ok(record) => record.unwrap_or_else(|| Record::empty(root_id)),
         Err(error) => {
             return vec![format!(
                 "Skipped store plugins: {}; launching without them",
@@ -665,7 +706,6 @@ fn inject(store: &Store, registration: &Registration, env: &mut ProfileEnv) -> V
             continue;
         }
         let checked = directory
-            .as_ref()
             .ok_or_else(|| Error::new("not_found", "the plugin store does not exist"))
             .and_then(|store| open_install(store, &plugin.install_path))
             .and_then(|version| match version.entry(".orphaned_at")? {
@@ -686,45 +726,45 @@ fn inject(store: &Store, registration: &Registration, env: &mut ProfileEnv) -> V
     warnings
 }
 
-/// The opt-in daily update, under the held root lock: when due, record the new
-/// time first, then update only if the store lock is free, within 8 seconds,
-/// output discarded. Never fails the launch.
-fn auto_update(store: &Store) -> Vec<String> {
-    let Ok(sets) = store.read_sets() else {
-        return vec![];
-    };
-    if !sets.plugin_auto_update {
-        return vec![];
-    }
+/// Under the held root lock, with auto-update on: when the daily update is due,
+/// records the new time first (so concurrent launches skip) and returns true.
+fn claim_update(store: &Store, warnings: &mut Vec<String>) -> bool {
     let state = match store.read_state() {
         Ok(state) => state,
-        Err(error) => return vec![format!("Skipped plugin auto-update: {}", error.message)],
+        Err(error) => {
+            warnings.push(format!("Skipped plugin auto-update: {}", error.message));
+            return false;
+        }
     };
     let now = unix_seconds();
     if state
         .plugin_auto_update_at
         .is_some_and(|at| at <= now && now - at < AUTO_UPDATE_INTERVAL)
     {
-        return vec![];
+        return false;
     }
     if let Err(error) = store.update_state(|state| {
         state.plugin_auto_update_at = Some(now);
         Ok(())
     }) {
-        return vec![format!("Skipped plugin auto-update: {}", error.message)];
+        warnings.push(format!("Skipped plugin auto-update: {}", error.message));
+        return false;
     }
-    let directory = match store.plugin_store() {
-        Ok(Some(directory)) => directory,
-        Ok(None) => return vec![],
-        Err(error) => return vec![format!("Skipped plugin auto-update: {}", error.message)],
-    };
-    let _lock = match store_lock(&directory, false) {
+    true
+}
+
+/// The claimed daily update, after the root lock is released: only if the store
+/// lock is free (otherwise skip silently), `claude plugin update ID` per recorded
+/// plugin, then the record refresh and orphan prune, all under the store lock,
+/// within 8 seconds, output discarded. Never fails the launch.
+fn auto_update(directory: &Directory, root_id: &str) -> Vec<String> {
+    let _lock = match store_lock(directory, false) {
         Ok(Some(lock)) => lock,
         Ok(None) => return vec![],
         Err(error) => return vec![format!("Skipped plugin auto-update: {}", error.message)],
     };
     let result = (|| -> Result<Vec<String>> {
-        let record = read_record_in(&directory, &store.root_id)?;
+        let record = read_record_in(directory, root_id)?;
         if record.plugins.is_empty() {
             return Ok(vec![]);
         }
@@ -737,6 +777,7 @@ fn auto_update(store: &Store) -> Vec<String> {
                 .ok_or_else(|| Error::new("plugin_store", "it exceeded its 8-second deadline"))
         };
         for plugin in &record.plugins {
+            // Claude's CLI updates exactly one plugin per call.
             let mut command = store_command(&claude, &directory.path);
             command.args(["plugin", "update", &plugin.id]);
             let (_, exit) = launch::deadline_probe(command, "plugin_store", remaining()?)
@@ -748,8 +789,8 @@ fn auto_update(store: &Store) -> Vec<String> {
                 ));
             }
         }
-        let (record, mut warnings) = refresh(&claude, &directory, &store.root_id, remaining()?)?;
-        warnings.extend(prune(&directory, &record));
+        let (record, mut warnings) = refresh(&claude, directory, root_id, remaining()?)?;
+        warnings.extend(prune(directory, &record));
         Ok(warnings)
     })();
     match result {

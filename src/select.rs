@@ -183,19 +183,25 @@ fn record_selection(store: &Store, project: &Path, registration: &Registration) 
     })
 }
 
-/// Prepares, records last use, reconciles links, releases the lock and hands off.
-fn start(
+/// The launch sequence shared by `run`, profile launchers, `switch` and bare
+/// `roost`: under the held root lock, prepare the profile environment, claim store
+/// plugin work, record last use and reconcile links; then release the lock, finish
+/// the plugin work (auto-update, injection) and hand off to Claude.
+pub(crate) fn start(
     store: Store,
     registration: &Registration,
     allow_auth_env: bool,
     arguments: &[OsString],
 ) -> Result<Outcome> {
-    let command = crate::plugins::prepare(&store, registration, allow_auth_env)?;
+    let mut env = launch::profile_env(&store, registration, allow_auth_env)?;
+    let program = launch::resolve_program("claude")?;
+    let plugins = crate::plugins::claim(&store, registration, &env);
     launched(&store, registration);
     sets::reconcile_at_launch(&store, registration);
     drop(store);
+    plugins.finish(&mut env);
     Ok(Outcome {
-        exit: launch::execute(command, arguments)?,
+        exit: launch::execute(env.command(program), arguments)?,
         ..Outcome::quiet()
     })
 }

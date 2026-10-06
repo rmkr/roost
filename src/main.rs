@@ -302,15 +302,8 @@ fn dispatch(action: Action, data: &mut Value) -> Result<Outcome> {
             arguments,
         } => {
             let store = open(&platform::root()?, OpenMode::Launch)?;
-            let reg = store.find(&name, false)?;
-            let command = plugins::prepare(&store, reg, allow_auth_env)?;
-            select::launched(&store, reg);
-            sets::reconcile_at_launch(&store, reg);
-            drop(store);
-            Ok(Outcome {
-                exit: launch::execute(command, &arguments)?,
-                ..Outcome::quiet()
-            })
+            let reg = store.find(&name, false)?.clone();
+            select::start(store, &reg, allow_auth_env, &arguments)
         }
         Action::Internal {
             root,
@@ -355,14 +348,8 @@ fn dispatch(action: Action, data: &mut Value) -> Result<Outcome> {
                     )),
                 );
             }
-            let command = plugins::prepare(&store, reg, false)?;
-            select::launched(&store, reg);
-            sets::reconcile_at_launch(&store, reg);
-            drop(store);
-            Ok(Outcome {
-                exit: launch::execute(command, &arguments)?,
-                ..Outcome::quiet()
-            })
+            let reg = reg.clone();
+            select::start(store, &reg, false, &arguments)
         }
         Action::Status {
             name,

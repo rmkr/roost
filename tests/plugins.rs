@@ -728,7 +728,11 @@ fn daily_auto_update_runs_once_per_window_and_never_blocks_the_launch() {
         .find(|c| c["arguments"] == json!(["plugin", "update", "lint@tools"]))
         .unwrap();
     assert_eq!(update["store_lock_held"], true);
+    assert_eq!(update["root_lock_held"], false);
     assert_eq!(update["stdin_tty"], false);
+    // The record refresh after it also runs without the root lock.
+    let refresh = calls.iter().find(|c| c["arguments"][1] == "list").unwrap();
+    assert_eq!(refresh["root_lock_held"], false);
     assert_eq!(
         parsed(&out)["env"]["CLAUDE_CODE_PLUGIN_DIRS"],
         s(&f.cache("lint@tools", "v2"))
