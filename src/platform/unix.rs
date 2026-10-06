@@ -232,6 +232,55 @@ impl Directory {
         self.child(name, true)
     }
 
+    /// Creates `name` as a symbolic link to the absolute `target`, relative to this
+    /// verified handle. Never replaces an existing entry; returns the link's own identity.
+    #[allow(dead_code, reason = "shared scaffold for set links (05) and Desktop (09)")]
+    pub fn symlink(&self, target: &Path, name: &str) -> Result<FileIdentity> {
+        valid_name(name)?;
+        let text = target
+            .to_str()
+            .ok_or_else(|| Error::new("unsafe_path", "Link target is not Unicode"))?;
+        if !target.is_absolute() || text.contains(['\r', '\n', '\0']) {
+            return Err(Error::new(
+                "unsafe_path",
+                "Link target must be an absolute path without line breaks",
+            ));
+        }
+        self.verify_namespace()?;
+        let path = self.path.join(name);
+        fs::symlinkat(target, &self.file, name)
+            .map_err(|e| native_error("create link", &path, e))?;
+        match self.entry(name)? {
+            Some(entry) if entry.is_link => Ok(entry.identity),
+            _ => Err(Error::new(
+                "unsafe_path",
+                format!("Link changed after creation: {}", path.display()),
+            )),
+        }
+    }
+
+    /// Reads the text of the link `name` without following it. `None` when absent;
+    /// any other object type is unsafe_path.
+    #[allow(dead_code, reason = "shared scaffold for set links (05) and Desktop (09)")]
+    pub fn read_link(&self, name: &str) -> Result<Option<PathBuf>> {
+        valid_name(name)?;
+        let path = self.path.join(name);
+        match fs::readlinkat(&self.file, name, Vec::new()) {
+            Ok(text) => {
+                use std::os::unix::ffi::OsStringExt;
+                Ok(Some(PathBuf::from(std::ffi::OsString::from_vec(
+                    text.into_bytes(),
+                ))))
+            }
+            Err(error) if error == rustix::io::Errno::NOENT => Ok(None),
+            Err(error) if error == rustix::io::Errno::INVAL => Err(Error::new(
+                "unsafe_path",
+                format!("Not a link: {}", path.display()),
+            )),
+            Err(error) => Err(native_error("read link", &path, error)),
+        }
+    }
+
     pub fn open_file(&self, name: &str, private: bool, write: bool) -> Result<File> {
         valid_name(name)?;
         let path = self.path.join(name);
@@ -674,6 +723,37 @@ mod tests {
                 & 0o777,
             0o700
         );
+        std::fs::remove_dir_all(path).unwrap();
+    }
+
+    #[test]
+    fn symlinks_are_created_and_read_relative_to_the_handle_without_following() {
+        let path = std::env::temp_dir().join(format!(
+            "roost-symlink-{}",
+            super::super::random_id().unwrap()
+        ));
+        let fixture = Directory::create(&path).unwrap();
+        let skills = fixture.create_dir("skills").unwrap();
+        let target = Path::new("/nonexistent/skill-source/tdd");
+        let identity = skills.symlink(target, "tdd").unwrap();
+        let entry = skills.entry("tdd").unwrap().unwrap();
+        assert!(entry.is_link);
+        assert_eq!(entry.identity, identity);
+        assert_eq!(skills.read_link("tdd").unwrap().as_deref(), Some(target));
+        assert_eq!(skills.read_link("absent").unwrap(), None);
+        // Existing entries are never replaced and regular files are not links.
+        assert_eq!(
+            skills.symlink(Path::new("/elsewhere"), "tdd").err().unwrap().code,
+            "collision"
+        );
+        skills.write_new("plain", b"x", 0o600).unwrap();
+        assert_eq!(skills.read_link("plain").err().unwrap().code, "unsafe_path");
+        assert!(skills.symlink(Path::new("relative"), "rel").is_err());
+        assert!(skills.symlink(Path::new("/a\nb"), "nl").is_err());
+        assert!(skills.symlink(target, "../escape").is_err());
+        // A link standing in for the parent directory is never traversed.
+        std::os::unix::fs::symlink(&skills.path, fixture.path.join("redirect")).unwrap();
+        assert!(fixture.child("redirect", false).is_err());
         std::fs::remove_dir_all(path).unwrap();
     }
 

@@ -38,6 +38,12 @@ impl Directory {
     pub fn create_dir(&self, _: &str) -> Result<Self> {
         Err(unavailable())
     }
+    pub fn symlink(&self, _: &Path, _: &str) -> Result<FileIdentity> {
+        Err(unavailable())
+    }
+    pub fn read_link(&self, _: &str) -> Result<Option<PathBuf>> {
+        Err(unavailable())
+    }
     pub fn open_file(&self, _: &str, _: bool, _: bool) -> Result<File> {
         Err(unavailable())
     }
