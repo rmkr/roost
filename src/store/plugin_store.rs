@@ -255,8 +255,7 @@ mod tests {
         assert!(!f.root.join(PLUGIN_STORE).exists());
         drop(read);
         fs::create_dir(f.root.join(PLUGIN_STORE)).unwrap();
-        fs::set_permissions(f.root.join(PLUGIN_STORE), fs::Permissions::from_mode(0o700))
-            .unwrap();
+        fs::set_permissions(f.root.join(PLUGIN_STORE), fs::Permissions::from_mode(0o700)).unwrap();
         let mut store = f.open(OpenMode::Mutate).unwrap();
         assert_eq!(store.plugin_store().err().unwrap().code, "ownership");
         assert_eq!(store.ensure_plugin_store().err().unwrap().code, "ownership");

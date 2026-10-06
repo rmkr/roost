@@ -210,7 +210,12 @@ impl Session {
         let status = store_command(&self.claude, &self.store.path)
             .args(args)
             .status()
-            .map_err(|_| Error::new("plugin_store", "Could not start Claude for the plugin store"))?;
+            .map_err(|_| {
+                Error::new(
+                    "plugin_store",
+                    "Could not start Claude for the plugin store",
+                )
+            })?;
         if !status.success() {
             return Err(Error::new(
                 "plugin_store",
@@ -255,7 +260,10 @@ fn listing(claude: &Path, store: &Path, available: bool, timeout: Duration) -> R
 
 /// Installed rows `(id, installPath, version)` of a listing: a JSON array, or the
 /// `installed` array of an `--available` listing. Only well-formed fields are used.
-fn installed_rows(listing: &Value, user_scope_only: bool) -> Vec<(String, PathBuf, Option<String>)> {
+fn installed_rows(
+    listing: &Value,
+    user_scope_only: bool,
+) -> Vec<(String, PathBuf, Option<String>)> {
     let rows = listing
         .as_array()
         .or_else(|| listing["installed"].as_array());
@@ -308,7 +316,10 @@ fn open_install(store: &Directory, path: &Path) -> Result<Directory> {
     let unsafe_path = || {
         Error::new(
             "unsafe_path",
-            format!("{} is not a plugin directory inside the store cache", path.display()),
+            format!(
+                "{} is not a plugin directory inside the store cache",
+                path.display()
+            ),
         )
     };
     let text = path.to_str().ok_or_else(unsafe_path)?;
@@ -382,7 +393,10 @@ fn refresh(
         let directory = match open_install(store, path) {
             Ok(directory) => directory,
             Err(error) => {
-                warnings.push(format!("Store plugin {id} was not recorded: {}", error.message));
+                warnings.push(format!(
+                    "Store plugin {id} was not recorded: {}",
+                    error.message
+                ));
                 continue;
             }
         };
@@ -418,7 +432,9 @@ fn write_record(store: &Directory, record: &Record) -> Result<()> {
         .map_err(|_| Error::new("io", "Could not encode the plugin store record"))?;
     for name in store.entries()? {
         if name.starts_with(RECORD_TEMP) && name.ends_with(".tmp") {
-            let _ = store.open_file(&name, true, false).and_then(|_| store.remove(&name, false));
+            let _ = store
+                .open_file(&name, true, false)
+                .and_then(|_| store.remove(&name, false));
         }
     }
     let temp = format!("{RECORD_TEMP}{}.tmp", platform::random_id()?);
@@ -429,7 +445,10 @@ fn write_record(store: &Directory, record: &Record) -> Result<()> {
         let _ = store.remove(&temp, false);
         return Err(Error::new(
             "unsafe_path",
-            format!("Unsafe plugin store record {}", store.path.join(RECORD).display()),
+            format!(
+                "Unsafe plugin store record {}",
+                store.path.join(RECORD).display()
+            ),
         ));
     }
     if let Err(error) = store.rename(&temp, store, RECORD) {
@@ -445,8 +464,11 @@ fn read_record_in(store: &Directory, root_id: &str) -> Result<Record> {
         return Ok(Record::empty(root_id));
     };
     let record: Record = serde_json::from_slice(&bytes).map_err(|_| {
-        Error::new("plugin_store", "The plugin store record is malformed or unsupported")
-            .next("Run roost plugin update to rebuild it")
+        Error::new(
+            "plugin_store",
+            "The plugin store record is malformed or unsupported",
+        )
+        .next("Run roost plugin update to rebuild it")
     })?;
     if record.schema_version != 1 || record.root_id != root_id {
         return Err(Error::new(
@@ -490,7 +512,9 @@ fn prune(store: &Directory, record: &Record) -> Vec<String> {
     else {
         return warnings;
     };
-    let now_ms = now().duration_since(UNIX_EPOCH).map_or(0, |d| d.as_millis());
+    let now_ms = now()
+        .duration_since(UNIX_EPOCH)
+        .map_or(0, |d| d.as_millis());
     let directories = |parent: &Directory| -> Vec<(String, Directory)> {
         parent
             .entries()
@@ -521,16 +545,17 @@ fn prune(store: &Directory, record: &Record) -> Vec<String> {
                 {
                     continue;
                 }
-                let still = plugin
-                    .entry(&name)
-                    .ok()
-                    .flatten()
-                    .is_some_and(|e| !e.is_link && e.is_dir && Some(e.identity) == version.identity().ok());
+                let still = plugin.entry(&name).ok().flatten().is_some_and(|e| {
+                    !e.is_link && e.is_dir && Some(e.identity) == version.identity().ok()
+                });
                 let result = if still {
                     std::fs::remove_dir_all(&version.path)
                         .map_err(|e| Error::io("remove orphaned plugin version", &version.path, e))
                 } else {
-                    Err(Error::new("unsafe_path", "Orphaned version changed before removal"))
+                    Err(Error::new(
+                        "unsafe_path",
+                        "Orphaned version changed before removal",
+                    ))
                 };
                 if let Err(error) = result {
                     warnings.push(format!(
@@ -551,7 +576,11 @@ fn prune(store: &Directory, record: &Record) -> Vec<String> {
 /// Launch preparation for `run` and profile launchers: the profile environment,
 /// then (isolated launches only) a due auto-update and plugin injection. Warnings
 /// go to stderr; none of them stops the launch. Callers release the Store after.
-pub fn prepare(store: &Store, registration: &Registration, allow_auth_env: bool) -> Result<Command> {
+pub fn prepare(
+    store: &Store,
+    registration: &Registration,
+    allow_auth_env: bool,
+) -> Result<Command> {
     let mut env = launch::profile_env(store, registration, allow_auth_env)?;
     let program = launch::resolve_program("claude")?;
     at_launch(store, registration, &mut env);
@@ -793,7 +822,10 @@ pub fn shadow_findings(jobs: Vec<ShadowJob>) -> Vec<Value> {
             .and_then(|(stdout, _)| serde_json::from_slice::<Value>(&stdout).ok());
         let Some(listing) = listing else {
             findings.push(finding(
-                format!("Could not check {} for natively installed store plugins", job.profile),
+                format!(
+                    "Could not check {} for natively installed store plugins",
+                    job.profile
+                ),
                 &job.directory,
                 None,
             ));
@@ -835,7 +867,10 @@ pub fn command(action: PluginAction, data: &mut Value) -> Result<(Vec<String>, V
                 &["plugin", "marketplace", "add", &source],
                 &format!("roost plugin marketplace add {source}"),
             )?;
-            Ok((vec![format!("Added marketplace {source} to the plugin store")], vec![]))
+            Ok((
+                vec![format!("Added marketplace {source} to the plugin store")],
+                vec![],
+            ))
         }
         PluginAction::Add {
             plugin,
@@ -851,7 +886,8 @@ pub fn command(action: PluginAction, data: &mut Value) -> Result<(Vec<String>, V
             })?;
             Ok((
                 vec![if on {
-                    "Plugin auto-update is on: launches update store plugins at most once a day".into()
+                    "Plugin auto-update is on: launches update store plugins at most once a day"
+                        .into()
                 } else {
                     "Plugin auto-update is off".into()
                 }],
@@ -870,7 +906,10 @@ fn list(root: &Path, data: &mut Value) -> Result<(Vec<String>, Vec<String>)> {
                 && std::fs::symlink_metadata(root)
                     .is_err_and(|e| e.kind() == std::io::ErrorKind::NotFound) =>
         {
-            return Ok((vec!["No store plugins; install one with roost plugin add PLUGIN".into()], vec![]));
+            return Ok((
+                vec!["No store plugins; install one with roost plugin add PLUGIN".into()],
+                vec![],
+            ));
         }
         Err(e) => return Err(e),
     };
@@ -880,7 +919,10 @@ fn list(root: &Path, data: &mut Value) -> Result<(Vec<String>, Vec<String>)> {
     let record = match read_record(&store) {
         Ok(found) => found.map(|(_, r)| r),
         Err(error) => {
-            warnings.push(format!("Plugin store record unavailable: {}", error.message));
+            warnings.push(format!(
+                "Plugin store record unavailable: {}",
+                error.message
+            ));
             None
         }
     };
@@ -901,7 +943,11 @@ fn list(root: &Path, data: &mut Value) -> Result<(Vec<String>, Vec<String>)> {
             let mut names: Vec<String> = sets
                 .sets
                 .iter()
-                .filter(|s| s.items.iter().any(|i| i.kind == ItemKind::Plugin && i.value == id))
+                .filter(|s| {
+                    s.items
+                        .iter()
+                        .any(|i| i.kind == ItemKind::Plugin && i.value == id)
+                })
                 .map(|s| s.name.clone())
                 .collect();
             names.sort_by_key(|n| (n.to_ascii_lowercase(), n.clone()));
@@ -947,7 +993,8 @@ fn list(root: &Path, data: &mut Value) -> Result<(Vec<String>, Vec<String>)> {
         .into_iter()
         .map(|p| json!({"id":p["id"],"sets":p["sets"]}))
         .collect();
-    *data = json!({"auto_update":sets.plugin_auto_update,"last_auto_update":last,"plugins":plugins});
+    *data =
+        json!({"auto_update":sets.plugin_auto_update,"last_auto_update":last,"plugins":plugins});
     Ok((lines, warnings))
 }
 
@@ -961,7 +1008,12 @@ fn choose_sets(root: &Path, named: Vec<String>, no_set: bool) -> Result<Vec<Stri
         return Ok(named);
     }
     let available: Vec<String> = match Store::open(root, false, OpenMode::Read) {
-        Ok(store) => store.read_sets()?.sets.into_iter().map(|s| s.name).collect(),
+        Ok(store) => store
+            .read_sets()?
+            .sets
+            .into_iter()
+            .map(|s| s.name)
+            .collect(),
         Err(e) if e.code == "not_found" => vec![],
         Err(e) => return Err(e),
     };
@@ -997,7 +1049,12 @@ fn choose_sets(root: &Path, named: Vec<String>, no_set: bool) -> Result<Vec<Stri
 
 /// Checks that every set exists and that adding `item` to them keeps each
 /// subscriber free of conflicts. Returns the stored set names.
-fn check_sets(store: &Store, sets: &SetsFile, chosen: &[String], item: &Item) -> Result<Vec<String>> {
+fn check_sets(
+    store: &Store,
+    sets: &SetsFile,
+    chosen: &[String],
+    item: &Item,
+) -> Result<Vec<String>> {
     let mut simulated = sets.clone();
     let mut names = vec![];
     for set in chosen {
@@ -1032,7 +1089,12 @@ fn check_sets(store: &Store, sets: &SetsFile, chosen: &[String], item: &Item) ->
     Ok(names)
 }
 
-fn add(root: &Path, plugin: &str, named: Vec<String>, no_set: bool) -> Result<(Vec<String>, Vec<String>)> {
+fn add(
+    root: &Path,
+    plugin: &str,
+    named: Vec<String>,
+    no_set: bool,
+) -> Result<(Vec<String>, Vec<String>)> {
     let (name, marketplace) = parse_id(plugin)?;
     let chosen = choose_sets(root, named, no_set)?;
     let session = Session::open(root)?;
@@ -1041,7 +1103,11 @@ fn add(root: &Path, plugin: &str, named: Vec<String>, no_set: bool) -> Result<(V
         None => {
             let listing = session.listing(true, Duration::from_secs(10))?;
             let mut candidates: BTreeSet<String> = available_ids(&listing).into_iter().collect();
-            candidates.extend(installed_rows(&listing, true).into_iter().map(|(id, _, _)| id));
+            candidates.extend(
+                installed_rows(&listing, true)
+                    .into_iter()
+                    .map(|(id, _, _)| id),
+            );
             candidates.retain(|id| plugin_name(id) == name);
             match candidates.len() {
                 1 => candidates.pop_first().unwrap(),
@@ -1123,13 +1189,19 @@ fn resolve_known(known: &BTreeSet<String>, plugin: &str) -> Result<String> {
     let matches: Vec<&String> = known.iter().filter(|id| plugin_name(id) == name).collect();
     match matches.as_slice() {
         [id] => Ok((*id).clone()),
-        [] => Err(Error::new("not_found", format!("No store plugin named {name}"))
-            .next("List store plugins with roost plugin list")),
+        [] => Err(
+            Error::new("not_found", format!("No store plugin named {name}"))
+                .next("List store plugins with roost plugin list"),
+        ),
         _ => Err(Error::new(
             "not_found",
             format!(
                 "{name} is ambiguous: {}",
-                matches.iter().map(|s| s.as_str()).collect::<Vec<_>>().join(", ")
+                matches
+                    .iter()
+                    .map(|s| s.as_str())
+                    .collect::<Vec<_>>()
+                    .join(", ")
             ),
         )
         .next(format!("Name one as {name}@MARKETPLACE"))),
@@ -1147,8 +1219,11 @@ fn update(root: &Path, plugin: Option<&str>) -> Result<(Vec<String>, Vec<String>
         Some(plugin) => {
             let id = resolve_known(&known, plugin)?;
             if !known.contains(&id) {
-                return Err(Error::new("not_found", format!("{id} is not installed in the plugin store"))
-                    .next(format!("roost plugin add {id}")));
+                return Err(Error::new(
+                    "not_found",
+                    format!("{id} is not installed in the plugin store"),
+                )
+                .next(format!("roost plugin add {id}")));
             }
             vec![id]
         }
@@ -1171,7 +1246,10 @@ fn update(root: &Path, plugin: Option<&str>) -> Result<(Vec<String>, Vec<String>
     let (record, mut warnings) = session.refresh(Duration::from_secs(10))?;
     warnings.extend(prune(&session.store, &record));
     Ok((
-        vec![format!("Updated {}; profiles pick it up at their next launch", ids.join(", "))],
+        vec![format!(
+            "Updated {}; profiles pick it up at their next launch",
+            ids.join(", ")
+        )],
         warnings,
     ))
 }
@@ -1211,7 +1289,10 @@ fn remove(root: &Path, plugin: &str) -> Result<(Vec<String>, Vec<String>)> {
         return Ok((lines, vec![]));
     }
     let session = Session::open(root)?;
-    session.run(&["plugin", "uninstall", &id], &format!("roost plugin remove {id}"))?;
+    session.run(
+        &["plugin", "uninstall", &id],
+        &format!("roost plugin remove {id}"),
+    )?;
     let (_, warnings) = session.refresh(Duration::from_secs(10))?;
     lines.push(format!(
         "Uninstalled {id} from the plugin store; profiles lose it at their next launch"

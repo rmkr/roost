@@ -485,10 +485,7 @@ fn capture(
                 return Err(Error::cancelled());
             }
             if Instant::now() >= deadline {
-                return Err(Error::new(
-                    code,
-                    "Claude probe exceeded its deadline",
-                ));
+                return Err(Error::new(code, "Claude probe exceeded its deadline"));
             }
             // Fairly service both pipes; neither stream waits for EOF on the other.
             if !stdout_done
