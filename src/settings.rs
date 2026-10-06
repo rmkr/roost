@@ -27,7 +27,7 @@ use std::{
 };
 
 /// Largest fragment or `settings.json` Roost reads.
-const LIMIT: usize = 4 * 1024 * 1024;
+const MAX_READ_BYTES: usize = 4 * 1024 * 1024;
 const SETTINGS: &str = "settings.json";
 const HOOKS: &str = "hooks";
 const STATUS_LINE: &str = "statusLine";
@@ -380,10 +380,19 @@ fn hooks(value: &Json) -> std::result::Result<Vec<Hook>, String> {
     Ok(found)
 }
 
-/// Reads and validates one fragment file (following links: the user manages it).
-fn read_fragment(path: &Path) -> std::result::Result<Fragment, String> {
-    let bytes = std::fs::read(path).map_err(|e| e.kind().to_string())?;
-    if bytes.len() > LIMIT {
+/// Reads and validates one fragment file. An explicit `--setting` path may be a
+/// link (the user manages it) and is followed; a source's children are opened
+/// without following. Only a regular file is read, through a non-blocking open
+/// and at most [`MAX_READ_BYTES`] + 1 bytes, so a FIFO or device swapped in is
+/// refused instead of hanging the launch or filling memory.
+fn read_fragment(path: &Path, follow: bool) -> std::result::Result<Fragment, String> {
+    use std::io::Read;
+    let file = crate::platform::open_user_file(path, follow).map_err(|e| e.message)?;
+    let mut bytes = vec![];
+    file.take(MAX_READ_BYTES as u64 + 1)
+        .read_to_end(&mut bytes)
+        .map_err(|e| e.kind().to_string())?;
+    if bytes.len() > MAX_READ_BYTES {
         return Err("larger than 4 MiB".into());
     }
     fragment(&bytes)
@@ -428,7 +437,7 @@ pub(crate) fn validate(item: &Item) -> Result<()> {
         Error::new("not_found", format!("Cannot list {}: {reason}", item.value))
     })?;
     for path in paths {
-        read_fragment(&path).map_err(|reason| {
+        read_fragment(&path, item.kind == ItemKind::Setting).map_err(|reason| {
             Error::new(
                 "usage",
                 format!(
@@ -499,7 +508,7 @@ fn subscribed_fragments(
             if found.iter().any(|(p, _)| *p == path) {
                 continue;
             }
-            match read_fragment(&path) {
+            match read_fragment(&path, !directory) {
                 Ok(fragment) => found.push((path, fragment)),
                 Err(reason) => warn(format!(
                     "Skipped settings fragment {} from set {set}: {reason}",
@@ -768,10 +777,10 @@ fn snapshot(profile: &Directory) -> Result<Snapshot> {
     }
     let mut bytes = vec![];
     use std::io::Read;
-    file.take(LIMIT as u64 + 1)
+    file.take(MAX_READ_BYTES as u64 + 1)
         .read_to_end(&mut bytes)
         .map_err(|e| Error::io("read settings", &profile.path.join(SETTINGS), e))?;
-    if bytes.len() > LIMIT {
+    if bytes.len() > MAX_READ_BYTES {
         return Err(Error::new(
             "unsafe_path",
             "settings.json is larger than 4 MiB",
@@ -1008,6 +1017,40 @@ mod tests {
         assert_eq!(fs::read_to_string(&file).unwrap(), "{}");
         assert_eq!(snapshot(&profile).unwrap().map(|s| s.0), identity);
         assert_eq!(temp.names(), [SETTINGS]);
+    }
+
+    /// Runs `read_fragment` on another thread, failing instead of hanging.
+    fn read_within_a_second(path: PathBuf) -> std::result::Result<Fragment, String> {
+        let (send, receive) = std::sync::mpsc::channel();
+        std::thread::spawn(move || drop(send.send(read_fragment(&path, true))));
+        receive
+            .recv_timeout(std::time::Duration::from_secs(1))
+            .expect("fragment read must not hang")
+    }
+
+    #[test]
+    fn fragment_reads_refuse_fifos_and_devices_without_hanging() {
+        let temp = Temp::new();
+        let fifo = temp.0.join("fifo.json");
+        let status = std::process::Command::new("mkfifo")
+            .arg(&fifo)
+            .status()
+            .unwrap();
+        assert!(status.success());
+        let link = temp.0.join("link.json");
+        std::os::unix::fs::symlink(&fifo, &link).unwrap();
+        for path in [fifo, link, PathBuf::from("/dev/zero")] {
+            let error = read_within_a_second(path.clone()).unwrap_err();
+            assert!(
+                error.contains("regular file"),
+                "{}: {error}",
+                path.display()
+            );
+        }
+        // A file over the limit is refused after reading at most limit + 1 bytes.
+        let big = temp.0.join("big.json");
+        fs::write(&big, vec![b' '; MAX_READ_BYTES + 2]).unwrap();
+        assert!(read_within_a_second(big).unwrap_err().contains("larger"));
     }
 
     #[test]

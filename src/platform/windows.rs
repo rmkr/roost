@@ -77,6 +77,9 @@ impl Directory {
 pub fn file_identity(_: &File) -> Result<FileIdentity> {
     Err(unavailable())
 }
+pub(crate) fn open_user_file(_: &Path, _: bool) -> Result<File> {
+    Err(unavailable())
+}
 pub(crate) fn copy_mode(_: &File) -> Result<u32> {
     Err(unavailable())
 }

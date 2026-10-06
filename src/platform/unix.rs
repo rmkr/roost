@@ -53,6 +53,29 @@ pub fn file_identity(file: &File) -> Result<FileIdentity> {
     })?))
 }
 
+/// Opens a user-managed file (outside any managed directory) for reading,
+/// refusing anything but a regular file. The open never blocks, so a FIFO swapped
+/// in cannot hang it; a final symlink is followed only when `follow`.
+pub(crate) fn open_user_file(path: &Path, follow: bool) -> Result<File> {
+    let mut flags = OFlags::RDONLY | OFlags::CLOEXEC | OFlags::NONBLOCK | OFlags::NOCTTY;
+    if !follow {
+        flags |= OFlags::NOFOLLOW;
+    }
+    let file = fs::open(path, flags, Mode::empty())
+        .map(File::from)
+        .map_err(|e| native_error("open file", path, e))?;
+    let metadata = file
+        .metadata()
+        .map_err(|e| Error::io("inspect opened file", path, e))?;
+    if !metadata.is_file() {
+        return Err(Error::new(
+            "unsafe_path",
+            format!("{} is not a regular file", path.display()),
+        ));
+    }
+    Ok(file)
+}
+
 pub(crate) fn copy_mode(file: &File) -> Result<u32> {
     let metadata = file
         .metadata()
