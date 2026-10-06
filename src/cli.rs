@@ -1,4 +1,4 @@
-use clap::{CommandFactory, Parser, Subcommand, error::ErrorKind};
+use clap::{Args, CommandFactory, Parser, Subcommand, error::ErrorKind};
 use std::{
     ffi::{OsStr, OsString},
     path::PathBuf,
@@ -28,6 +28,9 @@ pub enum Action {
         source: Option<PathBuf>,
         #[arg(long, requires = "copy_default")]
         yes: bool,
+        /// Do not subscribe the new profile to default sets
+        #[arg(long, conflicts_with = "link_default")]
+        no_sets: bool,
     },
     /// Register an upstream profile at its unchanged real directory
     Register {
@@ -98,6 +101,12 @@ pub enum Action {
         #[arg(long)]
         json: bool,
     },
+    /// Manage shared sets of skills, instructions and plugins
+    #[command(disable_help_subcommand = true)]
+    Set {
+        #[command(subcommand)]
+        action: SetAction,
+    },
     /// Show help for Roost or one manager command
     Help { command: Option<String> },
     #[command(skip)]
@@ -131,6 +140,76 @@ pub enum Action {
     },
 }
 
+/// `roost set ...` subcommands.
+#[derive(Subcommand, Debug)]
+pub enum SetAction {
+    /// List sets, their items and subscribed profiles
+    List {
+        #[arg(long)]
+        json: bool,
+    },
+    /// Create an empty set
+    Create {
+        set: String,
+        /// Subscribe profiles created later with roost add
+        #[arg(long)]
+        default: bool,
+    },
+    /// Delete a set and its subscriptions; links leave at the next launch
+    Delete { set: String },
+    /// Mark a set default for new profiles, or unmark it with --off
+    Default {
+        set: String,
+        #[arg(long)]
+        off: bool,
+    },
+    /// Add one item to a set
+    Add {
+        set: String,
+        #[command(flatten)]
+        item: ItemArgs,
+    },
+    /// Drop one item from a set
+    Drop {
+        set: String,
+        #[command(flatten)]
+        item: ItemArgs,
+    },
+    /// Subscribe a profile to sets
+    Subscribe {
+        name: String,
+        #[arg(required = true)]
+        sets: Vec<String>,
+    },
+    /// Unsubscribe a profile from sets
+    Unsubscribe {
+        name: String,
+        #[arg(required = true)]
+        sets: Vec<String>,
+    },
+}
+
+/// Exactly one set item.
+#[derive(Args, Debug)]
+#[group(required = true, multiple = false)]
+pub struct ItemArgs {
+    /// A skill directory, linked under skills/ by its name
+    #[arg(long, value_name = "DIR")]
+    pub skill: Option<PathBuf>,
+    /// A directory whose every child directory is a skill
+    #[arg(long, value_name = "DIR")]
+    pub skills_from: Option<PathBuf>,
+    /// An instruction fragment (.md file), linked under rules/
+    #[arg(long, value_name = "FILE")]
+    pub instruction: Option<PathBuf>,
+    /// A directory whose every child .md file is an instruction fragment
+    #[arg(long, value_name = "DIR")]
+    pub instructions_from: Option<PathBuf>,
+    /// A plugin installed in the plugin store
+    #[arg(long, value_name = "PLUGIN@MARKETPLACE")]
+    pub plugin: Option<String>,
+}
+
 impl Action {
     pub fn json(&self) -> bool {
         matches!(
@@ -138,6 +217,9 @@ impl Action {
             Self::List { json: true, .. }
                 | Self::Status { json: true, .. }
                 | Self::Doctor { json: true }
+                | Self::Set {
+                    action: SetAction::List { json: true }
+                }
         )
     }
     pub fn name(&self) -> Option<&str> {
@@ -150,6 +232,9 @@ impl Action {
             | Self::Status { name, .. }
             | Self::Token { name, .. }
             | Self::Remove { name, .. }
+            | Self::Set {
+                action: SetAction::Subscribe { name, .. } | SetAction::Unsubscribe { name, .. },
+            }
             | Self::Switch {
                 name: Some(name), ..
             } => Some(name),

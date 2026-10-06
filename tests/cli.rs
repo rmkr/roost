@@ -164,9 +164,9 @@ fn human_list_is_a_plain_aligned_table_when_piped() {
     assert_eq!(
         lines,
         [
-            "Profile   Kind           Token  Launchers",
-            "personal  default_alias  –      ready",
-            "Work      owned          –      ready",
+            "Profile   Kind           Token  Launchers  Sets",
+            "personal  default_alias  –      ready      —",
+            "Work      owned          –      ready      —",
             "",
             "○ 2 profiles · 0 upstream · hidden: Path",
         ]
@@ -190,10 +190,10 @@ fn human_list_shows_token_launcher_state_and_upstream_count() {
     assert_eq!(
         text.lines().collect::<Vec<_>>(),
         [
-            "Profile  Kind      Token  Launchers",
-            "Gone     owned     –      not_required",
-            "Old      upstream  –      ready",
-            "Work     owned     ✓      ready",
+            "Profile  Kind      Token  Launchers     Sets",
+            "Gone     owned     –      not_required  —",
+            "Old      upstream  –      ready         —",
+            "Work     owned     ✓      ready         —",
             "",
             "○ 3 profiles · 1 upstream · hidden: Path",
         ]
@@ -265,10 +265,10 @@ fn full_list_probes_isolated_active_rows_only() {
     assert_eq!(
         text.lines().collect::<Vec<_>>(),
         [
-            "Profile   Kind           Token  Launchers  Login  Auth       Claude dir",
-            "personal  default_alias  –      ready      —      —          —",
+            "Profile   Kind           Token  Launchers  Sets  Login  Auth       Claude dir",
+            "personal  default_alias  –      ready      —     —      —          —",
             &format!(
-                "Work      owned          –      ready      yes    claude.ai  {}",
+                "Work      owned          –      ready      —     yes    claude.ai  {}",
                 work.display()
             ),
             "",
@@ -314,7 +314,7 @@ fn full_list_probe_failure_is_unknown_with_a_safe_warning() {
             .nth(1)
             .unwrap()
             .split_whitespace()
-            .collect::<Vec<_>>()[4..6],
+            .collect::<Vec<_>>()[5..7],
         ["no", "none"]
     );
     let out = f
@@ -330,7 +330,7 @@ fn full_list_probe_failure_is_unknown_with_a_safe_warning() {
             .nth(1)
             .unwrap()
             .split_whitespace()
-            .collect::<Vec<_>>()[4..],
+            .collect::<Vec<_>>()[5..],
         ["?", "?", "?"]
     );
     let stderr = String::from_utf8(out.stderr).unwrap();
@@ -394,10 +394,10 @@ print(json.dumps(data.decode().replace('\r\n','\n')))
     assert_eq!(
         plain.lines().collect::<Vec<_>>(),
         [
-            "Profile  Kind   Token  Launchers  Login",
-            "Work     owned  –      ready      yes",
+            "Profile  Kind   Token  Launchers  Sets",
+            "Work     owned  –      ready      —",
             "",
-            "○ 1 profile · 0 upstream · hidden: Path, Auth, Claude dir",
+            "○ 1 profile · 0 upstream · hidden: Path, Login, Auth, Claude dir",
         ]
     );
 }

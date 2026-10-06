@@ -233,6 +233,19 @@ pub fn profiles(records: &[Value], full: bool, color: bool, width: Option<usize>
                 _ => Style::Red,
             };
             Cell::new(condition, style)
+        })
+        .column("Sets", |r: &Value| {
+            let names: Vec<&str> = r["sets"]
+                .as_array()
+                .into_iter()
+                .flatten()
+                .filter_map(Value::as_str)
+                .collect();
+            if names.is_empty() {
+                Cell::new("—", Style::Dim)
+            } else {
+                Cell::plain(names.join(","))
+            }
         });
     if full {
         table = table
