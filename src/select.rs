@@ -151,7 +151,11 @@ pub fn launched(store: &Store, registration: &Registration) {
     let at = now();
     let id = &registration.registration_id;
     let result = store.update_state(|state| {
-        match state.last_used.iter_mut().find(|t| &t.registration_id == id) {
+        match state
+            .last_used
+            .iter_mut()
+            .find(|t| &t.registration_id == id)
+        {
             Some(time) => time.at = at,
             None => state.last_used.push(Timestamp {
                 registration_id: id.clone(),

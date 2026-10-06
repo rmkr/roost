@@ -221,11 +221,11 @@ fn human_list_is_a_plain_aligned_table_when_piped() {
     assert_eq!(
         lines,
         [
-            "Profile   Kind           Token  Launchers  Sets",
-            "personal  default_alias  –      ready      —",
-            "Work      owned          –      ready      —",
+            "  Profile   Kind           Token  Launchers  Sets  Last used",
+            "  personal  default_alias  –      ready      —     never",
+            "  Work      owned          –      ready      —     never",
             "",
-            "○ 2 profiles · 0 upstream · hidden: Path",
+            "○ 2 profiles · 0 upstream · @ selected here · ^ last used · hidden: Path",
         ]
     );
 }
@@ -247,12 +247,12 @@ fn human_list_shows_token_launcher_state_and_upstream_count() {
     assert_eq!(
         text.lines().collect::<Vec<_>>(),
         [
-            "Profile  Kind      Token  Launchers     Sets",
-            "Gone     owned     –      not_required  —",
-            "Old      upstream  –      ready         —",
-            "Work     owned     ✓      ready         —",
+            "  Profile  Kind      Token  Launchers     Sets  Last used",
+            "  Gone     owned     –      not_required  —     never",
+            "  Old      upstream  –      ready         —     never",
+            "  Work     owned     ✓      ready         —     never",
             "",
-            "○ 3 profiles · 1 upstream · hidden: Path",
+            "○ 3 profiles · 1 upstream · @ selected here · ^ last used · hidden: Path",
         ]
     );
 }
@@ -322,14 +322,14 @@ fn full_list_probes_isolated_active_rows_only() {
     assert_eq!(
         text.lines().collect::<Vec<_>>(),
         [
-            "Profile   Kind           Token  Launchers  Sets  Login  Auth       Claude dir",
-            "personal  default_alias  –      ready      —     —      —          —",
+            "  Profile   Kind           Token  Launchers  Sets  Last used  Login  Auth       Claude dir",
+            "  personal  default_alias  –      ready      —     never      —      —          —",
             &format!(
-                "Work      owned          –      ready      —     yes    claude.ai  {}",
+                "  Work      owned          –      ready      —     never      yes    claude.ai  {}",
                 work.display()
             ),
             "",
-            "○ 2 profiles · 0 upstream · hidden: Path",
+            "○ 2 profiles · 0 upstream · @ selected here · ^ last used · hidden: Path",
         ]
     );
 }
@@ -371,7 +371,7 @@ fn full_list_probe_failure_is_unknown_with_a_safe_warning() {
             .nth(1)
             .unwrap()
             .split_whitespace()
-            .collect::<Vec<_>>()[5..7],
+            .collect::<Vec<_>>()[6..8],
         ["no", "none"]
     );
     let out = f
@@ -387,7 +387,7 @@ fn full_list_probe_failure_is_unknown_with_a_safe_warning() {
             .nth(1)
             .unwrap()
             .split_whitespace()
-            .collect::<Vec<_>>()[5..],
+            .collect::<Vec<_>>()[6..],
         ["?", "?", "?"]
     );
     let stderr = String::from_utf8(out.stderr).unwrap();
@@ -451,10 +451,10 @@ print(json.dumps(data.decode().replace('\r\n','\n')))
     assert_eq!(
         plain.lines().collect::<Vec<_>>(),
         [
-            "Profile  Kind   Token  Launchers  Sets",
-            "Work     owned  –      ready      —",
+            "  Profile  Kind   Token  Launchers  Sets",
+            "  Work     owned  –      ready      —",
             "",
-            "○ 1 profile · 0 upstream · hidden: Path, Login, Auth, Claude dir",
+            "○ 1 profile · 0 upstream · @ selected here · ^ last used · hidden: Path, Last used, Login, Auth, Claude dir",
         ]
     );
 }
@@ -1505,4 +1505,101 @@ fn desktop_launch_reconciles_subscribed_skill_links() {
     let _ = fs::remove_file(&link);
     f.ok(&["desktop", "--foreground", "Work"]);
     assert_eq!(fs::read_link(&link).unwrap(), skill);
+}
+
+#[test]
+fn list_marks_selection_and_most_recent_launch_from_run_and_launchers() {
+    let f = Fixture::new();
+    f.add("Work");
+    f.add("Home");
+    f.ok(&["add", "personal", "--link-default"]);
+    let old = f.upstream("Old");
+    f.ok(&["register", "Old", "--path", old.to_str().unwrap()]);
+    let app = repo(&f, "app");
+    let in_app = |args: &[&str]| f.command().current_dir(&app).args(args).output().unwrap();
+    assert!(in_app(&["switch", "--no-launch", "Work"]).status.success());
+    // A launcher records the upstream registration's last use in manager storage.
+    let launcher = f.root.join("bin/roost-Old");
+    launched(
+        &Command::new(&launcher)
+            .env_clear()
+            .env("HOME", &f.home)
+            .env("PATH", format!("{}:/usr/bin:/bin", f.bin.display()))
+            .output()
+            .unwrap(),
+    );
+    assert!(
+        fs::read_dir(&old).unwrap().next().is_none(),
+        "upstream data untouched"
+    );
+    std::thread::sleep(std::time::Duration::from_millis(1100));
+    launched(&f.run(&["run", "Home"]));
+    // Default-alias launches record nothing.
+    launched(&f.run(&["run", "personal"]));
+    let value = parsed(&in_app(&["list", "--json"]));
+    assert_eq!(
+        value["data"]["project"],
+        json!(app.join(".git").to_str().unwrap())
+    );
+    let by_name = |name: &str| {
+        value["data"]["profiles"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|p| p["name"] == name)
+            .unwrap()
+            .clone()
+    };
+    let (work, home, old, personal) = (
+        by_name("Work"),
+        by_name("Home"),
+        by_name("Old"),
+        by_name("personal"),
+    );
+    assert_eq!(
+        (&work["selected"], &work["most_recent"]),
+        (&json!(true), &json!(false))
+    );
+    assert_eq!(work["last_used"], Value::Null);
+    assert_eq!(
+        (&home["selected"], &home["most_recent"]),
+        (&json!(false), &json!(true))
+    );
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_secs();
+    let at = home["last_used"].as_u64().unwrap();
+    assert!(at <= now && at + 60 > now, "{at} {now}");
+    assert!(old["last_used"].as_u64().unwrap() < at);
+    assert_eq!(old["most_recent"], json!(false));
+    assert_eq!(personal["last_used"], Value::Null);
+    // Outside the project nothing is selected.
+    let elsewhere = parsed(
+        &f.command()
+            .current_dir(repo(&f, "elsewhere"))
+            .args(["list", "--json"])
+            .output()
+            .unwrap(),
+    );
+    assert!(
+        elsewhere["data"]["profiles"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .all(|p| p["selected"] == false)
+    );
+    let text = String::from_utf8(in_app(&["ls"]).stdout).unwrap();
+    assert_eq!(
+        text.lines().collect::<Vec<_>>(),
+        [
+            "  Profile   Kind           Token  Launchers  Sets  Last used",
+            "^ Home      owned          –      ready      —     now",
+            "  Old       upstream       –      ready      —     now",
+            "  personal  default_alias  –      ready      —     never",
+            "@ Work      owned          –      ready      —     never",
+            "",
+            "○ 4 profiles · 1 upstream · @ selected here · ^ last used · hidden: Path",
+        ]
+    );
 }
