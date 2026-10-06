@@ -81,7 +81,7 @@ roost plugin add PLUGIN[@MARKETPLACE] [--set SET... | --no-set]
 roost plugin update [PLUGIN]
 roost plugin auto-update (--on | --off)
 roost plugin remove PLUGIN
-roost desktop NAME
+roost desktop [--foreground] NAME
 roost help [COMMAND]
 roost --help | -h
 roost --version | -v
@@ -369,8 +369,9 @@ Orphaned versions (accepted 2026-10-06, Q49): Claude's 14-day sweep never runs o
 
 `roost desktop NAME` (experimental, Linux only; other platforms fail claude_unavailable) needs an active registration and resolves `claude-desktop` through PATH (missing: claude_unavailable). There is no forwarded argument tail.
 
-- Owned/upstream: the data folder is `<root>/desktop/<REGISTRATION_ID>/`, created on first use by the `desktop_create` journal operation with marker `.roost-desktop.json` `{schema_version:1, root_id:ID, registration_id:ID, directory_identity:FileIdentity}`. Launch preparation is the isolated `run` preparation (auth checks, token, plugin injection, reconciliation, last use), then exec `claude-desktop --user-data-dir=<folder>` and record `desktop_launched`.
-- Default alias: exec plain `claude-desktop` with the caller's environment; no folder, nothing recorded.
+- Owned/upstream: the data folder is `<root>/desktop/<REGISTRATION_ID>/`, created on first use by the `desktop_create` journal operation with marker `.roost-desktop.json` `{schema_version:1, root_id:ID, registration_id:ID, directory_identity:FileIdentity}`. Launch preparation is the isolated `run` preparation (auth checks, token, plugin injection, reconciliation, last use), then record `desktop_launched` and start `claude-desktop --user-data-dir=<folder>` [detached](#desktop).
+- Default alias: start plain `claude-desktop` [detached](#desktop) with the caller's environment; no folder, nothing recorded.
+- Detached by default (amended 2026-10-06 at the user's request): the child gets a new session (`setsid`), stdin/stdout/stderr on the null device and no inherited Roost handles, and Roost does not wait for it. Roost then watches it for up to 2 seconds: an exit in that window is reported as claude_unavailable with the exit status and a `--foreground` next step; otherwise Roost prints `Started Claude Desktop for NAME` to stderr and exits 0. Chromium's own console noise is never shown. `--foreground` instead execs (Unix) with inherited stdio, as for `run`, for debugging.
 - Running check: if the folder's Electron `SingletonLock` link names this host and a live PID, fail desktop_running ("this profile's Desktop is already running"). If any other Roost Desktop folder, or the conventional `~/.config/Claude`, holds such a live lock, warn that Cowork is untested with a second concurrent Desktop, and launch.
 - Doctor: for each folder with a `desktop_launched` record but no Electron data besides the marker, finding `desktop_data_not_isolated` (warning) suggesting the flag may have stopped working.
 
