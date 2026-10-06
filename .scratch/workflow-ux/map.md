@@ -20,6 +20,7 @@ Roost remembers which profile each project uses, shows profiles in a readable ta
 <!-- Closed tickets only: linked title and a one-line gist; detail lives in the ticket. -->
 
 - [Amend the specification for workflow UX](issues/01-amend-spec.md): spec amended and accepted, with a separate plugin store lock and Desktop-folder deletion on upstream remove.
+- [Lay shared scaffolding for the workflow UX features](issues/10-shared-scaffold.md): table renderer, link helpers, reusable profile environment, side-file store API and `Launch` open mode.
 - [Investigate injected plugin behavior](issues/06-injected-plugin-behavior.md): injection works as ADR 0001 assumes (`name@inline`, per-profile opt-out, config and data per profile); inject `installPath` from the store's `installed_plugins.json` at every launch; no claude.ai org marketplaces in the store; ADR accepted.
 
 ## Not yet specified

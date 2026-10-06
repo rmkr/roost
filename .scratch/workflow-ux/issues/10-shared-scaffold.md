@@ -2,7 +2,7 @@
 
 Type: task
 Labels: workflow-ux
-Status: claimed
+Status: resolved
 Assignee: Claude subagent ticket-10
 Parent: [Make Roost simpler to work with day to day](../map.md)
 Blocked by: 01
@@ -28,3 +28,7 @@ Implementer notes: `~/.cache/roost-impl/notes.md` (cross-cutting section and mer
   - Launch: `launch::profile_env(store, reg, allow_auth_env) -> ProfileEnv` holds the validation and env part of `prepare`. `ProfileEnv::{is_isolated, set, append_paths, apply, command}`, where `append_paths` builds `CLAUDE_CODE_PLUGIN_DIRS` after the inherited nonempty value and is a no-op for aliases. `launch::resolve_program(name)` replaces `resolve_claude`, and `prepare` = `profile_env` + `resolve_program("claude")`.
   - `Directory::symlink(target, name) -> FileIdentity` / `read_link(name) -> Option<PathBuf>` (descriptor-relative, no-follow) have fail-closed Windows stubs.
   - Not done: the journaled `store_create`/`desktop_create` operations and the `store`/`desktop_data` roles are left to tickets 07 and 09.
+
+## Answer
+
+2026-10-06: Merged into `workflow-ux` at 3c43e75. Adds `src/table.rs` (column-list renderer used by `list`), `Directory::symlink`/`read_link`, `launch::profile_env`/`ProfileEnv`/`resolve_program`, `store::side` side files (`read_state`/`read_sets`/`update_state`/`update_sets`/`reserved_dir`), `OpenMode::Launch`, and reserved root names. Journaled `store_create`/`desktop_create` are left to tickets 07 and 09.
