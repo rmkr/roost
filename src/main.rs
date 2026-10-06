@@ -487,6 +487,9 @@ fn dispatch(action: Action, data: &mut Value) -> Result<Outcome> {
                         "--yes applies only to --purge or to removing an upstream profile",
                     ));
                 }
+                if purge || registration.kind == Kind::Upstream {
+                    desktop::refuse_if_running(&store, &registration)?;
+                }
                 let root_id = store.root_id.clone();
                 drop(store);
                 if purge {
@@ -527,6 +530,9 @@ fn dispatch(action: Action, data: &mut Value) -> Result<Outcome> {
                     Error::new("ownership", "Profile changed while removal was pending")
                         .next("Inspect the profile and repeat the command for the intended scope"),
                 );
+            }
+            if purge || current.kind == Kind::Upstream {
+                desktop::refuse_if_running(&store, &current)?;
             }
             let messages = store.remove(&name, purge)?;
             let mut out = Outcome::lines(messages);

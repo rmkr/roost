@@ -7,7 +7,7 @@
 use crate::{
     Error, Result, launch, platform,
     store::{
-        Kind, OpenMode, Store,
+        Kind, OpenMode, Registration, Store,
         side::{StateFile, Timestamp},
     },
 };
@@ -100,6 +100,27 @@ pub fn run(name: &str, foreground: bool) -> Result<i32> {
     } else {
         linux::detached(command, &registration.name)
     }
+}
+
+/// Q51: purge and upstream remove refuse while the registration's Desktop folder holds
+/// a live `SingletonLock` (its Desktop is running and would keep writing there).
+pub fn refuse_if_running(store: &Store, registration: &Registration) -> Result<()> {
+    let host = linux::hostname();
+    let running = store.desktop_locks()?.into_iter().any(|(id, lock)| {
+        id == registration.registration_id
+            && lock.is_some_and(|target| linux::live_lock(&target, host.as_deref()))
+    });
+    if running {
+        return Err(Error::new(
+            "desktop_running",
+            format!("Claude Desktop is running for {}", registration.name),
+        )
+        .next(format!(
+            "Quit Claude Desktop for {}, then repeat the command",
+            registration.name
+        )));
+    }
+    Ok(())
 }
 
 fn record_launch(state: &mut StateFile, id: &str) {

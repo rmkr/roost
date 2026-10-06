@@ -56,7 +56,7 @@ sys.exit(int(os.environ.get('FAKE_CLAUDE_EXIT','0')))
         // data into --user-data-dir unless told to ignore it, then exits or lingers.
         let desktop = bin.join("claude-desktop");
         fs::write(&desktop, r#"#!/usr/bin/python3
-import json,os,sys,time
+import json,os,socket,sys,time
 args=sys.argv[1:]
 record={'arguments':args,'env':dict(os.environ),'session_leader':os.getsid(0)==os.getpid(),
         'stdin':os.readlink('/proc/self/fd/0'),'stdout':os.readlink('/proc/self/fd/1'),'stderr':os.readlink('/proc/self/fd/2')}
@@ -64,7 +64,14 @@ with open(os.environ['FAKE_DESKTOP_RECORD'],'a') as f:f.write(json.dumps(record)
 data=[a.split('=',1)[1] for a in args if a.startswith('--user-data-dir=')]
 if data and not os.environ.get('FAKE_DESKTOP_IGNORE_DIR'):open(os.path.join(data[0],'Preferences'),'w').close()
 print('chromium console noise');print('[ERROR] gpu noise',file=sys.stderr)
-if os.environ.get('FAKE_DESKTOP_MODE')=='long':time.sleep(8)
+if os.environ.get('FAKE_DESKTOP_MODE')=='long':
+    # Like Electron: a SingletonLock link naming HOST-PID while running.
+    lock=os.path.join(data[0],'SingletonLock') if data and os.environ.get('FAKE_DESKTOP_LOCK') else None
+    if lock:os.symlink('%s-%d'%(socket.gethostname(),os.getpid()),lock)
+    time.sleep(8)
+    try:
+        if lock:os.remove(lock)
+    except OSError:pass
 sys.exit(int(os.environ.get('FAKE_DESKTOP_EXIT','0')))
 "#).unwrap();
         fs::set_permissions(&desktop, fs::Permissions::from_mode(0o700)).unwrap();
@@ -1340,6 +1347,61 @@ fn desktop_refuses_a_running_profile_and_warns_about_other_instances() {
     std::os::unix::fs::symlink(&live, &lock).unwrap();
     let out = f.ok(&["desktop", "--foreground", "personal"]);
     assert!(String::from_utf8_lossy(&out.stderr).contains("Cowork is untested"));
+}
+
+#[test]
+fn purge_and_upstream_remove_refuse_while_that_desktop_runs() {
+    let f = Fixture::new();
+    f.add("Work");
+    let upstream = f.upstream("Up");
+    f.ok(&["register", "Up", "--path", upstream.to_str().unwrap()]);
+    for name in ["Work", "Up"] {
+        f.ok(&["desktop", "--foreground", name]);
+        let out = f
+            .command()
+            .args(["desktop", name])
+            .env("FAKE_DESKTOP_MODE", "long")
+            .env("FAKE_DESKTOP_LOCK", "1")
+            .output()
+            .unwrap();
+        assert!(
+            out.status.success(),
+            "{}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+    }
+    let pids: Vec<i32> = ["Work", "Up"]
+        .iter()
+        .map(|name| {
+            let target = fs::read_link(f.desktop_folder(name).join("SingletonLock")).unwrap();
+            let target = target.to_str().unwrap().to_owned();
+            target.rsplit_once('-').unwrap().1.parse().unwrap()
+        })
+        .collect();
+    for args in [
+        vec!["remove", "Work", "--purge", "--yes"],
+        vec!["remove", "Up", "--yes"],
+    ] {
+        // Refused before confirmation: no terminal and no --yes still names Desktop.
+        let without_yes: Vec<&str> = args.iter().copied().filter(|a| *a != "--yes").collect();
+        for attempt in [args.clone(), without_yes] {
+            let out = f.run(&attempt);
+            assert_eq!(out.status.code(), Some(1), "{attempt:?}");
+            let stderr = String::from_utf8_lossy(&out.stderr);
+            assert!(stderr.contains("desktop_running"), "{stderr}");
+            assert!(
+                stderr.contains(&format!("Quit Claude Desktop for {}", args[1])),
+                "{stderr}"
+            );
+        }
+        f.ok(&["where", args[1]]);
+        assert!(f.desktop_folder(args[1]).join("Preferences").exists());
+    }
+    // Ordinary owned remove keeps the folder and needs no check.
+    f.ok(&["remove", "Work"]);
+    for pid in pids {
+        unsafe { libc::kill(pid, libc::SIGTERM) };
+    }
 }
 
 #[test]
