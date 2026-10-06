@@ -406,7 +406,7 @@ mod tests {
     }
     impl Fixture {
         fn new() -> Self {
-            let base = std::env::temp_dir().join(format!(
+            let base = std::env::temp_dir().canonicalize().unwrap().join(format!(
                 "roost-desktop-test-{}",
                 platform::random_id().unwrap()
             ));

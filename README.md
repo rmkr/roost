@@ -2,7 +2,7 @@
 
 Roost is a Rust CLI for selecting Claude configuration profiles while keeping your existing Claude installation. It can create owned profiles, register upstream profiles at their unchanged paths, and launch native browser login and saved conversations. It also remembers which profile each project uses, shares skills, instructions, settings and plugins across profiles, and can start Claude Desktop per profile.
 
-This is a source-only development build. Local Linux automated tests and disposable Bash/Fish checks pass. macOS, other architectures, native Windows, WSL and real-account acceptance remain unverified; the Windows storage backend currently refuses operations until its handle/ACL protection is implemented. No prebuilt downloads or package publication are provided.
+This is a source-only development build. Local Linux automated tests and disposable Bash/Fish checks pass, and the automated tests pass on macOS (Apple silicon), where `roost desktop` is unavailable. Other architectures, native Windows, WSL and real-account acceptance remain unverified; the Windows storage backend currently refuses operations until its handle/ACL protection is implemented. No prebuilt downloads or package publication are provided.
 
 Terms such as profile, account, owned, registered upstream, selected profile and shared set are defined in the [glossary](GLOSSARY.md).
 
