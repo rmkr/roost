@@ -120,7 +120,7 @@ fn parse_id(text: &str) -> Result<(String, Option<String>)> {
 fn plugin_name(id: &str) -> &str {
     id.split_once('@').map_or(id, |(name, _)| name)
 }
-fn valid_id(id: &str) -> bool {
+pub(crate) fn valid_id(id: &str) -> bool {
     matches!(id.split_once('@'), Some((p, m)) if valid_part(p) && valid_part(m))
 }
 
@@ -240,7 +240,7 @@ fn listing(claude: &Path, store: &Path, available: bool, timeout: Duration) -> R
     if available {
         command.arg("--available");
     }
-    let (stdout, exit) = launch::deadline_probe(command, "plugin_store", timeout)?;
+    let (stdout, exit) = launch::probe(command, "plugin_store", timeout)?;
     let unreadable = || {
         Error::new("plugin_store", "Claude's plugin listing was not recognized")
             .next("Check the selected Claude installation with roost doctor")
@@ -773,7 +773,7 @@ fn auto_update(directory: &Directory, root_id: &str) -> Vec<String> {
             // Claude's CLI updates exactly one plugin per call.
             let mut command = store_command(&claude, &directory.path);
             command.args(["plugin", "update", &plugin.id]);
-            let (_, exit) = launch::deadline_probe(command, "plugin_store", remaining()?)
+            let (_, exit) = launch::probe(command, "plugin_store", remaining()?)
                 .map_err(|e| Error::new("plugin_store", e.message))?;
             if !exit.success() {
                 return Err(Error::new(
@@ -850,7 +850,7 @@ pub fn shadow_findings(jobs: Vec<ShadowJob>) -> Vec<Value> {
             .env("CLAUDE_CONFIG_DIR", &job.directory)
             .env("DISABLE_AUTOUPDATER", "1")
             .args(["plugin", "list", "--json"]);
-        let listing = launch::bounded_probe(command, "diagnostics")
+        let listing = launch::probe(command, "diagnostics", launch::PROBE_TIMEOUT)
             .ok()
             .filter(|(_, exit)| exit.success())
             .and_then(|(stdout, _)| serde_json::from_slice::<Value>(&stdout).ok());
@@ -952,18 +952,7 @@ fn list(root: &Path, data: &mut Value) -> Result<(Vec<String>, Vec<String>)> {
             None
         }
     };
-    let mut ids: BTreeSet<String> = record
-        .iter()
-        .flat_map(|r| r.plugins.iter().map(|p| p.id.clone()))
-        .collect();
-    ids.extend(
-        sets.sets
-            .iter()
-            .flat_map(|s| s.items.iter())
-            .filter(|i| i.kind == ItemKind::Plugin)
-            .map(|i| i.value.clone()),
-    );
-    let plugins: Vec<Value> = ids
+    let plugins: Vec<Value> = known_ids(record.as_ref(), &sets)
         .into_iter()
         .map(|id| {
             let mut names: Vec<String> = sets
@@ -1024,15 +1013,34 @@ fn list(root: &Path, data: &mut Value) -> Result<(Vec<String>, Vec<String>)> {
     Ok((lines, warnings))
 }
 
+/// Store plugin IDs Roost knows: recorded in the store or named by a set.
+fn known_ids(record: Option<&Record>, sets: &SetsFile) -> BTreeSet<String> {
+    let recorded = record
+        .into_iter()
+        .flat_map(|r| r.plugins.iter().map(|p| p.id.clone()));
+    let named = sets
+        .sets
+        .iter()
+        .flat_map(|s| s.items.iter())
+        .filter(|i| i.kind == ItemKind::Plugin)
+        .map(|i| i.value.clone());
+    recorded.chain(named).collect()
+}
+
 /// Sets the plugin goes into: `--set`, `--no-set`, or a terminal prompt.
 fn choose_sets(root: &Path, named: Vec<String>, no_set: bool) -> Result<Vec<String>> {
-    for set in &named {
-        crate::store::validate_name(set)
-            .map_err(|_| Error::new("usage", format!("Invalid set name {set}")))?;
+    let chosen = if no_set || !named.is_empty() {
+        named
+    } else {
+        prompt_sets(root)?
+    };
+    for set in &chosen {
+        sets::validate_set_name(set)?;
     }
-    if no_set || !named.is_empty() {
-        return Ok(named);
-    }
+    Ok(chosen)
+}
+
+fn prompt_sets(root: &Path) -> Result<Vec<String>> {
     let available: Vec<String> = match Store::open(root, false, OpenMode::Read) {
         Ok(store) => store
             .read_sets()?
@@ -1060,17 +1068,12 @@ fn choose_sets(root: &Path, named: Vec<String>, no_set: bool) -> Result<Vec<Stri
         available.join(", ")
     ))
     .map_err(|e| if e.code == "usage" { usage() } else { e })?;
-    let chosen: Vec<String> = answer
+    Ok(answer
         .split(',')
         .map(str::trim)
         .filter(|s| !s.is_empty())
         .map(str::to_owned)
-        .collect();
-    for set in &chosen {
-        crate::store::validate_name(set)
-            .map_err(|_| Error::new("usage", format!("Invalid set name {set}")))?;
-    }
-    Ok(chosen)
+        .collect())
 }
 
 /// Checks that every set exists and that adding `item` to them keeps each
@@ -1084,14 +1087,7 @@ fn check_sets(
     let mut simulated = sets.clone();
     let mut names = vec![];
     for set in chosen {
-        let target = simulated
-            .sets
-            .iter_mut()
-            .find(|s| s.name.eq_ignore_ascii_case(set))
-            .ok_or_else(|| {
-                Error::new("not_found", format!("No set named {set}"))
-                    .next("List sets with roost set list")
-            })?;
+        let target = sets::find_set_mut(&mut simulated, set)?;
         names.push(target.name.clone());
         if !target.items.contains(item) {
             target.items.push(item.clone());
@@ -1147,27 +1143,14 @@ fn add(
                     .into_iter()
                     .map(|(id, _, _)| id),
             );
-            candidates.retain(|id| plugin_name(id) == name);
-            match candidates.len() {
-                1 => candidates.pop_first().unwrap(),
-                0 => {
-                    return Err(Error::new(
-                        "not_found",
-                        format!("No marketplace in the plugin store offers {name}"),
-                    )
-                    .next("Add its marketplace with roost plugin marketplace add SOURCE"));
-                }
-                _ => {
-                    return Err(Error::new(
-                        "not_found",
-                        format!(
-                            "{name} is ambiguous: {}",
-                            candidates.into_iter().collect::<Vec<_>>().join(", ")
-                        ),
-                    )
-                    .next(format!("Name one: roost plugin add {name}@MARKETPLACE")));
-                }
+            if !candidates.iter().any(|id| plugin_name(id) == name) {
+                return Err(Error::new(
+                    "not_found",
+                    format!("No marketplace in the plugin store offers {name}"),
+                )
+                .next("Add its marketplace with roost plugin marketplace add SOURCE"));
             }
+            resolve_known(&candidates, plugin)?
         }
     };
     let item = Item {
@@ -1308,19 +1291,7 @@ fn remove(root: &Path, plugin: &str) -> Result<(Vec<String>, Vec<String>)> {
     let (id, installed, root_id) = {
         let manager = Store::open(root, true, OpenMode::Mutate)?;
         let record = read_record(&manager)?.map(|(_, r)| r);
-        let mut known: BTreeSet<String> = record
-            .iter()
-            .flat_map(|r| r.plugins.iter().map(|p| p.id.clone()))
-            .collect();
-        known.extend(
-            manager
-                .read_sets()?
-                .sets
-                .iter()
-                .flat_map(|s| s.items.iter())
-                .filter(|i| i.kind == ItemKind::Plugin)
-                .map(|i| i.value.clone()),
-        );
+        let known = known_ids(record.as_ref(), &manager.read_sets()?);
         let id = resolve_known(&known, plugin)?;
         manager.update_sets(|sets| {
             for set in &mut sets.sets {

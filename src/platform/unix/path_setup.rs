@@ -341,7 +341,7 @@ fn fish_config_directory() -> Result<PathBuf> {
         .unwrap_or_else(|| "fish".into());
     let mut command = std::process::Command::new(executable);
     command.args(["-c", "printf '%s\\n' \"$__fish_config_dir\""]);
-    let (captured, status) = crate::launch::bounded_probe(command, "io")?;
+    let (captured, status) = crate::launch::probe(command, "io", crate::launch::PROBE_TIMEOUT)?;
     if !status.success() {
         return Err(Error::new("io", "Fish configuration discovery failed"));
     }
