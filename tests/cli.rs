@@ -1603,3 +1603,152 @@ fn list_marks_selection_and_most_recent_launch_from_run_and_launchers() {
         ]
     );
 }
+
+#[test]
+fn remove_and_purge_clear_selections_so_a_same_name_profile_inherits_nothing() {
+    let f = Fixture::new();
+    let app = repo(&f, "app");
+    let in_app = |args: &[&str]| f.command().current_dir(&app).args(args).output().unwrap();
+    let selected_names = || -> Vec<String> {
+        parsed(&in_app(&["list", "--json", "--retained"]))["data"]["profiles"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter(|p| p["selected"] == true)
+            .map(|p| p["name"].as_str().unwrap().to_owned())
+            .collect()
+    };
+    f.add("Work");
+    assert!(in_app(&["switch", "--no-launch", "Work"]).status.success());
+    launched(&in_app(&["run", "Work"]));
+    assert_eq!(selected_names(), ["Work"]);
+    // Ordinary remove retains the owned profile and its last use, not the selection.
+    f.ok(&["remove", "Work"]);
+    let state = fs::read_to_string(f.root.join("state.json")).unwrap();
+    assert_eq!(
+        serde_json::from_str::<Value>(&state).unwrap()["selections"],
+        json!([])
+    );
+    let record = &parsed(&in_app(&["list", "--json", "--retained"]))["data"]["profiles"][0];
+    assert!(record["last_used"].is_u64(), "{record}");
+    f.ok(&["reuse", "Work"]);
+    assert!(selected_names().is_empty());
+    let bare = in_app(&[]);
+    assert_eq!(bare.status.code(), Some(2));
+    assert!(!String::from_utf8_lossy(&bare.stderr).contains("warning"));
+    // Purge, then a new profile with the same name starts with nothing.
+    assert!(in_app(&["switch", "--no-launch", "Work"]).status.success());
+    f.ok(&["remove", "Work", "--purge", "--yes"]);
+    f.add("Work");
+    assert!(selected_names().is_empty());
+    let record = &parsed(&in_app(&["list", "--json"]))["data"]["profiles"][0];
+    assert_eq!(record["last_used"], Value::Null);
+    assert_eq!(in_app(&[]).status.code(), Some(2));
+    // Removing a selected upstream registration drops its selection too.
+    let old = f.upstream("Old");
+    f.ok(&["register", "Old", "--path", old.to_str().unwrap()]);
+    assert!(in_app(&["switch", "--no-launch", "Old"]).status.success());
+    f.ok(&["remove", "Old"]);
+    let state = fs::read_to_string(f.root.join("state.json")).unwrap();
+    assert_eq!(
+        serde_json::from_str::<Value>(&state).unwrap()["selections"],
+        json!([])
+    );
+}
+
+#[test]
+fn default_alias_selection_is_remembered_but_records_no_last_use() {
+    let f = Fixture::new();
+    f.ok(&["add", "personal", "--link-default"]);
+    let app = repo(&f, "app");
+    let in_app = |args: &[&str]| f.command().current_dir(&app).args(args).output().unwrap();
+    assert!(
+        in_app(&["switch", "--no-launch", "PERSONAL"])
+            .status
+            .success()
+    );
+    let probe = launched(
+        &f.command()
+            .current_dir(&app)
+            .env("CLAUDE_CONFIG_DIR", "/caller/dir")
+            .output()
+            .unwrap(),
+    );
+    assert_eq!(probe["env"]["CLAUDE_CONFIG_DIR"], json!("/caller/dir"));
+    let record = &parsed(&in_app(&["list", "--json"]))["data"]["profiles"][0];
+    assert_eq!(record["selected"], json!(true));
+    assert_eq!(record["last_used"], Value::Null);
+    assert_eq!(record["most_recent"], json!(false));
+}
+
+#[test]
+fn stale_selection_warns_naming_the_profile_before_asking() {
+    let f = Fixture::new();
+    f.add("Work");
+    f.add("Gone");
+    let app = repo(&f, "app");
+    let registry: Value =
+        serde_json::from_str(&fs::read_to_string(f.root.join("registry.json")).unwrap()).unwrap();
+    let id = |name: &str| {
+        registry["registrations"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|r| r["name"] == name)
+            .unwrap()["registration_id"]
+            .clone()
+    };
+    f.ok(&["remove", "Gone"]);
+    // A selection left naming a retained registration (for example after a failed
+    // clean-up) is stale: warn, then fall through to the picker rules.
+    let state = json!({"schema_version":1,"root_id":registry["root_id"],
+        "selections":[{"project":app.join(".git"),"registration_id":id("Gone")}],
+        "last_used":[],"links":[],"desktop_launched":[],"plugin_auto_update_at":null});
+    let path = f.root.join("state.json");
+    fs::write(&path, serde_json::to_vec(&state).unwrap()).unwrap();
+    fs::set_permissions(&path, fs::Permissions::from_mode(0o600)).unwrap();
+    let out = f.command().current_dir(&app).output().unwrap();
+    assert_eq!(out.status.code(), Some(2));
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        stderr.contains("warning") && stderr.contains("Gone"),
+        "{stderr}"
+    );
+}
+
+#[test]
+fn state_write_failure_warns_and_still_launches() {
+    let f = Fixture::new();
+    f.add("Work");
+    let app = repo(&f, "app");
+    let path = f.root.join("state.json");
+    fs::write(&path, b"not json").unwrap();
+    fs::set_permissions(&path, fs::Permissions::from_mode(0o600)).unwrap();
+    for args in [vec!["run", "Work"], vec!["switch", "Work"]] {
+        let out = f.command().current_dir(&app).args(&args).output().unwrap();
+        launched(&out);
+        assert!(
+            String::from_utf8_lossy(&out.stderr).contains("warning"),
+            "{args:?}"
+        );
+    }
+    let out = f
+        .command()
+        .current_dir(&app)
+        .args(["switch", "--no-launch", "Work"])
+        .output()
+        .unwrap();
+    assert_eq!(out.status.code(), Some(1));
+    assert_eq!(fs::read(&path).unwrap(), b"not json");
+    // A pending launch never records on a refused profile.
+    assert_eq!(
+        f.command()
+            .current_dir(&app)
+            .args(["switch", "--no-launch", "Nobody"])
+            .output()
+            .unwrap()
+            .status
+            .code(),
+        Some(1)
+    );
+}
