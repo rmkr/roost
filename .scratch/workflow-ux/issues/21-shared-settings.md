@@ -2,7 +2,7 @@
 
 Type: task
 Labels: workflow-ux
-Status: claimed
+Status: resolved
 Assignee: Claude subagent ticket-21
 Parent: [Make Roost simpler to work with day to day](../map.md)
 Blocked by: none
@@ -34,3 +34,7 @@ Implement [design: shared settings](../design.md#shared-settings) and [ADR 0003]
 - Refactors: linked kinds come from `PLACEMENTS`, and every path-valued kind's source type is set in one `source_kind` next to it. Settings reuse `sets::source_present`/`source_type`, and `ItemKind::is_setting` replaces `settings::is_setting`. There is one `type_of` for handler/statusLine types, and `group_matcher` is reused by parsing. `statusLine`/`outputStyle` are indexed `SINGLE_KEYS`. Renames: `Hook::matches_record`, `MAX_READ_BYTES`, `parse_fragment`/`parse_hooks`.
 - Item 11 (concurrent-change refusal through a real launch) was not added. Nothing runs between Roost's snapshot and its re-check except Roost's own `state.json` write: the fake claude runs after reconciliation, and a pre-launch modification only changes what is read. The only ways to test it would be a test-only hook in production code or a timing race, which would be flaky. The refusal stays covered at the `replace` seam by `replace_refuses_a_settings_file_changed_since_read`.
 - Tests: four new integration tests in `tests/settings.rs` (link dedupe, mode, interrupted launch recovery, number text) and two new unit tests (FIFO/device/oversized fragment reads, plus number text added to rendering). Existing tests were extended for the trailing newline, re-add warning and `statusLine` re-add.
+
+## Answer
+
+2026-10-06: Merged into `main` through the `shared-settings` integration branch (127946a, fix pass 6a0f6f5). Settings fragments (`--setting`, `--settings-from`) are reconciled into owned profiles' `settings.json` at launch, writing only on change, with record-first crash safety, exact number and key-order preservation, bounded non-blocking fragment reads, identity-based fragment de-duplication and preserved file modes. The two-axis review found no standards violations; its findings and the user's Q78/Q79 decisions (re-add with a warning; re-add a deleted `statusLine`) are fixed.
