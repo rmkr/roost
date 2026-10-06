@@ -194,6 +194,19 @@ fn namespace_protected(
     mode & 0o020 == 0 || private_gid() == Some(gid)
 }
 
+/// Whether a directory belongs to the effective user and only the user can
+/// write it: never world-writable or sticky, and group-writable only when its
+/// group is the user's private group. Used for startup directories.
+fn user_private_directory(
+    owner: u32,
+    gid: u32,
+    mode: u32,
+    euid: u32,
+    private_gid: impl FnOnce() -> Option<u32>,
+) -> bool {
+    owner == euid && mode & 0o1002 == 0 && (mode & 0o020 == 0 || private_gid() == Some(gid))
+}
+
 /// The real passwd/group databases through the C library (NSS included).
 struct SystemAccounts;
 
@@ -1167,6 +1180,18 @@ pub use path_setup::setup_path;
 mod tests {
     use super::*;
     use std::os::unix::fs::PermissionsExt;
+
+    #[test]
+    fn user_private_directory_accepts_only_the_private_group_as_writer() {
+        let private = || Some(1003);
+        assert!(user_private_directory(1001, 1003, 0o40755, 1001, private));
+        assert!(user_private_directory(1001, 1003, 0o40775, 1001, private));
+        assert!(!user_private_directory(1001, 1004, 0o40775, 1001, private));
+        assert!(!user_private_directory(1001, 1003, 0o40777, 1001, private));
+        assert!(!user_private_directory(1001, 1003, 0o41777, 1001, private));
+        assert!(!user_private_directory(0, 1003, 0o40755, 1001, private));
+        assert!(!user_private_directory(1001, 1003, 0o40775, 1001, || None));
+    }
 
     /// Injected passwd/group facts for the private-group namespace rule.
     struct FakeAccounts {

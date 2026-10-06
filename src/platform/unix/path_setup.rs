@@ -154,7 +154,13 @@ fn protected_parent(directory: &Directory) -> Result<()> {
         .file
         .metadata()
         .map_err(|e| Error::io("inspect startup directory", &directory.path, e))?;
-    if metadata.uid() != rustix::process::geteuid().as_raw() || metadata.mode() & 0o022 != 0 {
+    if !user_private_directory(
+        metadata.uid(),
+        metadata.gid(),
+        metadata.mode(),
+        rustix::process::geteuid().as_raw(),
+        system_private_group,
+    ) {
         return Err(Error::new(
             "ownership",
             "Startup directory must be user-owned and not writable by others",
