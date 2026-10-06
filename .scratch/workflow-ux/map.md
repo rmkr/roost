@@ -48,6 +48,7 @@ None in scope.
 
 ## Later
 
+- CI (GitHub Actions): deferred by the user on 2026-10-06. A ready workflow exists in history (commit before 8fda665: `.github/workflows/ci.yml`, Linux fmt/clippy/test, macOS and Windows build/clippy, macOS tests non-blocking); restore it with `git show 8fda665^:.github/workflows/ci.yml`.
 - Shared settings for registered upstream profiles and the default alias (not possible without writing borrowed data; revisit only if a non-writing route appears).
 
 ## Out of scope
