@@ -1,6 +1,6 @@
 # Roost implementation specification
 
-Approved by the user on 2026-10-06. Decision [06](issues/06-specification-readiness.md) and the [planning map](map.md) are resolved. Design Q1–Q9 and final confirmation Q10 are accepted; independent review is clean after one verified correction. No Rust application or release has been built or tested.
+Approved by the user on 2026-10-06. Amended the same day by [Workflow UX amendments](#workflow-ux-amendments-2026-10-06) through [Amend the specification for workflow UX](../workflow-ux/issues/01-amend-spec.md), pending the user's acceptance. Decision [06](issues/06-specification-readiness.md) and the [planning map](map.md) are resolved. Design Q1–Q9 and final confirmation Q10 are accepted; independent review is clean after one verified correction. No Rust application or release has been built or tested.
 
 ## Purpose and authority
 
@@ -26,7 +26,7 @@ Roost uses MIT. Extra upstream credits/revision text is not required in README/h
 
 ## Version and platform targets
 
-Initial source-testing toolchain: Rust/Cargo **1.97.0**. This is a selected pin, not a proven application MSRV. Claude Code **2.1.280+** is the selected documented lower bound for status `configDirectory`; prove floor/current required features before claiming support, and explicitly raise the floor if needed. Fish **3.2+** supplies `fish_add_path --path`. PowerShell **5.1** and **7+** remain required. Use portable POSIX syntax for sh/Bash/Zsh; record actual tested versions rather than invent historical floors.
+Initial source-testing toolchain: Rust/Cargo **1.97.0**. This is a selected pin, not a proven application MSRV. Claude Code **2.1.280+** is the selected minimum, raised from 2.1.268 by the [workflow UX amendments](#workflow-ux-amendments-2026-10-06) because injected plugins need `CLAUDE_CODE_PLUGIN_DIRS`; it also covers status `configDirectory`. Prove floor/current required features before claiming support, and explicitly raise the floor if needed. Fish **3.2+** supplies `fish_add_path --path`. PowerShell **5.1** and **7+** remain required. Use portable POSIX syntax for sh/Bash/Zsh; record actual tested versions rather than invent historical floors.
 
 | Environment | Required Rust target | Intended combined runtime baseline |
 | --- | --- | --- |
@@ -48,28 +48,50 @@ On native Windows the PATH-selected Claude must be native `claude.exe`. A select
 ## Public CLI
 
 ```text
-roost add NAME
+roost [--allow-auth-env] [-- [CLAUDE_ARGS...]]
+roost add NAME [--no-sets]
 roost add NAME --link-default
-roost add NAME --copy-default [--source DIR] [--yes]
+roost add NAME --copy-default [--source DIR] [--yes] [--no-sets]
 roost register NAME --path DIR
 roost reuse NAME
-roost list [--retained] [--json]
+roost list [--retained] [--full] [--json]
 roost where NAME
 roost run [--allow-auth-env] NAME [--] [CLAUDE_ARGS...]
+roost switch [--allow-auth-env] NAME [--] [CLAUDE_ARGS...]
+roost switch --no-launch NAME
+roost switch --forget
 roost status [--allow-auth-env] NAME [--json]
 roost token NAME [--stdin | --clear]
 roost remove NAME [--purge [--yes]]
 roost update
 roost setup-path [--shell SHELL] [--apply]
 roost doctor [--json]
+roost set list [--json]
+roost set create SET [--default]
+roost set delete SET
+roost set default SET [--off]
+roost set add SET ITEM
+roost set drop SET ITEM
+  ITEM: --skill DIR | --skills-from DIR | --instruction FILE | --instructions-from DIR | --plugin PLUGIN@MARKETPLACE
+roost set subscribe NAME SET...
+roost set unsubscribe NAME SET...
+roost plugin list [--json]
+roost plugin marketplace add SOURCE
+roost plugin add PLUGIN[@MARKETPLACE] [--set SET... | --no-set]
+roost plugin update [PLUGIN]
+roost plugin auto-update (--on | --off)
+roost plugin remove PLUGIN
+roost desktop NAME
 roost help [COMMAND]
 roost --help | -h
 roost --version | -v
 ```
 
-Aliases: `ls`, `path`, `rm`. No args: successful help. Version: bare version plus newline. Parse before storage mutation, prompts or secret input. Reject unknown switches/commands, extra positionals and invalid combinations. Copy and link conflict; source requires copy; stdin/clear conflict; yes requires copy/purge; JSON exists only for list/status/doctor. Help/version do not inspect/create storage or require Claude.
+Aliases: `ls`, `path`, `rm`. No args launches the [selected profile](#selected-profile-and-switching) (amended 2026-10-06; previously successful help). Version: bare version plus newline. Parse before storage mutation, prompts or secret input. Reject unknown switches/commands, extra positionals and invalid combinations. Copy and link conflict; source requires copy; no-sets conflicts with link; stdin/clear conflict; yes requires copy/purge; JSON exists only for list/status/doctor/set list/plugin list; full only for list. Switch's no-launch and forget conflict with each other, with allow-auth-env and with a Claude tail; forget takes no NAME. Set add/drop take exactly one item switch; subscribe/unsubscribe take at least one SET; plugin add's repeatable `--set` conflicts with `--no-set`. Help/version do not inspect/create storage or require Claude.
 
-Run manager options precede NAME. Consume exactly one optional initial separator after NAME and preserve the remaining `OsString` tail, including `--help`, order, empty arguments and boundaries. `run work -- --` forwards a literal initial `--`. Other commands allow their switches around positionals. Launchers consume no caller switches or separators.
+Run and switch manager options precede NAME. Consume exactly one optional initial separator after NAME and preserve the remaining `OsString` tail, including `--help`, order, empty arguments and boundaries. `run work -- --` forwards a literal initial `--`. Bare `roost` accepts only an optional leading `--allow-auth-env` followed by nothing or by `--` and an opaque tail; `roost -- --help` forwards `--help`, while `roost --help`/`-h`/`--version`/`-v` keep their manager meaning. Any other first token is a command or switch; an unknown one is a usage error, never a profile name. Other commands allow their switches around positionals. Launchers consume no caller switches or separators.
+
+Set names follow profile-name rules in a separate case-insensitive namespace. PLUGIN and MARKETPLACE are opaque Claude identifiers: 1–128 characters, valid Unicode, no whitespace, control characters, `/`, `\` or a second `@`.
 
 Names: 1–32 ASCII characters, first alphanumeric then alphanumeric/underscore/hyphen; reject case-insensitive CON/PRN/AUX/NUL/COM1–9/LPT1–9. Apply validation on reads too. All manager lookups and uniqueness checks are ASCII case-insensitive. Stored spelling, directories and regenerated launcher spelling do not change on a casing variant. Native launcher filename casing follows the OS. Session names/UUIDs are opaque Claude arguments.
 
@@ -92,6 +114,13 @@ Check paths as physical objects as well as strings. Do not authorize ownership b
     .roost-profile.json         owned isolated-profile marker
     .roost-token                optional owned manager token
     ...                         Claude-owned configuration/state
+  state.json                    launch-written state: selections, last use, recorded links (amended)
+  sets.json                     shared sets, subscriptions, plugin settings (amended)
+  .roost-state-<ID>.tmp          transient private replacement of state.json/sets.json (amended)
+  plugin-store/                 plugin store: Roost-owned Claude config dir, no account (amended)
+    .roost-store.json           store marker
+  desktop/<REGISTRATION_ID>/     Desktop data folder for one registration (amended)
+    .roost-desktop.json         Desktop folder marker
   bin/roost-NAME                 POSIX launcher (all required systems)
   bin/roost-NAME.cmd             native Windows only
   bin/roost-NAME.ps1             native Windows only
@@ -144,21 +173,21 @@ Token replacement privately stages and flushes bytes, establishes protection bef
 
 ## Locking, transactions and recovery
 
-One stable `.roost-lock` open object per initialized root. `try_lock` polling plus cancellation waits at most 10 seconds, then reports retry guidance (operational exit 1); no automatic lock-file deletion. Exclusive lock protects mutation and brief launch preparation. Read commands may acquire the same brief lock for a coherent view, but never recover/mutate. No handle inherits into Claude. Release before waiting for a session, native diagnostic probe, secret input or confirmation; reacquire and revalidate after prompts. Distinct roots do not coordinate upstream/external writers. Concurrent Claude launches are permitted.
+One stable `.roost-lock` open object per initialized root. `try_lock` polling plus cancellation waits at most 10 seconds, then reports retry guidance (operational exit 1); no automatic lock-file deletion. Exclusive lock protects mutation and brief launch preparation. Read commands may acquire the same brief lock for a coherent view, but never recover/mutate. No handle inherits into Claude. Release before waiting for a session, native diagnostic probe, secret input, picker or confirmation (plugin store commands are the one exception: they hold the lock for the store child); reacquire and revalidate after prompts. Distinct roots do not coordinate upstream/external writers. Concurrent Claude launches are permitted.
 
 Each mutation writes a private complete intent before changing published artifacts, stages complete replacements and commits registry last. Intent shape:
 
 ```text
 schema_version: 1
 root_id, operation_id: ID
-operation: initialize | add | register | reuse | remove | purge | token_set | token_clear
+operation: initialize | add | register | reuse | remove | purge | token_set | token_clear | store_create | desktop_create
 registration_id: ID or null for initialize
 prior_generation, next_generation: unsigned integers (next = prior + 1)
 phase: prepared | publishing | committed | cleanup
 artifacts: [{ role, destination, staged, before, after, action, completed }]
 ```
 
-Role is profile/launcher/token/registry/marker/staging_directory; action is create/replace/delete. Each artifact has an absolute destination, a nullable staged object `{path:string, object_identity:FileIdentity}`, and distinct nullable before/after destination states. Null before means verified absent at preflight; null after means intended absent after deletion. Create requires null before/non-null after; replace requires both; delete requires non-null before/null after. Each non-null state is exactly:
+Role is profile/launcher/token/registry/marker/staging_directory/store/desktop_data; action is create/replace/delete. Each artifact has an absolute destination, a nullable staged object `{path:string, object_identity:FileIdentity}`, and distinct nullable before/after destination states. Null before means verified absent at preflight; null after means intended absent after deletion. Create requires null before/non-null after; replace requires both; delete requires non-null before/null after. Each non-null state is exactly:
 
 ```text
 object_identity: FileIdentity
@@ -180,7 +209,8 @@ All public/private launch preparation checks pending intent and rejects recovery
 | Reuse/identical register refresh | Stage required templates/binding; preflight every destination; replace only exact owned templates for this registration, then registry. Pending state blocks launch. Proven new wrappers can be rolled back to recorded owned binding or left blocked with explicit guidance; never overwrite foreign replacement. |
 | Ordinary remove | Preflight all launchers before deleting any; retain registry/evidence if a later deletion fails, report changed/remaining artifacts. Successful owned removal commits retained state; borrowed/alias removal drops record. Recovery of interrupted removal restores the previous active registry bookkeeping only after reporting missing launchers; explicit reuse repairs them, or explicit remove retries. |
 | Token set/clear | Stage/protect token if setting. Record intent before replace/delete, then increment registry generation. Recovery determines actual token presence/identity, completes committed bookkeeping or reports whether old/new/absent token remains; do not invent rollback of secret bytes. Explicit token command can retry. |
-| Purge | Validate active/retained owned marker/registry/root agreement, all launchers and directory identity before confirmation. Preserve root marker and profile marker throughout content deletion. Journal remains after partial failure; no automatic continuation of deletion. Explicit remove --purge must revalidate and reconfirm/reacknowledge before retry. Commit removal only after deletion finishes. |
+| Store/Desktop folder creation | Exclusively create the private directory, record its identity, write its marker, then increment registry generation; registrations are unchanged. Recovery removes a proven new directory that is still empty or holds only its partial marker, or completes bookkeeping for a marked one. |
+| Purge | Validate active/retained owned marker/registry/root agreement, all launchers and directory identity before confirmation. The registration's Desktop folder, if present, is a separate journaled `desktop_data` artifact deleted after profile content with the same marker-last rule. Preserve root marker and profile marker throughout content deletion. Journal remains after partial failure; no automatic continuation of deletion. Explicit remove --purge must revalidate and reconfirm/reacknowledge before retry. Commit removal only after deletion finishes. |
 
 For purge, enumerate immediate entries through the validated owned directory, retaining `.roost-profile.json` until last; unlink contained links themselves, and use std's non-following `remove_dir_all` for each real child directory rather than writing a recursive deletion engine. Revalidate anchored ownership before each step. Remove marker and empty profile directory at the final boundary; a crash in that final empty interval may only finish empty-directory/bookkeeping cleanup with matching journal/root/physical identity, never authorize deletion of newly introduced content without marker evidence. Partial deletion is irreversible and must be reported. Native reparse/hardlink/symlink-race fixtures are required. Std traversal guarantees do not replace the initial ownership decision.
 
@@ -190,7 +220,7 @@ Completion/abort cleanup touches only journal-listed objects with matching root/
 
 Add creates isolated owned data or a local pass-through alias with launchers; active/retained name blocks add. Empty/alias creation has no confirmation. Register accepts only a real `<upstream-home>/.ccm/profiles/<upstream-name>` directory including custom upstream homes; preserve path. Reject conventional default, Roost data, overlaps/duplicates/redirection. Safely recognize linked-default marker; same name/path/physical identity/kind refreshes launchers, changed mapping/marker fails. Reuse restores retained owned data or refreshes active registrations; missing unsafe isolated/borrowed roots fail, never reconstruct data.
 
-List is metadata-only, active by default; retained flag includes retained owned records. Run/status/token need active registration; where also accepts safe retained owned. Ordinary remove retains owned data/token/evidence and reports that native login is unchanged; already-retained safe owned remove is a no-op. Purge only active/retained owned isolated data; reject borrowed/default before prompting even with yes. No automatic native logout/revocation.
+List is metadata-only, active by default; retained flag includes retained owned records; full adds bounded probes ([`roost ls`](#roost-ls)). Run/status/token need active registration; where also accepts safe retained owned. Ordinary remove retains owned data/token/evidence and reports that native login is unchanged; already-retained safe owned remove is a no-op. Purge only active/retained owned isolated data, plus Roost-owned per-registration data under [remove and purge](#remove-and-purge); reject borrowed/default data before prompting even with yes. No automatic native logout/revocation.
 
 Copy source: explicit source, nonempty inherited CLAUDE_CONFIG_DIR, conventional default. Reject absent/non-directory/redirected root and overlap; require quiet-source acknowledgement. Never interpret ROOST_DIR as source/home. Copy ordinary settings/plugin/history files independently, never hardlink. Exclude top-level cache/daemon/ide/paste-cache/shell-snapshots/telemetry/backups. At every depth exclude `.credentials.json`, `.claude.json` and their basename-plus-dot variants, `.ccm-oauth-token`, `.ccm-linked-default`, `.roost-root.json`, `.roost-profile.json`, `.roost-token`, `.roost-operation.json`, `.roost-lock`, `.roost-stage` and Roost-created temporary ownership/token names. Do not copy a separate companion `.claude.json` or parse global native state. Skip/report contained links/reparse points/multiply-linked regular/special files. Unreadable selected ordinary file fails staging. Copied settings/history may still contain secrets/helpers/machine references; require native login/auth verification afterward. Report omission paths/reasons/counts safely without file contents.
 
@@ -214,7 +244,7 @@ PowerShell .ps1 treats the received string-array tail as data, uses .NET Process
 
 Resolve the shared Claude through caller platform PATH. Unix accepts executable/shebang installations; Windows follows selected PATH/PATHEXT result and requires native claude.exe. No shell interpolation of Claude argument values. Validate supported version for launches/status/update, using bounded version probe; missing/unsupported result refuses with guidance. Version probes inherit ordinary caller environment without profile token injection and never read native credentials. Doctor captures version once, never runs auth status for every profile.
 
-For isolated run/status set only CLAUDE_CONFIG_DIR=stored directory, DISABLE_AUTOUPDATER=1, FORCE_AUTOUPDATE_PLUGINS=1 plus a safe manager CLAUDE_CODE_OAUTH_TOKEN when eligible. Keep cwd/stdio/other environment. Refuse nonempty (including whitespace/0/false) inherited names from the exact finite [authentication table](issues/04-command-contract.md#launch-authentication-and-update-environment); no prefix heuristics or cloud-SDK reimplementation. Check before token injection; empty/absent is allowed. Isolated directory overrides inherited CLAUDE_CONFIG_DIR. Allow-auth-env preserves caller auth/provider variables and suppresses all manager token injection, but still checks root/token path/permissions. Aliases preserve entire caller environment and bypass token injection/auth conflicts, including empty/other-root ROOST_DIR and CLAUDE_CONFIG_DIR. Scope is pass_through, never isolated.
+For isolated run/status set only CLAUDE_CONFIG_DIR=stored directory, DISABLE_AUTOUPDATER=1, FORCE_AUTOUPDATE_PLUGINS=1 plus a safe manager CLAUDE_CODE_OAUTH_TOKEN when eligible; isolated launches (owned and upstream; not status) also set CLAUDE_CODE_PLUGIN_DIRS when the registration's sets provide store plugins ([plugin store](#plugin-store)). Keep cwd/stdio/other environment. Refuse nonempty (including whitespace/0/false) inherited names from the exact finite [authentication table](issues/04-command-contract.md#launch-authentication-and-update-environment); no prefix heuristics or cloud-SDK reimplementation. Check before token injection; empty/absent is allowed. Isolated directory overrides inherited CLAUDE_CONFIG_DIR. Allow-auth-env preserves caller auth/provider variables and suppresses all manager token injection, but still checks root/token path/permissions. Aliases preserve entire caller environment and bypass token injection/auth conflicts, including empty/other-root ROOST_DIR and CLAUDE_CONFIG_DIR. Scope is pass_through, never isolated.
 
 Run/update use uncaptured native execution and inherit stdin/stdout/stderr and console/cwd. On Unix use CommandExt::exec after closing store/lock handles and restoring manager-owned terminal/signal changes: Claude replaces Roost in the same PID/foreground group, so native signals and exit status reach the caller directly. On Windows spawn the native child and wait in the shared console. Update invokes exactly `claude update` with unchanged caller environment; it is shared-Claude updating, not Roost self-update, and never injects profile/token/plugin/update variables. Claude enforces caller restrictions; Roost neither installs nor package-manager-falls-back.
 
@@ -232,24 +262,26 @@ All JSON commands use `{ "schema_version":1, "data":..., "warnings":[], "error":
 
 | Command | Exact data object |
 | --- | --- |
-| list | `{ "profiles": [ProfileRecord] }` |
+| list | `{ "project":string|null, "profiles": [ProfileRecord] }`; project (amended) is the current project key, null when unavailable |
 | status | `{ "name":string|null, "kind":Kind|null, "reported_logged_in":boolean|null, "auth_method":AuthMethod|null, "config_directory":string|null, "scope":"isolated"|"pass_through"|null }` |
 | doctor | `{ "claude_path":string|null, "claude_version":string|null, "storage_directory":string|null, "launcher_directory":string|null, "path_member":boolean|null, "profiles":[ProfileRecord], "findings":[Finding] }` |
+| set list | `{ "sets":[{ "name":string, "default":boolean, "items":[{ "kind":ItemKind, "value":string }], "subscribers":[string] }] }`; ItemKind is `skill`, `skill_source`, `instruction`, `instruction_source` or `plugin`; value is the absolute path or plugin ID |
+| plugin list | `{ "auto_update":boolean, "last_auto_update":integer|null, "plugins":[{ "id":string, "sets":[string] }] }` |
 
-ProfileRecord is exactly `{ "name":string, "kind":Kind, "state":"active"|"retained", "directory":string|null, "token_present":boolean|null, "launchers":[{ "path":string, "condition":"ready"|"missing"|"unsafe"|"collision"|"stale"|"not_required" }] }`. Kind uses owned/upstream/default_alias. Directory is stored isolated/borrowed root, or expected caller directory for an alias; list computes this without creating it. A registered linked-default alias's upstream marker-directory is not its effective Claude directory; persisted evidence remains internal. Token_present is safe manager/borrowed token presence only (null when unsafe/unavailable, false for aliases), not auth validity. Retained launchers are not_required when absent; stale/foreign leftovers are reported. Finding is `{ "code":string, "severity":"warning"|"error", "message":string, "path":string|null, "next_step":string|null }`. Findings serialize storage/launcher/Claude/PATH/recovery checks, not account identity.
+ProfileRecord is exactly `{ "name":string, "kind":Kind, "state":"active"|"retained", "directory":string|null, "token_present":boolean|null, "launchers":[{ "path":string, "condition":"ready"|"missing"|"unsafe"|"collision"|"stale"|"not_required" }], "sets":[string], "last_used":integer|null, "selected":boolean, "most_recent":boolean, "probe":{ "reported_logged_in":boolean|null, "auth_method":AuthMethod|null, "config_directory":string|null }|null }` (last five keys amended 2026-10-06). Sets are subscribed set names sorted by folded name (empty for aliases). Last_used is Unix seconds UTC of the last recorded launch. Selected is true only for the current project's valid selection; most_recent only for the registration with the greatest last_used. Probe is null without `--full`, for aliases and for retained records; with `--full` its fields follow status recognition and are null on probe failure with a safe warning. Kind uses owned/upstream/default_alias. Directory is stored isolated/borrowed root, or expected caller directory for an alias; list computes this without creating it. A registered linked-default alias's upstream marker-directory is not its effective Claude directory; persisted evidence remains internal. Token_present is safe manager/borrowed token presence only (null when unsafe/unavailable, false for aliases), not auth validity. Retained launchers are not_required when absent; stale/foreign leftovers are reported. Finding is `{ "code":string, "severity":"warning"|"error", "message":string, "path":string|null, "next_step":string|null }`. Findings serialize storage/launcher/Claude/PATH/recovery checks, not account identity.
 
-Sort profile records by folded name then stored spelling, launcher records by path and findings by code/path for deterministic CLI fixtures. Errors may retain safe partial data. Doctor remains read-only: PATH absence alone warning, missing Claude/required active launchers/unsafe paths/collisions/recovery requiring action fail. Retained profiles need no working launchers. Never chmod/fix/remove while diagnosing.
+Sort profile records by folded name then stored spelling, launcher records by path and findings by code/path for deterministic CLI fixtures. Errors may retain safe partial data. Doctor remains read-only: [Desktop](#desktop) and [state](#state-files) findings are warnings; PATH absence alone warning, missing Claude/required active launchers/unsafe paths/collisions/recovery requiring action fail. Retained profiles need no working launchers. Never chmod/fix/remove while diagnosing.
 
-Stable error categories: usage, not_found, collision, ownership, unsafe_path, auth_conflict, invalid_token, claude_unavailable, claude_unsupported, auth_status, io, diagnostics, cancelled. Do not add secret/native-field details to explain them. Include safe operation/profile/path and concrete next step, actual changed/remaining state on partial failure.
+Stable error categories: usage, not_found, collision, ownership, unsafe_path, auth_conflict, invalid_token, claude_unavailable, claude_unsupported, auth_status, io, diagnostics, cancelled, plugin_store, desktop_running (last two amended 2026-10-06). Do not add secret/native-field details to explain them. Include safe operation/profile/path and concrete next step, actual changed/remaining state on partial failure.
 
 | Result | Exit |
 | --- | --- |
 | Success/help/version/warning-only doctor | 0 |
 | Operational/safety/failed doctor/unknown status | 1 |
-| Invalid manager syntax | 2 |
+| Invalid manager syntax; picker or set prompt needed without a terminal | 2 |
 | Recognized native status logged out | 3 |
-| Declined confirmation/terminal EOF/cancel before child handoff | 130 |
-| Run/update child | Numeric child result, Unix 128+signal, Windows native result |
+| Declined confirmation/terminal EOF/cancel before child handoff, including picker and set prompt | 130 |
+| Run/update/switch/bare-launch/desktop child | Numeric child result, Unix 128+signal, Windows native result |
 
 Empty explicit token stdin is invalid_token, not terminal cancellation. A pending purge is reported as partial deletion, never as successfully retained intact data.
 
@@ -262,6 +294,95 @@ Bash: actual-home .bashrc. Zsh: nonempty ZDOTDIR/.zshrc else actual-home .zshrc.
 Fish: one complete owned `roost-path.fish` in configured user conf.d, with the same Roost markers and `fish_add_path --path 'resolved-launcher-directory'`. Obtain configured user directory from the selected Fish's supported `__fish_config_dir` query, with native XDG/home fallback only for conventional configuration; fail when discovery is ambiguous. Respect nonempty XDG_CONFIG_HOME; do not modify universal vars. Foreign/malformed snippet refuses. Shell startup discovery can execute user shell setup, so do not treat captured output as authority without validating the single path; no source parsing of arbitrary scripts.
 
 Native Windows: read/write only HKCU Environment Path, preserve existing order/spelling/value kind, append resolved launcher directory once using case-insensitive membership, notify environment change and advise new terminal. Preserve expandable entries; compare a safely expanded view for membership without rewriting their stored spelling. No system PATH/current-parent environment mutation/automatic undo. Cargo's executable bin PATH is a separate manual installation concern.
+
+## Workflow UX amendments (2026-10-06)
+
+Source: [workflow UX design](../workflow-ux/design.md), [ADR 0001](../../docs/adr/0001-shared-plugins-injected-at-launch.md), [ADR 0002](../../docs/adr/0002-desktop-per-profile-via-user-data-dir.md). Ownership invariants are unchanged: nothing below writes into registered upstream or default data. Upstream and alias state lives only in Roost's own files, keyed by registration ID.
+
+### State files
+
+`state.json` and `sets.json` are side files, not journaled mutations. Write them only under the root lock by creating `.roost-state-<ID>.tmp` exclusively and privately in the root, writing and flushing the complete document, then renaming over the destination with the same protections as the registry. Validate the destination's owner/mode/link count before replacement. A leftover temp file is admitted by root validation and removed by the next side-file write only when it is a private regular single-link current-user file of that pattern. Absent files mean empty state; read commands never create them.
+
+```text
+state.json: { schema_version:1, root_id:ID,
+  selections:  [{ project:absolute-path, registration_id:ID }],
+  last_used:   [{ registration_id:ID, at:unix-seconds }],
+  links:       [{ registration_id:ID, path:relative-path, target:absolute-path, link_identity:FileIdentity }],
+  desktop_launched: [{ registration_id:ID, at:unix-seconds }],
+  plugin_auto_update_at: unix-seconds | null }
+sets.json: { schema_version:1, root_id:ID,
+  sets: [{ name:string, default:boolean, items:[{ kind:ItemKind, value:string }] }],
+  subscriptions: [{ registration_id:ID, set:string }],
+  plugin_auto_update: boolean }
+```
+
+Link `path` is relative to the profile directory (`skills/NAME` or `rules/NAME.md`). Validation follows the registry rules (exact schema, root-ID match, no duplicate project/registration/name/path entries). Entries naming a registration ID absent from the registry are ignored and dropped by the next write. At launch a missing, malformed or unsupported side file is a safe warning and the launch proceeds without that state and without rewriting it; explicit `switch`, `set`, `plugin` and `add` writes fail with the registry's validation category instead. Side files never hold tokens, credentials or Claude output.
+
+### Selected profile and switching
+
+Project key: walk from the current directory toward the filesystem root to the first `.git` entry. A directory is the git directory; a regular file of the form `gitdir: PATH` names it (relative to the file's directory). If the git directory contains `commondir`, resolve its single-line path relative to the git directory. The key is that common directory as an absolute path, so all worktrees share one key; without `.git` it is the current directory. Do not run git or read `GIT_DIR`/`GIT_COMMON_DIR`. A malformed `.git` file or `commondir` falls back to the current directory with a safe warning. A key that is not valid Unicode without CR/LF is unsafe_path for selection commands and makes list's `project` null.
+
+Bare `roost` launches the registration selected for the current project with the tail after `--`, exactly as `run` would. A selection is valid only when its registration is active. With no valid selection (a stale one first warns naming the forgotten profile), Roost shows the picker when stdin and stderr are both terminals; otherwise it fails usage (exit 2) with next steps `roost switch NAME` and `roost run NAME`. With no active registrations it fails not_found naming `roost add NAME`. The picker shows even for one profile.
+
+Picker: single-choice list on stderr of active registrations sorted as list, each row the `ls` columns. Initial highlight is the most recently launched registration, else the first row. Up/Down (and k/j) move, Enter chooses; Ctrl-C, Esc, `q` or EOF cancel with exit 130 and no state change. Raw mode is restored on every exit. The lock is released while the picker waits; afterwards reacquire, revalidate the choice and record the selection before launching.
+
+`switch NAME` records NAME as this project's selection and launches it like `run`; `--no-launch` only records; `--forget` removes this project's selection (success when none). NAME must be active; default aliases may be selected. Selection is recorded before launch preparation, so a later launch failure leaves it in place.
+
+Last use: `run`, `switch`, bare `roost` and profile launchers set `last_used` for the launched owned or upstream registration. Default-alias launches never record last use; picking or switching to an alias records only the selection. The most recent registration is the one with the greatest `at`.
+
+### `roost ls`
+
+Human `list` prints one table on stdout: marker column (`@` selected for this project, `^` most recent, space otherwise; `@` wins), then Profile, Kind, Token (`✓`, `–` absent, `?` unknown), Launchers (`ready` when every required launcher is ready, else the worst condition), Sets (comma-joined, `—` when none), Last used (relative: `now`, `Nm`, `Nh`, `Nd`, `never`). Columns align by display width. A summary line follows: profile count, upstream count, marker legend and the names of columns hidden to fit the terminal width (Path is always hidden in the default view). Color only when stdout is a terminal and `NO_COLOR` is unset or empty; piped output is plain, same columns. `--retained` keeps its meaning. `--full` adds Login, Auth and Claude dir columns from status probes for active owned/upstream rows, run in parallel under the existing 10-second/1 MiB bounds and allowlist; the lock is not held during probes and a failure shows `?` with a warning. Default list runs no probes.
+
+### Shared sets
+
+A set has a name, a default flag and items. Item kinds (v1): `skill` (an absolute skill directory, linked under `skills/` as its basename), `skill_source` (a directory; every immediate child directory is a skill), `instruction` (an absolute `.md` instruction fragment, linked under `rules/` as its basename), `instruction_source` (a directory; every immediate child regular `.md` file is a fragment) and `plugin` (a store plugin ID). Paths are stored absolute per Q8 and need not exist at definition time. Source expansion skips entries whose names start with `.`, are not valid Unicode, contain CR/LF, or are named `synced`, and skips links/non-matching types. Roost never writes into source directories.
+
+Commands: `set create` refuses an existing name (collision). `set delete` drops the set and its subscriptions; recorded links leave at each profile's next launch. `set default` marks or (`--off`) unmarks. `set add`/`set drop` add or remove one item; adding a duplicate or dropping an absent item is a no-op success; `--plugin` requires the plugin to be installed in the store (not_found). `set subscribe NAME SET...` and `unsubscribe` accept active or retained owned registrations and active upstream registrations; aliases fail usage ("default aliases receive no shared items"). Subscribing is refused (collision) when, after the change, two different subscribed items would produce the same link path or the same plugin name from different marketplaces; this is checked against current source contents. A subscription on an upstream registration delivers only plugin items; skills and instructions are ignored for it.
+
+`add` of an owned profile subscribes it to every default set after the registry commits, unless `--no-sets`. `add --copy-default` whose source resolves to the physical directory of an active or retained owned registration copies that registration's subscriptions instead of the default sets. Copy already skips contained links, so recorded links are not copied; the next launch creates them. A subscription write failure after a committed add warns with a `roost set subscribe` next step.
+
+Reconciliation (owned registrations only, at every launch, under the lock): desired links are the union of subscribed skill and instruction items after expansion. A path desired by two items is a launch-time conflict: warn and skip that path. For each recorded link no longer desired or whose target changed, remove it only when the object at its path is still the recorded symlink (same identity, same target text); a missing or replaced object drops the record with a warning and is never touched. For each desired path: if absent, create the `skills/` or `rules/` directory if needed (private) and a symlink with the absolute target through the verified profile directory handle, then record it; if anything else exists there, existing content wins: warn and skip. Never create, remove or replace `skills/synced` or `plugins/synced`. Targets are not followed or validated beyond their link text. Links are Unix symlinks; Windows link support is deferred with the rest of the Windows backend. A profile's `CLAUDE.md` is never touched.
+
+Pending research ([ticket 06](../workflow-ux/issues/06-injected-plugin-behavior.md)): whether `rules/` in a config directory loads like `CLAUDE.md`. If it does not, instruction items instead reconcile a Roost-managed block in the owned profile's `CLAUDE.md`, delimited by `<!-- >>> roost instructions >>> -->` and `<!-- <<< roost instructions <<< -->`, holding one `@ABSOLUTE-PATH` line per fragment. That fallback follows the PATH-block rules: one well-formed block, replaced only through private same-directory staging and revalidation, content outside the block preserved byte-for-byte, malformed or multiple blocks refused with a warning at launch. This choice must be settled before instruction items are implemented.
+
+### Launch-time mutation
+
+Launch preparation (`run`, `switch`, bare `roost`, profile launchers, `desktop`) keeps its existing checks, including refusing a pending intent; it never recovers journaled operations. After those checks pass and while still holding the brief lock it: records selection (switch/picker) and last use; for owned registrations reconciles links; and, when auto-update is due, updates store plugins. Then it releases the lock and hands off. Each of these steps that fails emits a safe stderr warning and the launch continues. Lock contention keeps the existing 10-second failure. `status`, `where` and `list` do none of this.
+
+### Plugin store
+
+`<root>/plugin-store/` is a Roost-owned Claude config directory with no account that never runs sessions. Its first use creates it through the `store_create` journal operation with marker `.roost-store.json` `{schema_version:1, root_id:ID, directory_identity:FileIdentity}`. It is never a registration, copy source or `where` result.
+
+Store commands run the PATH-selected Claude (version-checked) as `claude plugin marketplace add SOURCE`, `claude plugin install ID`, `claude plugin update [ID]` and `claude plugin uninstall ID` with the caller's environment plus `CLAUDE_CONFIG_DIR=<store>` and `DISABLE_AUTOUPDATER=1`, minus `CLAUDE_CODE_OAUTH_TOKEN` and `CLAUDE_CODE_PLUGIN_DIRS`; no manager token is injected and the auth-conflict table does not apply. Unlike launches, the root lock is held for the whole store command (handle not inheritable); the child is spawned with inherited stdio and waited for, with no deadline. A nonzero child exit is plugin_store (exit 1) naming the retry command; Roost's own records change only after success.
+
+`plugin add` resolves `PLUGIN` without `@MARKETPLACE` through Claude's store listing (fields fixed by ticket 06); ambiguity or absence is not_found. Without `--set`/`--no-set`, a terminal shows the sets and reads a comma-separated list (empty for none) before taking the lock; without a terminal it fails usage naming both flags; with no sets it proceeds with none. Named sets must exist (not_found) and pass the subscribe conflict rule (collision) before install. After a successful install the plugin ID is added to the sets. `plugin update` updates one or all store plugins. `plugin remove` first drops the ID from every set, then uninstalls; an uninstall failure is plugin_store and may be retried. `plugin list` reports store plugins known to Roost's sets plus the auto-update state. `plugin auto-update` sets `plugin_auto_update`.
+
+Injection: for an isolated launch, collect the plugin items of every subscribed set, deduplicate by ID, and resolve each to its installed directory inside the store (which directory, and how Roost learns it without parsing undocumented state, is fixed by ticket 06). Missing plugins are skipped with a warning. If any remain, set `CLAUDE_CODE_PLUGIN_DIRS` to the caller's nonempty inherited value (if any) followed by the store directories, joined with the platform path-list separator; otherwise leave the variable as inherited. Allow-auth-env does not affect injection. Aliases, status probes and `update` never receive it. Injected plugins appear as `name@inline`; Claude does not auto-update them.
+
+Auto-update: when `plugin_auto_update` is true and `plugin_auto_update_at` is null or at least 24 hours old, a launch first writes the new timestamp (so concurrent launches skip), then runs `claude plugin update` in the store with stdin null, output captured and discarded under the 1 MiB cap, and an 8-second deadline (kept below the 10-second lock wait of concurrent launches). Timeout or failure terminates/reaps the child, warns and launches.
+
+### Desktop
+
+`roost desktop NAME` (experimental, Linux only; other platforms fail claude_unavailable) needs an active registration and resolves `claude-desktop` through PATH (missing: claude_unavailable). There is no forwarded argument tail.
+
+- Owned/upstream: the data folder is `<root>/desktop/<REGISTRATION_ID>/`, created on first use by the `desktop_create` journal operation with marker `.roost-desktop.json` `{schema_version:1, root_id:ID, registration_id:ID, directory_identity:FileIdentity}`. Launch preparation is the isolated `run` preparation (auth checks, token, plugin injection, reconciliation, last use), then exec `claude-desktop --user-data-dir=<folder>` and record `desktop_launched`.
+- Default alias: exec plain `claude-desktop` with the caller's environment; no folder, nothing recorded.
+- Running check: if the folder's Electron `SingletonLock` link names this host and a live PID, fail desktop_running ("this profile's Desktop is already running"). If any other Roost Desktop folder, or the conventional `~/.config/Claude`, holds such a live lock, warn that Cowork is untested with a second concurrent Desktop, and launch.
+- Doctor: for each folder with a `desktop_launched` record but no Electron data besides the marker, finding `desktop_data_not_isolated` (warning) suggesting the flag may have stopped working.
+
+### Remove and purge
+
+| State | Ordinary remove (owned: retained) | Remove of upstream/alias (record dropped) | Purge (owned) |
+| --- | --- | --- | --- |
+| Selections | Cleared | Cleared | Cleared |
+| Last use, `desktop_launched` | Kept | Dropped | Dropped |
+| Subscriptions | Kept, so reuse restores them | Dropped | Dropped |
+| Recorded links | Links stay in retained data; records kept | n/a | Links unlinked as contained links, never followed; records dropped |
+| Desktop folder | Kept | See below | Deleted (journaled `desktop_data`) |
+| Plugin store | Untouched | Untouched | Untouched |
+
+Side-file changes happen after the registry commits; failure warns with a `roost switch --forget` or `roost set unsubscribe` next step, and dropped registration IDs are ignored by readers anyway. An upstream registration with a Desktop folder refuses ordinary remove (collision) with next step `roost remove NAME --purge`; for upstream registrations `--purge` deletes only that Roost-owned folder (same confirmation, marker-last and journal rules) and then drops the record, never touching borrowed data. Aliases still reject purge. The plugin store has no removal command; uninstall plugins with `plugin remove`.
 
 ## Source install, upgrade and practical recipes
 
@@ -314,6 +435,10 @@ Implement checks as code exists, using disposable roots and fake secrets; no pro
 | A11 PATH | Temporary homes/ZDOTDIR/XDG/custom Fish discovery; foreign/malformed/multiple/redirection/hardlinked startup targets, repeated apply, quoting and new-shell membership. Only one owned block/snippet changes, no Fish universal/system mutations. Windows only user PATH preserves existing/expandable entries and is idempotent. |
 | A12 Source lifecycle | Known-revision locked install/uninstall/reinstall/compatible upgrade in default/custom Cargo roots. Foreign bin refusal, separate two PATH concerns, stale wrapper explicit refresh, incompatible schema refusal, data retention on uninstall. Missing/old/Windows-shim Claude diagnostics and no automatic install/fallback. |
 | A13 Native OAuth/storage | Consenting eligible nonproduction accounts: two claude.ai contexts, first browser/manual-code flow, cancellation/failure, observed directory, owned token clear then browser reliance; borrowed token read-only/override. Linux native private files, macOS Keychain success/denied-write native fallback, Windows native ACL/browser, WSL separate native/manual flow. Record safe observations, never extracted credentials. |
+| A15 Selection | Fake git repos with linked worktrees, nested repos, `.git` files, malformed `commondir` and non-git directories. Picker without terminal, Ctrl-C/EOF, one profile, stale selection warning, alias pick, last-used highlight. Switch/forget/no-launch. Remove/purge then same-name add inherits nothing. State write failure warns and launches. |
+| A16 Sets/links | Explicit and source skill and instruction items, default sets on add/no-sets/copy from owned, subscribe-time conflict refusal, launch-time conflict skip, existing content wins, `synced` never linked, foreign replacement of a recorded link untouched, upstream/alias receive no links, purge unlinks without following. |
+| A17 Plugin store | Fake Claude records store `plugin` subcommands, environment and lock holding; set prompt/flags/no terminal; remove order; CLAUDE_CODE_PLUGIN_DIRS composition with an inherited value; daily auto-update window, timeout and failure warning; alias and update environments unchanged. |
+| A18 Desktop | Fake `claude-desktop`: data-folder argument and environment per kind, alias plain launch, same-profile singleton refusal, concurrent-instance warning, remove/purge/upstream lifecycle, doctor finding. Never launch the real app in tests. |
 | A14 Native sessions/update | Same/different-profile named starts, picker/UUID/name resume, current-directory continue, fork versus shared continuation, login/native options quoted forwarding. Shared explicit Claude updater with caller restrictions/env and native result. No eventual-background-result or auth-switch assertion. |
 
 Development starts locally on x64 glibc Linux with Bash/Fish and focused fake-Claude checks. Other OS/architecture/shell/auth evidence is deferred. Later supported first-release claims require relevant A1–A14 evidence on all eight native target environments and WSL 2, required shells and floor/current Claude versions. Container/emulation may support specifically stated Linux fixtures; compilation alone cannot pass native launch/browser/Keychain/ACL gates. Mark unavailable cases unmet rather than assuming parity. No prebuilt/release automation gate exists in this planning scope.
@@ -324,6 +449,6 @@ Specification readiness requires final human agreement, every accepted behavior 
 
 Primary-source API/version evidence: [Rust/native design facts](research/rust-native-design-facts.md), [version/platform facts](research/version-acceptance-facts.md), [Claude contracts](research/claude-contracts.md), [upstream baseline](research/upstream-behavior.md), [distribution facts](research/distribution-facts.md) and [name check](research/roost-name-check.md). Their proposals are superseded where the human decided differently. Local research observed tools only; it did not run real Claude auth/version, install/build Roost, or prove other systems.
 
-Out of scope: rename, global active-profile switching, automatic discovery/migration/ownership transfer, import/export, per-profile Claude binaries, selectable copy classes, completions, global manager config, PATH uninstall cleanup, Rust OAuth/session supervisor, GUI/TUI, prebuilt delivery/publication/packaging/installer/release automation. Forwarded native Claude capabilities remain native behavior.
+Out of scope: rename, global active-profile switching (per-project selection is not global), automatic discovery/migration/ownership transfer, import/export, per-profile Claude binaries, selectable copy classes, completions, global manager config (the plugin auto-update flag is the only setting), PATH uninstall cleanup, Rust OAuth/session supervisor, GUI/TUI beyond the single-choice pickers, prebuilt delivery/publication/packaging/installer/release automation. Forwarded native Claude capabilities remain native behavior.
 
 Independent review completed in two rounds with SPEC-RECOVERY-01 corrected and no actionable findings remaining; the fingerprints and disposition are recorded in decision 06. The user accepted the completed specification at Q10 on 2026-10-06. This completes the planning map; application implementation and deferred runtime/platform evidence remain subsequent work.
