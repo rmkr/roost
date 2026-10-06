@@ -808,15 +808,13 @@ impl Store {
         records.into_iter().map(|r| {
             let directory = if r.kind == Kind::DefaultAlias { Self::alias_directory().ok() } else { r.directory.clone() };
             let token_present = if r.kind == Kind::DefaultAlias { Some(false) } else { self.token_present(r).ok() };
-            let mut launchers = launch::templates(&self.root, &self.root_id, r)?.into_iter().map(|(path, bytes)| {
-                let condition = match self.bin.entry(file_name(&path)?) {
-                    Ok(None) => if r.state == State::Retained { "not_required" } else { "missing" },
-                    Ok(Some(_)) => match launcher_bytes(&self.bin, file_name(&path)?) { Ok(Some(actual)) if actual == bytes => if r.state == State::Retained || self.pending() { "stale" } else { "ready" }, Ok(Some(_)) => "collision", _ => "unsafe" },
-                    Err(_) => "unsafe",
-                };
-                Ok(json!({"path":path,"condition":condition}))
-            }).collect::<Result<Vec<_>>>()?;
-            launchers.sort_by_key(|v| v["path"].as_str().unwrap_or("").to_owned());
+            let (path, bytes) = launch::template(&self.root, &self.root_id, r)?;
+            let condition = match self.bin.entry(file_name(&path)?) {
+                Ok(None) => if r.state == State::Retained { "not_required" } else { "missing" },
+                Ok(Some(_)) => match launcher_bytes(&self.bin, file_name(&path)?) { Ok(Some(actual)) if actual == bytes => if r.state == State::Retained || self.pending() { "stale" } else { "ready" }, Ok(Some(_)) => "collision", _ => "unsafe" },
+                Err(_) => "unsafe",
+            };
+            let launchers = [json!({"path":path,"condition":condition})];
             // Defaults: sets::annotate and select::annotate fill sets/last_used/
             // selected/most_recent; probe is filled only by `list --full`.
             Ok(json!({"name":r.name,"kind":r.kind,"state":r.state,"directory":directory,"token_present":token_present,"launchers":launchers,"sets":[],"last_used":null,"selected":false,"most_recent":false,"probe":null}))
@@ -1063,32 +1061,31 @@ impl Store {
         old: Option<&Registration>,
         new: &Registration,
     ) -> Result<()> {
-        for (destination, bytes) in launch::templates(&self.root, &self.root_id, new)? {
-            let before = match old {
-                Some(r) => self.launcher_state(r, &destination)?,
-                None => {
-                    if self.bin.entry(file_name(&destination)?)?.is_some() {
-                        return Err(err(
-                            "collision",
-                            format!("Foreign launcher destination {}", destination.display()),
-                        ));
-                    }
-                    None
+        let (destination, bytes) = launch::template(&self.root, &self.root_id, new)?;
+        let before = match old {
+            Some(r) => self.launcher_state(r, &destination)?,
+            None => {
+                if self.bin.entry(file_name(&destination)?)?.is_some() {
+                    return Err(err(
+                        "collision",
+                        format!("Foreign launcher destination {}", destination.display()),
+                    ));
                 }
-            };
-            let mut after = state(self.directory.identity()?);
-            after.launcher_binding = new.launcher_binding.clone();
-            after.launcher_form = Some(Form::Sh);
-            self.stage_file(
-                stage,
-                Role::Launcher,
-                destination,
-                before,
-                &bytes,
-                0o700,
-                after,
-            )?;
-        }
+                None
+            }
+        };
+        let mut after = state(self.directory.identity()?);
+        after.launcher_binding = new.launcher_binding.clone();
+        after.launcher_form = Some(Form::Sh);
+        self.stage_file(
+            stage,
+            Role::Launcher,
+            destination,
+            before,
+            &bytes,
+            0o700,
+            after,
+        )?;
         Ok(())
     }
     fn launcher_state(&self, r: &Registration, path: &Path) -> Result<Option<ObjectState>> {
@@ -1096,11 +1093,10 @@ impl Store {
         let Some(mut evidence) = file_state(&self.bin, name, true)? else {
             return Ok(None);
         };
-        let expected = launch::templates(&self.root, &self.root_id, r)?
-            .into_iter()
-            .find(|(p, _)| p == path)
-            .ok_or_else(|| err("ownership", "Unexpected launcher form"))?
-            .1;
+        let (expected_path, expected) = launch::template(&self.root, &self.root_id, r)?;
+        if expected_path != path {
+            return Err(err("ownership", "Unexpected launcher form"));
+        }
         if launcher_bytes(&self.bin, name)?.as_deref() != Some(expected.as_slice()) {
             return Err(err(
                 "collision",
@@ -1115,33 +1111,25 @@ impl Store {
         Ok(Some(evidence))
     }
     fn delete_launchers(&mut self, r: &Registration) -> Result<()> {
-        // Preflight every form before publication starts: a later collision must never
-        // cause an earlier launcher to disappear.
-        let artifacts = launch::templates(&self.root, &self.root_id, r)?
-            .into_iter()
-            .map(|(path, _)| {
-                Ok(self.launcher_state(r, &path)?.map(|before| Artifact {
-                    role: Role::Launcher,
-                    destination: path,
-                    staged: None,
-                    before: Some(before),
-                    after: None,
-                    action: Action::Delete,
-                    completed: false,
-                }))
-            })
-            .collect::<Result<Vec<_>>>()?;
-        for a in artifacts.into_iter().flatten() {
-            if !self
-                .intent
-                .as_ref()
-                .unwrap()
-                .artifacts
-                .iter()
-                .any(|record| record.destination == a.destination)
-            {
-                self.record(a)?;
-            }
+        let (path, _) = launch::template(&self.root, &self.root_id, r)?;
+        let Some(before) = self.launcher_state(r, &path)? else {
+            return Ok(());
+        };
+        let intent = self.intent.as_ref().unwrap();
+        if !intent
+            .artifacts
+            .iter()
+            .any(|record| record.destination == path)
+        {
+            self.record(Artifact {
+                role: Role::Launcher,
+                destination: path,
+                staged: None,
+                before: Some(before),
+                after: None,
+                action: Action::Delete,
+                completed: false,
+            })?;
         }
         Ok(())
     }
@@ -1285,11 +1273,10 @@ impl Store {
             }
             Role::Launcher => {
                 let r = self.journal_registration(artifact, expected)?;
-                let bytes = launch::templates(&self.root, &self.root_id, &r)?
-                    .into_iter()
-                    .find(|(p, _)| *p == artifact.destination)
-                    .ok_or_else(|| recovery("Invalid journal launcher"))?
-                    .1;
+                let (path, bytes) = launch::template(&self.root, &self.root_id, &r)?;
+                if path != artifact.destination {
+                    return Err(recovery("Invalid journal launcher"));
+                }
                 Ok(entry.is_file
                     && entry.nlink == 1
                     && launcher_bytes(&parent, name)?.as_deref() == Some(bytes.as_slice()))
@@ -2015,11 +2002,10 @@ impl Store {
                         "Refresh old binding differs from committed registration",
                     ));
                 }
-                let bytes = launch::templates(&self.root, &self.root_id, &old)?
-                    .into_iter()
-                    .find(|(p, _)| *p == a.destination)
-                    .ok_or_else(|| recovery("Refresh form is unsupported"))?
-                    .1;
+                let (path, bytes) = launch::template(&self.root, &self.root_id, &old)?;
+                if path != a.destination {
+                    return Err(recovery("Refresh form is unsupported"));
+                }
                 let name = format!(".roost-tmp-rollback-{}", index);
                 let identity = stage.write_new(&name, &bytes, 0o700)?;
                 let mut after = before.clone();
@@ -2141,13 +2127,12 @@ impl Store {
         Ok(messages)
     }
     fn launchers_free(&self, r: &Registration) -> Result<()> {
-        for (path, _) in launch::templates(&self.root, &self.root_id, r)? {
-            if self.bin.entry(file_name(&path)?)?.is_some() {
-                return Err(err(
-                    "collision",
-                    format!("Launcher destination exists: {}", path.display()),
-                ));
-            }
+        let (path, _) = launch::template(&self.root, &self.root_id, r)?;
+        if self.bin.entry(file_name(&path)?)?.is_some() {
+            return Err(err(
+                "collision",
+                format!("Launcher destination exists: {}", path.display()),
+            ));
         }
         Ok(())
     }
@@ -2211,9 +2196,8 @@ impl Store {
         self.journal_ready(false)?;
         let old = self.find(name, true)?.clone();
         self.validate(&old)?;
-        for (path, _) in launch::templates(&self.root, &self.root_id, &old)? {
-            let _ = self.launcher_state(&old, &path)?;
-        }
+        let (path, _) = launch::template(&self.root, &self.root_id, &old)?;
+        let _ = self.launcher_state(&old, &path)?;
         let mut new = old.clone();
         new.state = State::Active;
         new.launcher_binding = Some(current_binding()?);
@@ -2333,9 +2317,8 @@ impl Store {
             }
         } else {
             self.validate(&r)?;
-            for (path, _) in launch::templates(&self.root, &self.root_id, &r)? {
-                let _ = self.launcher_state(&r, &path)?;
-            }
+            let (path, _) = launch::template(&self.root, &self.root_id, &r)?;
+            let _ = self.launcher_state(&r, &path)?;
         }
         let scope = if purge {
             format!(
@@ -3146,9 +3129,8 @@ mod tests {
         );
         assert_eq!(recovered.registry.generation, 2);
         assert!(!recovered.pending());
-        for (path, bytes) in launch::templates(&recovered.root, &recovered.root_id, &old).unwrap() {
-            assert_eq!(fs::read(path).unwrap(), bytes);
-        }
+        let (path, bytes) = launch::template(&recovered.root, &recovered.root_id, &old).unwrap();
+        assert_eq!(fs::read(path).unwrap(), bytes);
     }
     #[test]
     fn initializing_journal_finishes_staged_registry_without_resetting_root_id() {

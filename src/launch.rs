@@ -77,11 +77,11 @@ fn quoted_sh(value: &str) -> String {
     format!("'{}'", value.replace('\'', "'\\''"))
 }
 
-pub fn templates(
+pub fn template(
     root: &Path,
     root_id: &str,
     registration: &Registration,
-) -> Result<Vec<(PathBuf, Vec<u8>)>> {
+) -> Result<(PathBuf, Vec<u8>)> {
     crate::store::validate_name(&registration.name)?;
     for id in [root_id, registration.registration_id.as_str()] {
         if id.len() != 32
@@ -123,7 +123,7 @@ pub fn templates(
     let stem = root
         .join("bin")
         .join(format!("roost-{}", registration.name));
-    Ok(vec![(stem, sh.into_bytes())])
+    Ok((stem, sh.into_bytes()))
 }
 
 fn auth_conflicts(mut lookup: impl FnMut(&str) -> Option<OsString>) -> Vec<&'static str> {
@@ -849,9 +849,10 @@ mod tests {
         let mut registration = registration();
         registration.launcher_binding.as_mut().unwrap().executable =
             PathBuf::from("/manager/a'b roost");
-        let templates = templates(Path::new("/root/a'b"), &"a".repeat(32), &registration).unwrap();
-        let script = std::str::from_utf8(&templates[0].1).unwrap();
-        assert_eq!(templates[0].0, Path::new("/root/a'b/bin/roost-Work"));
+        let (path, bytes) =
+            template(Path::new("/root/a'b"), &"a".repeat(32), &registration).unwrap();
+        let script = std::str::from_utf8(&bytes).unwrap();
+        assert_eq!(path, Path::new("/root/a'b/bin/roost-Work"));
         assert!(
             script.contains("exec '/manager/a'\\''b roost' '__roost_launch_v1' '/root/a'\\''b'")
         );
