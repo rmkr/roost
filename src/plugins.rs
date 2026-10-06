@@ -1130,6 +1130,19 @@ fn check_sets(
     Ok(names)
 }
 
+/// After reacquiring the root lock: refuses when the root was replaced since the
+/// store command started (its root ID differs).
+fn same_root(current: &str, root_id: &str) -> Result<()> {
+    if current != root_id {
+        return Err(Error::new(
+            "ownership",
+            "The Roost root changed while the plugin command was running",
+        )
+        .next("Inspect the root with roost doctor, then repeat the command"));
+    }
+    Ok(())
+}
+
 fn add(
     root: &Path,
     plugin: &str,
@@ -1178,6 +1191,7 @@ fn add(
     };
     {
         let manager = Store::open(root, false, OpenMode::Read)?;
+        same_root(&manager.root_id, &session.root_id)?;
         check_sets(&manager, &manager.read_sets()?, &chosen, &item)?;
     }
     let mut retry = format!("roost plugin add {id}");
@@ -1189,6 +1203,7 @@ fn add(
     }
     session.run(&["plugin", "install", &id], &retry)?;
     let (record, mut warnings) = session.refresh(Duration::from_secs(10))?;
+    let root_id = session.root_id.clone();
     drop(session);
     if record.get(&id).is_none() {
         warnings.push(format!(
@@ -1198,6 +1213,14 @@ fn add(
     let mut lines = vec![format!("Installed {id} in the plugin store")];
     if !chosen.is_empty() {
         let manager = Store::open(root, false, OpenMode::Mutate)?;
+        // The sets are re-checked (existence, conflicts) inside update_sets.
+        same_root(&manager.root_id, &root_id).map_err(|e| {
+            Error::new(
+                e.code,
+                format!("{id} is installed but was not added to sets: {}", e.message),
+            )
+            .next("Inspect the root with roost doctor, then add it with roost set add SET --plugin ID")
+        })?;
         let mut added = vec![];
         manager
             .update_sets(|sets| {
@@ -1297,7 +1320,7 @@ fn update(root: &Path, plugin: Option<&str>) -> Result<(Vec<String>, Vec<String>
 
 fn remove(root: &Path, plugin: &str) -> Result<(Vec<String>, Vec<String>)> {
     parse_id(plugin)?;
-    let (id, installed) = {
+    let (id, installed, root_id) = {
         let manager = Store::open(root, true, OpenMode::Mutate)?;
         let record = read_record(&manager)?.map(|(_, r)| r);
         let mut known: BTreeSet<String> = record
@@ -1322,7 +1345,7 @@ fn remove(root: &Path, plugin: &str) -> Result<(Vec<String>, Vec<String>)> {
             Ok(())
         })?;
         let installed = record.is_some_and(|r| r.get(&id).is_some());
-        (id, installed)
+        (id, installed, manager.root_id.clone())
     };
     let mut lines = vec![format!("Removed {id} from every set")];
     if !installed {
@@ -1330,6 +1353,15 @@ fn remove(root: &Path, plugin: &str) -> Result<(Vec<String>, Vec<String>)> {
         return Ok((lines, vec![]));
     }
     let session = Session::open(root)?;
+    // Reacquired: the same root, and the plugin is still recorded in its store.
+    same_root(&session.root_id, &root_id)?;
+    if read_record_in(&session.store, &session.root_id)?
+        .get(&id)
+        .is_none()
+    {
+        lines.push(format!("{id} is no longer installed in the plugin store"));
+        return Ok((lines, vec![]));
+    }
     session.run(
         &["plugin", "uninstall", &id],
         &format!("roost plugin remove {id}"),

@@ -66,7 +66,17 @@ if sub[:2]==['marketplace','add']:
 if sub[0]=='install':
     pid=resolve(sub[1]);name,m=pid.split('@')
     if m not in st['marketplaces'] or name not in catalog.get(m,{}):sys.exit(1)
-    install(pid);save();print('Installed '+pid);sys.exit(0)
+    install(pid);save()
+    swap=os.environ.get('FAKE_SWAP_ROOT')
+    if swap:
+        # Replace the Roost root while the root lock is released: a new root with a
+        # same-named set, created by the Roost binary under test.
+        import subprocess
+        root=os.environ['ROOST_DIR'];os.rename(root,root+'-old')
+        env={k:v for k,v in os.environ.items() if k not in ('CLAUDE_CONFIG_DIR','FAKE_SWAP_ROOT','FAKE_LOG')}
+        for argv in (['add','Other'],['set','create','dev']):
+            subprocess.run([swap]+argv,env=env,check=True,stdout=subprocess.DEVNULL)
+    print('Installed '+pid);sys.exit(0)
 if sub[0]=='update':
     for pid in sub[1:] or list(st['installed']):
         if pid not in st['installed']:sys.exit(1)
@@ -515,6 +525,26 @@ fn with_lint() -> Fixture {
     f.ok(&["plugin", "marketplace", "add", "tools"]);
     f.ok(&["plugin", "add", "lint@tools", "--set", "dev"]);
     f
+}
+
+#[test]
+fn add_refuses_to_record_sets_when_the_root_changed_during_install() {
+    let f = Fixture::new();
+    f.ok(&["add", "Work"]);
+    f.ok(&["set", "create", "dev"]);
+    f.ok(&["plugin", "marketplace", "add", "tools"]);
+    let out = f
+        .command()
+        .env("FAKE_SWAP_ROOT", env!("CARGO_BIN_EXE_roost"))
+        .args(["plugin", "add", "lint@tools", "--set", "dev"])
+        .output()
+        .unwrap();
+    assert_eq!(out.status.code(), Some(1));
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(stderr.contains("ownership"), "{stderr}");
+    let sets: Value = serde_json::from_slice(&fs::read(f.root.join("sets.json")).unwrap()).unwrap();
+    assert_eq!(sets["sets"][0]["name"], "dev");
+    assert_eq!(sets["sets"][0]["items"], json!([]), "{sets}");
 }
 
 #[test]
