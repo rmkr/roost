@@ -55,7 +55,7 @@ Added 2026-10-06, reversing the earlier "`CLAUDE.md` is not shared" decision.
 
 ## Plugin store
 
-See [ADR 0001](../../docs/adr/0001-shared-plugins-injected-at-launch.md) (proposed; injection behavior still to be investigated).
+See [ADR 0001](../../docs/adr/0001-shared-plugins-injected-at-launch.md) (accepted 2026-10-06 after the [injected plugin research](research/injected-plugins.md)).
 
 - The plugin store is a Roost-owned Claude config directory that never runs sessions and has no account. Roost writes it only through Claude's own CLI, under the Roost lock.
 - `roost plugin marketplace add SOURCE` passes through to `claude plugin marketplace add` in the store.
