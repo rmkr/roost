@@ -236,6 +236,11 @@ fn dispatch(action: Action, data: &mut Value) -> Result<Outcome> {
         Action::Doctor { .. } => doctor(data),
         Action::Desktop {
             name: Some(name),
+            close: true,
+            ..
+        } => Ok(Outcome::lines(desktop::close(&name)?)),
+        Action::Desktop {
+            name: Some(name),
             link: true,
             replace,
             yes,

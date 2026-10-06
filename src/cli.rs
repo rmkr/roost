@@ -113,11 +113,15 @@ pub enum Action {
     /// Experimental, Linux only: start Claude Desktop with this profile's own Desktop
     /// data folder (sign-in) and configuration; detached unless --foreground.
     /// Without NAME, choose the profile from a picker. --link NAME makes NAME's
-    /// Desktop borrow the existing Claude Desktop data folder in place
+    /// Desktop borrow the existing Claude Desktop data folder in place; --close NAME
+    /// asks NAME's running Desktop to quit
     Desktop {
         /// Stay attached with Desktop's console output, for debugging
         #[arg(long, conflicts_with_all = ["link", "unlink"])]
         foreground: bool,
+        /// Ask NAME's running Claude Desktop to quit (SIGTERM, waits up to 10 seconds)
+        #[arg(long, requires = "name", conflicts_with_all = ["foreground", "link", "unlink", "replace", "yes"])]
+        close: bool,
         /// Let NAME's Desktop use the existing Claude Desktop data folder in place
         #[arg(long, requires = "name", conflicts_with = "unlink")]
         link: bool,
@@ -624,6 +628,7 @@ mod tests {
                 replace: false,
                 yes: false,
                 foreground: false,
+                close: false,
                 name: Some(_),
             }
         ));
@@ -656,6 +661,30 @@ mod tests {
             vec!["roost", "desktop", "--yes", "Work"],
             vec!["roost", "desktop", "--link", "--yes", "Work"],
             vec!["roost", "desktop", "--link", "Work", "--", "x"],
+        ] {
+            let error = parse_from(values.iter().map(OsString::from).collect()).unwrap_err();
+            assert_eq!(error.exit_code(), 2, "{values:?}");
+        }
+    }
+    #[test]
+    fn desktop_close_needs_name_and_stands_alone() {
+        assert!(matches!(
+            parse(&["roost", "desktop", "--close", "Work"]),
+            Action::Desktop {
+                close: true,
+                link: false,
+                foreground: false,
+                name: Some(_),
+                ..
+            }
+        ));
+        for values in [
+            vec!["roost", "desktop", "--close"],
+            vec!["roost", "desktop", "--close", "--link", "Work"],
+            vec!["roost", "desktop", "--close", "--unlink", "Work"],
+            vec!["roost", "desktop", "--close", "--replace", "Work"],
+            vec!["roost", "desktop", "--close", "--foreground", "Work"],
+            vec!["roost", "desktop", "--close", "--yes", "Work"],
         ] {
             let error = parse_from(values.iter().map(OsString::from).collect()).unwrap_err();
             assert_eq!(error.exit_code(), 2, "{values:?}");

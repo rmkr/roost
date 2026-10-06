@@ -446,6 +446,49 @@ pub fn refuse_if_running(store: &Store, registration: &Registration) -> Result<(
     Ok(())
 }
 
+/// `roost desktop --close NAME`: asks NAME's running Desktop to quit. Not running is
+/// a success that says so.
+pub fn close(name: &str) -> Result<Vec<String>> {
+    supported()?;
+    let store = Store::open(&platform::root()?, false, OpenMode::Read)?;
+    let registration = store.find(name, false)?.clone();
+    Ok(vec![close_registration(store, &registration)?])
+}
+
+/// Closes the Desktop instance holding `registration`'s `SingletonLock`: its own
+/// Roost folder, or the conventional folder for a linked registration or a default
+/// alias. The lock is released before signalling and waiting.
+fn close_registration(store: Store, registration: &Registration) -> Result<String> {
+    let host = linux::hostname();
+    let borrowed = registration.kind == Kind::DefaultAlias
+        || link_holder(&store)?
+            .is_some_and(|holder| holder.registration_id == registration.registration_id);
+    let lock = if borrowed {
+        conventional_lock()
+    } else {
+        store
+            .desktop_locks()?
+            .into_iter()
+            .find(|(id, _)| *id == registration.registration_id)
+            .and_then(|(_, lock)| lock)
+    };
+    drop(store);
+    let not_running = || {
+        format!(
+            "Claude Desktop is not running for {}",
+            registration.name
+        )
+    };
+    let Some(target) = lock.filter(|target| linux::live_lock(target, host.as_deref())) else {
+        return Ok(not_running());
+    };
+    let program = launch::resolve_program("claude-desktop")?;
+    match linux::terminate(&target, host.as_deref(), &program, &registration.name)? {
+        true => Ok(format!("Closed Claude Desktop for {}", registration.name)),
+        false => Ok(not_running()),
+    }
+}
+
 fn record_launch(state: &mut StateFile, id: &str) {
     let at = platform::unix_seconds();
     crate::select::stamp(&mut state.last_used, id, at);
@@ -528,21 +571,148 @@ mod linux {
         String::from_utf8(buffer[..end].to_vec()).ok()
     }
 
-    /// Electron's `SingletonLock` link text is `HOST-PID`; it is live when it names
-    /// this host and a process that exists.
+    /// How long `terminate` waits for Desktop to exit after SIGTERM.
+    const CLOSE_WAIT: Duration = Duration::from_secs(10);
+
+    /// The PID of Electron's `SingletonLock` link text `HOST-PID` when it names this
+    /// host.
+    fn lock_pid(target: &Path, host: Option<&str>) -> Option<libc::pid_t> {
+        let (lock_host, pid) = target.to_str()?.rsplit_once('-')?;
+        let pid = pid.parse::<libc::pid_t>().ok()?;
+        (Some(lock_host) == host && pid > 0).then_some(pid)
+    }
+
+    /// A lock is live when it names this host and a process that exists.
     pub fn live_lock(target: &Path, host: Option<&str>) -> bool {
-        let Some((lock_host, pid)) = target.to_str().and_then(|t| t.rsplit_once('-')) else {
+        let Some(pid) = lock_pid(target, host) else {
             return false;
         };
-        let Ok(pid) = pid.parse::<libc::pid_t>() else {
-            return false;
-        };
-        if Some(lock_host) != host || pid <= 0 {
-            return false;
-        }
         // Signal 0 only checks that the process exists.
         let exists = unsafe { libc::kill(pid, 0) } == 0;
         exists || std::io::Error::last_os_error().raw_os_error() == Some(libc::EPERM)
+    }
+
+    /// Whether process `pid` runs `program` (the resolved `claude-desktop`), comparing
+    /// canonical paths. Either its executable is `program`, or `program` is a `#!`
+    /// script and the process is exactly the kernel's execution of it: the
+    /// executable is the script's interpreter and the argument the kernel inserts
+    /// after the interpreter (and its optional shebang argument) is `program`. The
+    /// second form is how a script launcher (and the test fake) runs.
+    pub(super) fn runs_program(pid: libc::pid_t, program: &Path) -> bool {
+        use std::io::Read;
+        let canonical = |path: &Path| std::fs::canonicalize(path).ok();
+        let Some(program) = canonical(program) else {
+            return false;
+        };
+        // The kernel's link names the running executable's real path (with a
+        // " (deleted)" suffix once replaced, which then never matches).
+        let Ok(exe) = std::fs::read_link(format!("/proc/{pid}/exe")) else {
+            return false;
+        };
+        if exe == program {
+            return true;
+        }
+        let mut head = [0_u8; 256];
+        let Ok(count) = std::fs::File::open(&program).and_then(|mut f| f.read(&mut head)) else {
+            return false;
+        };
+        let Some(line) = head[..count]
+            .strip_prefix(b"#!")
+            .and_then(|rest| rest.split(|b| *b == b'\n').next())
+            .filter(|_| head[..count].contains(&b'\n'))
+            .and_then(|line| std::str::from_utf8(line).ok())
+        else {
+            return false;
+        };
+        let line = line.trim();
+        let (interpreter, argument) = match line.split_once([' ', '\t']) {
+            Some((interpreter, argument)) => (interpreter, !argument.trim().is_empty()),
+            None => (line, false),
+        };
+        if canonical(Path::new(interpreter)) != Some(exe) {
+            return false;
+        }
+        let Ok(cmdline) = std::fs::read(format!("/proc/{pid}/cmdline")) else {
+            return false;
+        };
+        let script = cmdline
+            .split(|b| *b == 0)
+            .nth(if argument { 2 } else { 1 })
+            .map(|arg| {
+                use std::os::unix::ffi::OsStrExt;
+                Path::new(std::ffi::OsStr::from_bytes(arg))
+            });
+        script.is_some_and(|script| script.is_absolute() && canonical(script) == Some(program))
+    }
+
+    /// Sends SIGTERM to the process named by the live `SingletonLock` `target` once
+    /// it is verified to be `program`, then waits up to 10 seconds for it to exit.
+    /// `Ok(false)` when it had already gone. Never escalates beyond SIGTERM.
+    pub fn terminate(
+        target: &Path,
+        host: Option<&str>,
+        program: &Path,
+        name: &str,
+    ) -> Result<bool> {
+        use rustix::process::{Pid, PidfdFlags, Signal, pidfd_open, pidfd_send_signal};
+        use std::os::fd::AsRawFd;
+        let Some(pid) = lock_pid(target, host) else {
+            return Ok(false);
+        };
+        // The pidfd pins this process: if it exits and the PID is reused after the
+        // checks below, signalling fails instead of reaching the newcomer.
+        let pidfd = match pidfd_open(Pid::from_raw(pid).expect("positive"), PidfdFlags::empty())
+        {
+            Ok(fd) => fd,
+            Err(rustix::io::Errno::SRCH) => return Ok(false),
+            Err(_) => return Err(Error::new("io", "Cannot inspect the Claude Desktop process")),
+        };
+        if !runs_program(pid, program) {
+            return Err(Error::new(
+                "ownership",
+                format!(
+                    "The Claude Desktop lock for {name} names process {pid}, which is not Claude Desktop ({}); nothing was signalled",
+                    program.display()
+                ),
+            )
+            .next(format!("Quit Claude Desktop for {name} from its own window or menu")));
+        }
+        match pidfd_send_signal(&pidfd, Signal::TERM) {
+            Ok(()) => (),
+            Err(rustix::io::Errno::SRCH) => return Ok(false),
+            Err(_) => {
+                return Err(Error::new(
+                    "ownership",
+                    format!("Cannot signal Claude Desktop for {name} (process {pid})"),
+                )
+                .next(format!("Quit Claude Desktop for {name} from its own window or menu")));
+            }
+        }
+        let deadline = Instant::now() + CLOSE_WAIT;
+        loop {
+            // A pidfd becomes readable once its process exits.
+            let mut poll = libc::pollfd {
+                fd: pidfd.as_raw_fd(),
+                events: libc::POLLIN,
+                revents: 0,
+            };
+            let left = deadline.saturating_duration_since(Instant::now());
+            let ready = unsafe { libc::poll(&mut poll, 1, left.as_millis().min(100) as i32) };
+            if ready > 0 {
+                return Ok(true);
+            }
+            if Instant::now() >= deadline {
+                return Err(Error::new(
+                    "desktop_running",
+                    format!(
+                        "Claude Desktop for {name} is still running after 10 seconds; Roost sent it SIGTERM and does not force it to quit"
+                    ),
+                )
+                .next(format!(
+                    "Quit Claude Desktop for {name} from its own window or menu, then repeat the command"
+                )));
+            }
+        }
     }
 
     /// Replaces Roost with Desktop, inheriting stdio, for debugging.
@@ -605,6 +775,9 @@ mod linux {
     }
     pub fn live_lock(_: &Path, _: Option<&str>) -> bool {
         false
+    }
+    pub fn terminate(_: &Path, _: Option<&str>, _: &Path, _: &str) -> Result<bool> {
+        Ok(false)
     }
     pub fn foreground(_: Command) -> Result<i32> {
         Err(Error::new(

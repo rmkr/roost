@@ -32,9 +32,11 @@ sys.exit(int(os.environ.get('FAKE_CLAUDE_EXIT','0')))
 
 /// Never the real app: records argv/env/stdio per launch, writes Electron-like data
 /// into --user-data-dir unless told to ignore it, then exits or lingers (`long`;
-/// with FAKE_DESKTOP_LOCK it holds a live SingletonLock meanwhile).
+/// with FAKE_DESKTOP_LOCK it holds a live SingletonLock meanwhile). Like Electron it
+/// releases the lock and exits on SIGTERM, unless FAKE_DESKTOP_TERM=ignore; lingering
+/// lasts FAKE_DESKTOP_SECONDS (default 8).
 const FAKE_DESKTOP: &str = r#"#!/usr/bin/python3
-import json,os,socket,sys,time
+import json,os,signal,socket,sys,time
 args=sys.argv[1:]
 record={'arguments':args,'env':dict(os.environ),'session_leader':os.getsid(0)==os.getpid(),
         'stdin':os.readlink('/proc/self/fd/0'),'stdout':os.readlink('/proc/self/fd/1'),'stderr':os.readlink('/proc/self/fd/2')}
@@ -47,8 +49,14 @@ if os.environ.get('FAKE_DESKTOP_MODE')=='long':
     # Without --user-data-dir: the conventional folder, when it exists.
     folder=data[0] if data else os.path.join(os.environ.get('XDG_CONFIG_HOME') or os.path.join(os.environ['HOME'],'.config'),'Claude')
     lock=os.path.join(folder,'SingletonLock') if os.path.isdir(folder) and os.environ.get('FAKE_DESKTOP_LOCK') else None
+    def term(*_):
+        try:
+            if lock:os.remove(lock)
+        except OSError:pass
+        os._exit(0)
+    signal.signal(signal.SIGTERM,signal.SIG_IGN if os.environ.get('FAKE_DESKTOP_TERM')=='ignore' else term)
     if lock:os.symlink('%s-%d'%(socket.gethostname(),os.getpid()),lock)
-    time.sleep(8)
+    time.sleep(float(os.environ.get('FAKE_DESKTOP_SECONDS','8')))
     try:
         if lock:os.remove(lock)
     except OSError:pass
@@ -1345,6 +1353,141 @@ fn purge_and_upstream_remove_refuse_while_that_desktop_runs() {
     for pid in pids {
         unsafe { libc::kill(pid, libc::SIGTERM) };
     }
+}
+
+/// Starts NAME's Desktop detached through Roost with a live `SingletonLock` in
+/// `folder`, plus `env`, and returns the PID that lock names.
+fn running_desktop(f: &Fixture, name: &str, folder: &Path, env: &[(&str, &str)]) -> i32 {
+    let mut command = f.command();
+    command
+        .args(["desktop", name])
+        .env("FAKE_DESKTOP_MODE", "long")
+        .env("FAKE_DESKTOP_LOCK", "1");
+    for (key, value) in env {
+        command.env(key, value);
+    }
+    let out = command.output().unwrap();
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    lock_pid(folder)
+}
+
+fn lock_pid(folder: &Path) -> i32 {
+    let target = fs::read_link(folder.join("SingletonLock")).unwrap();
+    target
+        .to_str()
+        .unwrap()
+        .rsplit_once('-')
+        .unwrap()
+        .1
+        .parse()
+        .unwrap()
+}
+
+/// Whether `pid` is a process that has not exited (zombies count as exited).
+fn alive(pid: i32) -> bool {
+    fs::read_to_string(format!("/proc/{pid}/stat")).is_ok_and(|stat| {
+        stat.rsplit_once(") ")
+            .is_some_and(|(_, rest)| !rest.starts_with('Z'))
+    })
+}
+
+#[test]
+fn desktop_close_terminates_the_verified_desktop_and_is_a_noop_when_not_running() {
+    let f = Fixture::new();
+    f.add("Work");
+    f.add("Other");
+    f.ok(&["desktop", "--foreground", "Work"]);
+    let pid = running_desktop(&f, "Work", &f.desktop_folder("Work"), &[]);
+    assert!(alive(pid));
+    let out = f.ok(&["desktop", "--close", "Work"]);
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(stdout.contains("Closed Claude Desktop for Work"), "{stdout}");
+    assert!(!alive(pid));
+    assert!(!f.desktop_folder("Work").join("SingletonLock").exists());
+    // Not running (any more, or never launched): a success that says so.
+    for name in ["Work", "Other"] {
+        let out = f.ok(&["desktop", "--close", name]);
+        let stdout = String::from_utf8_lossy(&out.stdout);
+        assert!(
+            stdout.contains(&format!("Claude Desktop is not running for {name}")),
+            "{stdout}"
+        );
+    }
+    f.fails(&["desktop", "--close", "Missing"], "not_found");
+}
+
+#[test]
+fn desktop_close_of_the_alias_closes_the_shared_conventional_instance() {
+    let f = Fixture::new();
+    f.add("Work");
+    f.ok(&["add", "personal", "--link-default"]);
+    let conventional = signed_in_desktop(&f);
+    f.ok(&["desktop", "--link", "Work"]);
+    let pid = running_desktop(&f, "Work", &conventional, &[]);
+    let out = f.ok(&["desktop", "--close", "personal"]);
+    assert!(
+        String::from_utf8_lossy(&out.stdout).contains("Closed Claude Desktop for personal"),
+        "{}",
+        String::from_utf8_lossy(&out.stdout)
+    );
+    assert!(!alive(pid));
+    // The borrowed folder itself is untouched.
+    assert_eq!(
+        fs::read_to_string(conventional.join("Preferences")).unwrap(),
+        "signed-in"
+    );
+    // The linked profile closes the same conventional instance.
+    let pid = running_desktop(&f, "Work", &conventional, &[]);
+    f.ok(&["desktop", "--close", "Work"]);
+    assert!(!alive(pid));
+}
+
+#[test]
+fn desktop_close_reports_a_desktop_that_ignores_sigterm_and_never_escalates() {
+    let f = Fixture::new();
+    f.add("Work");
+    f.ok(&["desktop", "--foreground", "Work"]);
+    let pid = running_desktop(
+        &f,
+        "Work",
+        &f.desktop_folder("Work"),
+        &[("FAKE_DESKTOP_TERM", "ignore"), ("FAKE_DESKTOP_SECONDS", "40")],
+    );
+    let started = std::time::Instant::now();
+    let out = f.run(&["desktop", "--close", "Work"]);
+    let waited = started.elapsed();
+    let survived = alive(pid);
+    unsafe { libc::kill(pid, libc::SIGKILL) };
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert_eq!(out.status.code(), Some(1), "{stderr}");
+    assert!(stderr.contains("desktop_running"), "{stderr}");
+    assert!(stderr.contains("still running after 10 seconds"), "{stderr}");
+    assert!(survived, "Roost must not force-kill");
+    assert!(waited >= std::time::Duration::from_secs(10), "{waited:?}");
+    assert!(waited < std::time::Duration::from_secs(20), "{waited:?}");
+}
+
+#[test]
+fn desktop_close_refuses_a_lock_naming_a_process_that_is_not_claude_desktop() {
+    let f = Fixture::new();
+    f.add("Work");
+    f.ok(&["desktop", "--foreground", "Work"]);
+    let mut sleeper = Command::new("/bin/sleep").arg("30").spawn().unwrap();
+    let live = format!("{}-{}", hostname(), sleeper.id());
+    std::os::unix::fs::symlink(&live, f.desktop_folder("Work").join("SingletonLock")).unwrap();
+    let out = f.run(&["desktop", "--close", "Work"]);
+    let untouched = sleeper.try_wait().unwrap().is_none();
+    sleeper.kill().unwrap();
+    sleeper.wait().unwrap();
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert_eq!(out.status.code(), Some(1), "{stderr}");
+    assert!(stderr.contains("ownership"), "{stderr}");
+    assert!(stderr.contains("not Claude Desktop"), "{stderr}");
+    assert!(untouched, "the unrelated process was signalled");
 }
 
 #[test]
