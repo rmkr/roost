@@ -851,7 +851,9 @@ pub(crate) fn reconcile(store: &Store, registration: &Registration) -> Vec<Strin
     let mut written = None;
     if document != original {
         let mut text = document.render();
-        if before.as_ref().is_some_and(|(_, b)| b.ends_with(b"\n")) {
+        // A new file ends with a newline like the ones Claude writes; an existing
+        // file keeps its own ending.
+        if before.as_ref().is_none_or(|(_, b)| b.ends_with(b"\n")) {
             text.push('\n');
         }
         match replace(&profile, &before, Some(text.as_bytes())) {

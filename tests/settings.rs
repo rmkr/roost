@@ -285,12 +285,14 @@ fn status_line_and_output_style_back_off_to_the_profiles_own_values() {
     f.ok(&["set", "add", "core", "--setting", s(&dir.join("line.json"))]);
     f.ok(&["add", "Work"]);
     f.ok(&["add", "Own"]);
-    // Absent settings.json: created with Roost's keys, recorded.
+    // Absent settings.json: created with Roost's keys, recorded, ending with a
+    // newline like the settings.json Claude writes.
     f.ok(&["run", "Work"]);
     assert_eq!(
         f.settings("Work"),
         json!({"statusLine":line,"outputStyle":"terse"})
     );
+    assert!(f.settings_text("Work").ends_with("}\n"));
     // A profile with its own value keeps it; nothing is recorded for that key.
     f.write_settings("Own", r#"{"outputStyle": "mine"}"#);
     f.ok(&["run", "Own"]);
