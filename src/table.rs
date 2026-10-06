@@ -78,7 +78,7 @@ impl<'a, R> Table<'a, R> {
     pub fn new() -> Self {
         Self::default()
     }
-    /// Adds an unlabeled leading marker column (for example `@`/`^`).
+    /// Adds an unlabeled leading marker column (for example `@`).
     pub fn marker(mut self, cell: impl Fn(&R) -> Cell + 'a) -> Self {
         self.marker = Some(Box::new(cell));
         self
@@ -243,8 +243,6 @@ fn profile_table(
         .marker(|r: &Value| {
             if r["selected"] == true {
                 Cell::new("@", Style::Green)
-            } else if r["most_recent"] == true {
-                Cell::new("^", Style::Yellow)
             } else {
                 Cell::plain(" ")
             }
@@ -319,7 +317,7 @@ fn profile_table(
     table
         .hidden("Path")
         .summary(format!(
-            "○ {} profile{} · {upstream} upstream · @ selected here · ^ last used",
+            "○ {} profile{} · {upstream} upstream · @ selected here",
             records.len(),
             if records.len() == 1 { "" } else { "s" }
         ))

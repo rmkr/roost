@@ -169,7 +169,7 @@ fn human_list_is_a_plain_aligned_table_when_piped() {
             "  personal  default_alias  –      ready      —     never",
             "  Work      owned          –      ready      —     never",
             "",
-            "○ 2 profiles · 0 upstream · @ selected here · ^ last used · hidden: Path",
+            "○ 2 profiles · 0 upstream · @ selected here · hidden: Path",
         ]
     );
 }
@@ -196,7 +196,7 @@ fn human_list_shows_token_launcher_state_and_upstream_count() {
             "  Old      upstream  –      ready         —     never",
             "  Work     owned     ✓      ready         —     never",
             "",
-            "○ 3 profiles · 1 upstream · @ selected here · ^ last used · hidden: Path",
+            "○ 3 profiles · 1 upstream · @ selected here · hidden: Path",
         ]
     );
 }
@@ -273,7 +273,7 @@ fn full_list_probes_isolated_active_rows_only() {
                 work.display()
             ),
             "",
-            "○ 2 profiles · 0 upstream · @ selected here · ^ last used · hidden: Path",
+            "○ 2 profiles · 0 upstream · @ selected here · hidden: Path",
         ]
     );
 }
@@ -398,7 +398,7 @@ print(json.dumps(data.decode().replace('\r\n','\n')))
             "  Profile  Kind   Token  Launchers  Sets",
             "  Work     owned  –      ready      —",
             "",
-            "○ 1 profile · 0 upstream · @ selected here · ^ last used · hidden: Path, Last used, Login, Auth, Claude dir",
+            "○ 1 profile · 0 upstream · @ selected here · hidden: Path, Last used, Login, Auth, Claude dir",
         ]
     );
 }
@@ -1599,12 +1599,12 @@ fn list_marks_selection_and_most_recent_launch_from_run_and_launchers() {
         text.lines().collect::<Vec<_>>(),
         [
             "  Profile   Kind           Token  Launchers  Sets  Last used",
-            "^ Home      owned          –      ready      —     now",
+            "  Home      owned          –      ready      —     now",
             "  Old       upstream       –      ready      —     now",
             "  personal  default_alias  –      ready      —     never",
             "@ Work      owned          –      ready      —     never",
             "",
-            "○ 4 profiles · 1 upstream · @ selected here · ^ last used · hidden: Path",
+            "○ 4 profiles · 1 upstream · @ selected here · hidden: Path",
         ]
     );
 }
@@ -2080,6 +2080,10 @@ fn desktop_without_name_highlights_the_last_desktop_launch_and_launches_detached
     // Desktop column: a folder means signed in, none means never launched.
     assert!(picker_row(text, "Work").contains("signed in"), "{text}");
     assert!(picker_row(text, "Home").trim_end().ends_with('—'), "{text}");
+    // No last-used marker on any row.
+    for name in ["Work", "Home", "Other"] {
+        assert!(!picker_row(text, name).contains('^'), "{text}");
+    }
     let launch = &f.desktop_launches()[1];
     assert_eq!(
         launch["arguments"],
