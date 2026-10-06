@@ -1,4 +1,4 @@
-//! Shared sets and launch-time skill links (spec "Shared sets", gate A16).
+//! Shared sets and launch-time skill and instruction links (spec "Shared sets", gate A16).
 //! Disposable fixtures only: fake `claude`, private temp root/home, no real data.
 #![cfg(unix)]
 use serde_json::{Value, json};
@@ -260,14 +260,6 @@ fn launch_links_subscribed_skills_and_removes_only_recorded_links() {
     f.ok(&["set", "create", "core", "--default"]);
     f.ok(&["set", "add", "core", "--skills-from", s(&source)]);
     f.ok(&["set", "add", "core", "--skill", s(&single)]);
-    // Instruction items are stored but not linked yet.
-    f.ok(&[
-        "set",
-        "add",
-        "core",
-        "--instruction",
-        s(&f.path.join("rule.md")),
-    ]);
     f.ok(&["add", "Work"]);
     let skills = f.profile("Work").join("skills");
     fs::create_dir(&skills).unwrap();
@@ -296,7 +288,6 @@ fn launch_links_subscribed_skills_and_removes_only_recorded_links() {
             .is_dir()
     );
     assert!(!skills.join(".hidden").exists() && !skills.join("notes.md").exists());
-    assert!(!f.profile("Work").join("rules").exists());
     let links = f.state()["links"].clone();
     let paths: Vec<_> = links
         .as_array()
@@ -494,4 +485,174 @@ fn deleting_a_set_drops_subscriptions_and_links_leave_at_next_launch() {
         f.json(&["ls", "--json"])["data"]["profiles"][0]["sets"],
         json!([])
     );
+}
+
+/// A user-managed directory of instruction fragments (never written by Roost).
+fn fragments(f: &Fixture, name: &str, files: &[&str]) -> PathBuf {
+    let path = f.path.join(name);
+    fs::create_dir_all(&path).unwrap();
+    for file in files {
+        fs::write(path.join(file), format!("# {file}")).unwrap();
+    }
+    path
+}
+
+#[test]
+fn launch_links_instruction_fragments_into_rules_and_unsubscribe_removes_them() {
+    let f = Fixture::new();
+    let notes = fragments(
+        &f,
+        "notes",
+        &["style.md", "git.md", ".hidden.md", "todo.txt"],
+    );
+    // Only immediate regular .md files: no directories, links or nested files.
+    fs::create_dir(notes.join("nested.md")).unwrap();
+    fs::write(notes.join("nested.md/deep.md"), "deep").unwrap();
+    symlink(notes.join("style.md"), notes.join("alias.md")).unwrap();
+    let solo = fragments(&f, "solo", &["review.md"]).join("review.md");
+    f.ok(&["set", "create", "core"]);
+    f.ok(&["set", "add", "core", "--instructions-from", s(&notes)]);
+    f.ok(&["set", "add", "core", "--instruction", s(&solo)]);
+    f.ok(&["add", "Work", "--no-sets"]);
+    f.ok(&["set", "subscribe", "Work", "core"]);
+    let profile = f.profile("Work");
+    fs::write(profile.join("CLAUDE.md"), "mine").unwrap();
+    let rules = profile.join("rules");
+    fs::create_dir(&rules).unwrap();
+    fs::set_permissions(&rules, fs::Permissions::from_mode(0o755)).unwrap();
+    fs::write(rules.join("git.md"), "own rule").unwrap();
+    let out = f.ok(&["run", "Work"]);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        stderr.contains("rules/git.md") && stderr.contains("existing content"),
+        "{stderr}"
+    );
+    assert_eq!(
+        fs::read_link(rules.join("style.md")).unwrap(),
+        notes.join("style.md")
+    );
+    assert_eq!(fs::read_link(rules.join("review.md")).unwrap(), solo);
+    assert_eq!(
+        fs::read_to_string(rules.join("git.md")).unwrap(),
+        "own rule"
+    );
+    for skipped in [".hidden.md", "todo.txt", "nested.md", "alias.md"] {
+        assert!(
+            fs::symlink_metadata(rules.join(skipped)).is_err(),
+            "{skipped}"
+        );
+    }
+    assert_eq!(
+        fs::read_to_string(profile.join("CLAUDE.md")).unwrap(),
+        "mine"
+    );
+    let paths: Vec<_> = f.state()["links"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|l| l["path"].clone())
+        .collect();
+    assert_eq!(
+        paths,
+        vec![json!("rules/review.md"), json!("rules/style.md")]
+    );
+    // Unsubscribing removes exactly the recorded links at the next launch.
+    f.ok(&["set", "unsubscribe", "Work", "core"]);
+    f.ok(&["run", "Work"]);
+    assert!(fs::symlink_metadata(rules.join("style.md")).is_err());
+    assert!(fs::symlink_metadata(rules.join("review.md")).is_err());
+    assert_eq!(
+        fs::read_to_string(rules.join("git.md")).unwrap(),
+        "own rule"
+    );
+    assert_eq!(
+        fs::read_to_string(notes.join("style.md")).unwrap(),
+        "# style.md"
+    );
+    assert!(solo.exists());
+    assert_eq!(f.state()["links"], json!([]));
+}
+
+#[test]
+fn instruction_items_are_listed_and_same_named_fragments_conflict() {
+    let f = Fixture::new();
+    let one = fragments(&f, "one", &["style.md"]);
+    let two = fragments(&f, "two", &["style.md"]);
+    f.ok(&["set", "create", "core"]);
+    f.ok(&["set", "create", "other"]);
+    f.ok(&["set", "add", "core", "--instructions-from", s(&one)]);
+    f.ok(&[
+        "set",
+        "add",
+        "other",
+        "--instruction",
+        s(&two.join("style.md")),
+    ]);
+    f.ok(&["add", "Work", "--no-sets"]);
+    f.ok(&["set", "subscribe", "Work", "core"]);
+    f.fails(&["set", "subscribe", "Work", "other"], "collision");
+    assert_eq!(
+        f.sets(),
+        json!([
+            {"name":"core","default":false,
+             "items":[{"kind":"instruction_source","value":s(&one)}],
+             "subscribers":["Work"]},
+            {"name":"other","default":false,
+             "items":[{"kind":"instruction","value":s(&two.join("style.md"))}],
+             "subscribers":[]}
+        ])
+    );
+    let text = String::from_utf8(f.ok(&["set", "list"]).stdout).unwrap();
+    assert!(
+        text.contains(&format!("instruction_source:{}", one.display())),
+        "{text}"
+    );
+    assert_eq!(
+        f.json(&["ls", "--json"])["data"]["profiles"][0]["sets"],
+        json!(["core"])
+    );
+    // Launch creates a private rules/ when the profile has none.
+    f.ok(&["run", "Work"]);
+    let rules = f.profile("Work").join("rules");
+    assert_eq!(
+        fs::metadata(&rules).unwrap().permissions().mode() & 0o777,
+        0o700
+    );
+    assert_eq!(
+        fs::read_link(rules.join("style.md")).unwrap(),
+        one.join("style.md")
+    );
+}
+
+#[test]
+fn upstream_and_alias_receive_no_instructions_and_purge_unlinks_without_following() {
+    let f = Fixture::new();
+    let notes = fragments(&f, "notes", &["style.md"]);
+    f.ok(&["set", "create", "core", "--default"]);
+    f.ok(&["set", "add", "core", "--instructions-from", s(&notes)]);
+    let upstream = f.home.join(".ccm/profiles/up");
+    fs::create_dir_all(&upstream).unwrap();
+    f.ok(&["register", "up", "--path", s(&upstream)]);
+    f.ok(&["set", "subscribe", "up", "core"]);
+    f.ok(&["run", "up"]);
+    assert!(!upstream.join("rules").exists());
+    f.ok(&["add", "personal", "--link-default"]);
+    f.ok(&["run", "personal"]);
+    assert!(!f.home.join(".claude/rules").exists());
+    f.ok(&["add", "Work"]);
+    f.ok(&["run", "Work"]);
+    let link = f.profile("Work").join("rules/style.md");
+    assert!(
+        fs::symlink_metadata(&link)
+            .unwrap()
+            .file_type()
+            .is_symlink()
+    );
+    f.ok(&["remove", "Work", "--purge", "--yes"]);
+    assert!(!f.profile("Work").exists());
+    assert_eq!(
+        fs::read_to_string(notes.join("style.md")).unwrap(),
+        "# style.md"
+    );
+    assert_eq!(f.state()["links"], json!([]));
 }
