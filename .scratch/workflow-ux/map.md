@@ -19,6 +19,8 @@ Roost remembers which profile each project uses, shows profiles in a readable ta
 
 <!-- Closed tickets only: linked title and a one-line gist; detail lives in the ticket. -->
 
+- [Amend the specification for workflow UX](issues/01-amend-spec.md): spec amended and accepted, with a separate plugin store lock and Desktop-folder deletion on upstream remove.
+
 ## Not yet specified
 
 - Shared agents, commands and output-styles (linked like skills), and hooks/settings through a shared `--settings` file: agreed as later item kinds, not yet ticketed.

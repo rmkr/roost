@@ -1,6 +1,6 @@
 # Roost implementation specification
 
-Approved by the user on 2026-10-06. Amended the same day by [Workflow UX amendments](#workflow-ux-amendments-2026-10-06) through [Amend the specification for workflow UX](../workflow-ux/issues/01-amend-spec.md), pending the user's acceptance. Decision [06](issues/06-specification-readiness.md) and the [planning map](map.md) are resolved. Design Q1–Q9 and final confirmation Q10 are accepted; independent review is clean after one verified correction. No Rust application or release has been built or tested.
+Approved by the user on 2026-10-06. Amended the same day by [Workflow UX amendments](#workflow-ux-amendments-2026-10-06) through [Amend the specification for workflow UX](../workflow-ux/issues/01-amend-spec.md), accepted by the user on 2026-10-06 with two changes (separate plugin store lock; upstream remove deletes Roost's Desktop folder). Decision [06](issues/06-specification-readiness.md) and the [planning map](map.md) are resolved. Design Q1–Q9 and final confirmation Q10 are accepted; independent review is clean after one verified correction. No Rust application or release has been built or tested.
 
 ## Purpose and authority
 
@@ -119,6 +119,7 @@ Check paths as physical objects as well as strings. Do not authorize ownership b
   .roost-state-<ID>.tmp          transient private replacement of state.json/sets.json (amended)
   plugin-store/                 plugin store: Roost-owned Claude config dir, no account (amended)
     .roost-store.json           store marker
+    .roost-store-lock           store lock, separate from the root lock
   desktop/<REGISTRATION_ID>/     Desktop data folder for one registration (amended)
     .roost-desktop.json         Desktop folder marker
   bin/roost-NAME                 POSIX launcher (all required systems)
@@ -173,7 +174,7 @@ Token replacement privately stages and flushes bytes, establishes protection bef
 
 ## Locking, transactions and recovery
 
-One stable `.roost-lock` open object per initialized root. `try_lock` polling plus cancellation waits at most 10 seconds, then reports retry guidance (operational exit 1); no automatic lock-file deletion. Exclusive lock protects mutation and brief launch preparation. Read commands may acquire the same brief lock for a coherent view, but never recover/mutate. No handle inherits into Claude. Release before waiting for a session, native diagnostic probe, secret input, picker or confirmation (plugin store commands are the one exception: they hold the lock for the store child); reacquire and revalidate after prompts. Distinct roots do not coordinate upstream/external writers. Concurrent Claude launches are permitted.
+One stable `.roost-lock` open object per initialized root. `try_lock` polling plus cancellation waits at most 10 seconds, then reports retry guidance (operational exit 1); no automatic lock-file deletion. Exclusive lock protects mutation and brief launch preparation. Read commands may acquire the same brief lock for a coherent view, but never recover/mutate. No handle inherits into Claude. Release before waiting for a session, native diagnostic probe, secret input, picker or confirmation; reacquire and revalidate after prompts. Distinct roots do not coordinate upstream/external writers. Concurrent Claude launches are permitted.
 
 Each mutation writes a private complete intent before changing published artifacts, stages complete replacements and commits registry last. Intent shape:
 
@@ -354,13 +355,13 @@ Launch preparation (`run`, `switch`, bare `roost`, profile launchers, `desktop`)
 
 `<root>/plugin-store/` is a Roost-owned Claude config directory with no account that never runs sessions. Its first use creates it through the `store_create` journal operation with marker `.roost-store.json` `{schema_version:1, root_id:ID, directory_identity:FileIdentity}`. It is never a registration, copy source or `where` result.
 
-Store commands run the PATH-selected Claude (version-checked) as `claude plugin marketplace add SOURCE`, `claude plugin install ID`, `claude plugin update [ID]` and `claude plugin uninstall ID` with the caller's environment plus `CLAUDE_CONFIG_DIR=<store>` and `DISABLE_AUTOUPDATER=1`, minus `CLAUDE_CODE_OAUTH_TOKEN` and `CLAUDE_CODE_PLUGIN_DIRS`; no manager token is injected and the auth-conflict table does not apply. Unlike launches, the root lock is held for the whole store command (handle not inheritable); the child is spawned with inherited stdio and waited for, with no deadline. A nonzero child exit is plugin_store (exit 1) naming the retry command; Roost's own records change only after success.
+Store commands run the PATH-selected Claude (version-checked) as `claude plugin marketplace add SOURCE`, `claude plugin install ID`, `claude plugin update [ID]` and `claude plugin uninstall ID` with the caller's environment plus `CLAUDE_CONFIG_DIR=<store>` and `DISABLE_AUTOUPDATER=1`, minus `CLAUDE_CODE_OAUTH_TOKEN` and `CLAUDE_CODE_PLUGIN_DIRS`; no manager token is injected and the auth-conflict table does not apply. Store commands take the root lock only briefly, to validate the store and update Roost's records, never while the child runs. The child runs under the separate store lock `plugin-store/.roost-store-lock` (handle not inheritable; same 10-second wait and retry guidance), so launches, which only read the store, never wait on an install; the child is spawned with inherited stdio and waited for, with no deadline. Store commands and auto-update serialize on the store lock. A launch that cannot read or parse the store's state skips plugin injection with a warning and still launches. A nonzero child exit is plugin_store (exit 1) naming the retry command; Roost's own records change only after success.
 
 `plugin add` resolves `PLUGIN` without `@MARKETPLACE` through Claude's store listing (fields fixed by ticket 06); ambiguity or absence is not_found. Without `--set`/`--no-set`, a terminal shows the sets and reads a comma-separated list (empty for none) before taking the lock; without a terminal it fails usage naming both flags; with no sets it proceeds with none. Named sets must exist (not_found) and pass the subscribe conflict rule (collision) before install. After a successful install the plugin ID is added to the sets. `plugin update` updates one or all store plugins. `plugin remove` first drops the ID from every set, then uninstalls; an uninstall failure is plugin_store and may be retried. `plugin list` reports store plugins known to Roost's sets plus the auto-update state. `plugin auto-update` sets `plugin_auto_update`.
 
 Injection: for an isolated launch, collect the plugin items of every subscribed set, deduplicate by ID, and resolve each to its installed directory inside the store (which directory, and how Roost learns it without parsing undocumented state, is fixed by ticket 06). Missing plugins are skipped with a warning. If any remain, set `CLAUDE_CODE_PLUGIN_DIRS` to the caller's nonempty inherited value (if any) followed by the store directories, joined with the platform path-list separator; otherwise leave the variable as inherited. Allow-auth-env does not affect injection. Aliases, status probes and `update` never receive it. Injected plugins appear as `name@inline`; Claude does not auto-update them.
 
-Auto-update: when `plugin_auto_update` is true and `plugin_auto_update_at` is null or at least 24 hours old, a launch first writes the new timestamp (so concurrent launches skip), then runs `claude plugin update` in the store with stdin null, output captured and discarded under the 1 MiB cap, and an 8-second deadline (kept below the 10-second lock wait of concurrent launches). Timeout or failure terminates/reaps the child, warns and launches.
+Auto-update: when `plugin_auto_update` is true and `plugin_auto_update_at` is null or at least 24 hours old, a launch first writes the new timestamp (so concurrent launches skip), then, only if the store lock is free (non-blocking try; otherwise skip silently), runs `claude plugin update` in the store under that lock with stdin null, output captured and discarded under the 1 MiB cap, and an 8-second deadline. Timeout or failure terminates/reaps the child, warns and launches.
 
 ### Desktop
 
@@ -379,10 +380,10 @@ Auto-update: when `plugin_auto_update` is true and `plugin_auto_update_at` is nu
 | Last use, `desktop_launched` | Kept | Dropped | Dropped |
 | Subscriptions | Kept, so reuse restores them | Dropped | Dropped |
 | Recorded links | Links stay in retained data; records kept | n/a | Links unlinked as contained links, never followed; records dropped |
-| Desktop folder | Kept | See below | Deleted (journaled `desktop_data`) |
+| Desktop folder | Kept | Upstream: deleted after confirmation (see below); alias: none | Deleted (journaled `desktop_data`) |
 | Plugin store | Untouched | Untouched | Untouched |
 
-Side-file changes happen after the registry commits; failure warns with a `roost switch --forget` or `roost set unsubscribe` next step, and dropped registration IDs are ignored by readers anyway. An upstream registration with a Desktop folder refuses ordinary remove (collision) with next step `roost remove NAME --purge`; for upstream registrations `--purge` deletes only that Roost-owned folder (same confirmation, marker-last and journal rules) and then drops the record, never touching borrowed data. Aliases still reject purge. The plugin store has no removal command; uninstall plugins with `plugin remove`.
+Side-file changes happen after the registry commits; failure warns with a `roost switch --forget` or `roost set unsubscribe` next step, and dropped registration IDs are ignored by readers anyway. Ordinary remove of an upstream registration that has a Desktop folder also deletes that Roost-owned folder (its Desktop sign-in), after confirmation naming the folder (`--yes` skips; no terminal without `--yes` is usage), as a journaled `desktop_data` artifact with the marker-last rule, then drops the record; borrowed data is never touched. Purge stays owned-only: upstream and alias registrations still reject `--purge`. The plugin store has no removal command; uninstall plugins with `plugin remove`.
 
 ## Source install, upgrade and practical recipes
 
