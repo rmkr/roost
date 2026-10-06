@@ -130,14 +130,222 @@ fn check_file(file: &File, path: &Path, private: bool, directory: bool, write: b
     Ok(())
 }
 
+/// One passwd record: the facts the private-group rule needs.
+#[derive(Clone, Debug)]
+pub(crate) struct Account {
+    pub name: String,
+    pub uid: u32,
+    pub gid: u32,
+}
+
+/// The passwd and group databases as the namespace check sees them. Every
+/// method answers `None` when the database cannot be read, which the check
+/// treats as "not private" (fail closed).
+pub(crate) trait AccountDatabase {
+    /// The effective user's passwd record.
+    fn current_user(&self) -> Option<Account>;
+    /// The supplementary member names of group `gid`.
+    fn group_members(&self, gid: u32) -> Option<Vec<String>>;
+    /// Every account in the passwd database, completely enumerated.
+    fn accounts(&self) -> Option<Vec<Account>>;
+}
+
+/// The effective user's private group: their primary group, provided it has
+/// no supplementary members other than the user and no other account uses it
+/// as its primary group. `None` when there is no such group or any fact is
+/// unreadable.
+pub(crate) fn private_group(db: &dyn AccountDatabase) -> Option<u32> {
+    let user = db.current_user()?;
+    let members = db.group_members(user.gid)?;
+    if members.iter().any(|member| *member != user.name) {
+        return None;
+    }
+    let accounts = db.accounts()?;
+    if accounts
+        .iter()
+        .any(|other| other.gid == user.gid && other.uid != user.uid)
+    {
+        return None;
+    }
+    Some(user.gid)
+}
+
+/// Whether a directory with this owner, group and mode protects the names in
+/// it. It must be owned by the effective user or root. A sticky directory is
+/// accepted as before; otherwise it may not be world-writable, and it may be
+/// group-writable only when its group is the user's private group (looked up
+/// lazily, only for that case).
+fn namespace_protected(
+    owner: u32,
+    gid: u32,
+    mode: u32,
+    euid: u32,
+    private_gid: impl FnOnce() -> Option<u32>,
+) -> bool {
+    if owner != 0 && owner != euid {
+        return false;
+    }
+    if mode & 0o1000 != 0 {
+        return true;
+    }
+    if mode & 0o002 != 0 {
+        return false;
+    }
+    mode & 0o020 == 0 || private_gid() == Some(gid)
+}
+
+/// The real passwd/group databases through the C library (NSS included).
+struct SystemAccounts;
+
+/// Runs a reentrant libc lookup, growing its string buffer on ERANGE.
+fn with_buffer<T>(mut lookup: impl FnMut(&mut [u8]) -> std::result::Result<T, i32>) -> Option<T> {
+    let mut buffer = vec![0_u8; 16384];
+    loop {
+        match lookup(&mut buffer) {
+            Err(libc::ERANGE) if buffer.len() < 1048576 => {
+                let size = buffer.len() * 2;
+                buffer.resize(size, 0);
+            }
+            Err(_) => return None,
+            Ok(value) => return Some(value),
+        }
+    }
+}
+
+fn passwd_account(record: &libc::passwd) -> Option<Account> {
+    // pw_name points into the caller's buffer, which outlives this call.
+    let name = unsafe { std::ffi::CStr::from_ptr(record.pw_name) };
+    Some(Account {
+        name: name.to_str().ok()?.to_owned(),
+        uid: record.pw_uid,
+        gid: record.pw_gid,
+    })
+}
+
+impl AccountDatabase for SystemAccounts {
+    fn current_user(&self) -> Option<Account> {
+        with_buffer(|buffer| {
+            let mut record = std::mem::MaybeUninit::<libc::passwd>::uninit();
+            let mut result = std::ptr::null_mut();
+            // getpwuid_r writes into caller-owned storage.
+            let code = unsafe {
+                libc::getpwuid_r(
+                    libc::geteuid(),
+                    record.as_mut_ptr(),
+                    buffer.as_mut_ptr().cast(),
+                    buffer.len(),
+                    &mut result,
+                )
+            };
+            if code != 0 {
+                return Err(code);
+            }
+            if result.is_null() {
+                return Err(libc::ENOENT);
+            }
+            passwd_account(unsafe { record.assume_init_ref() }).ok_or(libc::EINVAL)
+        })
+    }
+
+    fn group_members(&self, gid: u32) -> Option<Vec<String>> {
+        with_buffer(|buffer| {
+            let mut record = std::mem::MaybeUninit::<libc::group>::uninit();
+            let mut result = std::ptr::null_mut();
+            // getgrgid_r writes into caller-owned storage.
+            let code = unsafe {
+                libc::getgrgid_r(
+                    gid,
+                    record.as_mut_ptr(),
+                    buffer.as_mut_ptr().cast(),
+                    buffer.len(),
+                    &mut result,
+                )
+            };
+            if code != 0 {
+                return Err(code);
+            }
+            if result.is_null() {
+                return Err(libc::ENOENT);
+            }
+            let record = unsafe { record.assume_init_ref() };
+            let mut names = Vec::new();
+            let mut cursor = record.gr_mem;
+            // gr_mem is a NULL-terminated array of C strings inside `buffer`.
+            while !cursor.is_null() && !unsafe { *cursor }.is_null() {
+                let name = unsafe { std::ffi::CStr::from_ptr(*cursor) };
+                names.push(name.to_str().map_err(|_| libc::EINVAL)?.to_owned());
+                cursor = unsafe { cursor.add(1) };
+            }
+            Ok(names)
+        })
+    }
+
+    #[cfg(all(target_os = "linux", target_env = "gnu"))]
+    fn accounts(&self) -> Option<Vec<Account>> {
+        // setpwent/getpwent_r share process-wide iteration state.
+        static ENUMERATION: Mutex<()> = Mutex::new(());
+        let _guard = ENUMERATION.lock().ok()?;
+        unsafe { libc::setpwent() };
+        let mut buffer = vec![0_u8; 16384];
+        let mut accounts = Vec::new();
+        let complete = loop {
+            let mut record = std::mem::MaybeUninit::<libc::passwd>::uninit();
+            let mut result = std::ptr::null_mut();
+            // getpwent_r writes into caller-owned storage.
+            let code = unsafe {
+                libc::getpwent_r(
+                    record.as_mut_ptr(),
+                    buffer.as_mut_ptr().cast(),
+                    buffer.len(),
+                    &mut result,
+                )
+            };
+            if code == libc::ENOENT {
+                break true;
+            }
+            if code == libc::ERANGE && buffer.len() < 1048576 {
+                let size = buffer.len() * 2;
+                buffer.resize(size, 0);
+                continue;
+            }
+            if code != 0 || result.is_null() {
+                break false;
+            }
+            match passwd_account(unsafe { record.assume_init_ref() }) {
+                Some(account) => accounts.push(account),
+                None => break false,
+            }
+        };
+        unsafe { libc::endpwent() };
+        complete.then_some(accounts)
+    }
+
+    /// Without a reentrant enumeration the database is treated as unreadable.
+    #[cfg(not(all(target_os = "linux", target_env = "gnu")))]
+    fn accounts(&self) -> Option<Vec<Account>> {
+        None
+    }
+}
+
+/// The effective user's private group from the system databases, computed
+/// once per process.
+fn system_private_group() -> Option<u32> {
+    static PRIVATE: std::sync::OnceLock<Option<u32>> = std::sync::OnceLock::new();
+    *PRIVATE.get_or_init(|| private_group(&SystemAccounts))
+}
+
 fn check_namespace(file: &File, path: &Path) -> Result<()> {
     let metadata = file
         .metadata()
         .map_err(|e| Error::io("inspect parent namespace", path, e))?;
     let uid = rustix::process::geteuid().as_raw();
-    if (metadata.uid() != 0 && metadata.uid() != uid)
-        || (metadata.mode() & 0o022 != 0 && metadata.mode() & 0o1000 == 0)
-    {
+    if !namespace_protected(
+        metadata.uid(),
+        metadata.gid(),
+        metadata.mode(),
+        uid,
+        system_private_group,
+    ) {
         return Err(Error::new(
             "ownership",
             format!("Parent namespace is not protected: {}", path.display()),
@@ -959,6 +1167,133 @@ pub use path_setup::setup_path;
 mod tests {
     use super::*;
     use std::os::unix::fs::PermissionsExt;
+
+    /// Injected passwd/group facts for the private-group namespace rule.
+    struct FakeAccounts {
+        current: Option<Account>,
+        members: Option<Vec<&'static str>>,
+        accounts: Option<Vec<Account>>,
+    }
+    fn account(name: &str, uid: u32, gid: u32) -> Account {
+        Account {
+            name: name.to_owned(),
+            uid,
+            gid,
+        }
+    }
+    impl AccountDatabase for FakeAccounts {
+        fn current_user(&self) -> Option<Account> {
+            self.current.clone()
+        }
+        fn group_members(&self, gid: u32) -> Option<Vec<String>> {
+            assert_eq!(gid, 1000);
+            self.members
+                .as_ref()
+                .map(|m| m.iter().map(|n| (*n).to_owned()).collect())
+        }
+        fn accounts(&self) -> Option<Vec<Account>> {
+            self.accounts.clone()
+        }
+    }
+    fn private_ubuntu_user() -> FakeAccounts {
+        FakeAccounts {
+            current: Some(account("alice", 1000, 1000)),
+            members: Some(vec![]),
+            accounts: Some(vec![
+                account("root", 0, 0),
+                account("alice", 1000, 1000),
+                account("bob", 1001, 1001),
+            ]),
+        }
+    }
+
+    #[test]
+    fn group_writable_namespace_owned_by_user_with_private_group_is_protected() {
+        let db = private_ubuntu_user();
+        assert!(namespace_protected(1000, 1000, 0o40775, 1000, || {
+            private_group(&db)
+        }));
+    }
+
+    #[test]
+    fn private_group_may_list_only_the_user_as_a_supplementary_member() {
+        let mut db = private_ubuntu_user();
+        db.members = Some(vec!["alice"]);
+        assert_eq!(private_group(&db), Some(1000));
+        db.members = Some(vec!["alice", "bob"]);
+        assert_eq!(private_group(&db), None);
+        assert!(!namespace_protected(1000, 1000, 0o40775, 1000, || {
+            private_group(&db)
+        }));
+    }
+
+    #[test]
+    fn group_shared_as_another_accounts_primary_group_is_not_private() {
+        let mut db = private_ubuntu_user();
+        db.accounts
+            .as_mut()
+            .unwrap()
+            .push(account("carol", 1002, 1000));
+        assert_eq!(private_group(&db), None);
+        // A second name for the user's own uid is still the user.
+        let mut db = private_ubuntu_user();
+        db.accounts
+            .as_mut()
+            .unwrap()
+            .push(account("alice-alias", 1000, 1000));
+        assert_eq!(private_group(&db), Some(1000));
+    }
+
+    #[test]
+    fn unreadable_account_databases_fail_closed() {
+        let mut db = private_ubuntu_user();
+        db.accounts = None;
+        assert_eq!(private_group(&db), None);
+        let mut db = private_ubuntu_user();
+        db.members = None;
+        assert_eq!(private_group(&db), None);
+        let mut db = private_ubuntu_user();
+        db.current = None;
+        assert_eq!(private_group(&db), None);
+    }
+
+    #[test]
+    fn group_writable_namespace_needs_the_users_private_group() {
+        // Group 27 (e.g. sudo) is not the user's private group 1000.
+        assert!(!namespace_protected(1000, 27, 0o40775, 1000, || Some(1000)));
+        assert!(!namespace_protected(1000, 1000, 0o40775, 1000, || None));
+        // Root-owned directories follow the same rule.
+        assert!(namespace_protected(0, 1000, 0o40770, 1000, || Some(1000)));
+    }
+
+    #[test]
+    fn system_account_database_reads_the_current_user() {
+        // Host-independent: whatever the host's groups, the effective user
+        // resolves and appears in the enumerated passwd database.
+        let user = SystemAccounts.current_user().expect("current user");
+        assert_eq!(user.uid, rustix::process::geteuid().as_raw());
+        #[cfg(all(target_os = "linux", target_env = "gnu"))]
+        assert!(
+            SystemAccounts
+                .accounts()
+                .expect("passwd enumeration")
+                .iter()
+                .any(|a| a.uid == user.uid)
+        );
+    }
+
+    #[test]
+    fn namespace_rules_outside_group_write_are_unchanged() {
+        let never = || -> Option<u32> { panic!("account databases consulted") };
+        assert!(namespace_protected(1000, 1000, 0o40755, 1000, never));
+        assert!(namespace_protected(0, 0, 0o40755, 1000, never));
+        assert!(namespace_protected(0, 0, 0o41777, 1000, never));
+        assert!(!namespace_protected(1001, 1000, 0o40700, 1000, never));
+        assert!(!namespace_protected(1001, 1000, 0o40775, 1000, never));
+        // World-writable without sticky stays rejected, private group or not.
+        assert!(!namespace_protected(1000, 1000, 0o40777, 1000, never));
+        assert!(!namespace_protected(1000, 1000, 0o40757, 1000, never));
+    }
     #[test]
     fn picker_highlight_survives_styled_cells_and_plain_rows_stay_plain() {
         let rows = [
