@@ -6,7 +6,7 @@ use crate::{
     Error, Outcome, Result, launch, platform, sets,
     store::{
         Kind, OpenMode, Registration, State, Store,
-        side::{Selection, Timestamp},
+        side::{Selection, StateFile, Timestamp},
     },
     table,
 };
@@ -275,35 +275,29 @@ fn pick(store: Store, root: &Path, key: &Path) -> Result<(Store, Registration, R
         .next("roost switch NAME selects one for this project; roost run NAME launches once")
     };
     let title = "Choose a profile for this project";
-    let (store, chosen) = choose(store, root, title, no_terminal, |store, records| {
+    let render = |store: &Store, records: &mut [Value]| {
         let _ = annotate(store, records, Some(key));
-        let lines = table::profiles(records, false, table::stderr_color(), None);
+        let lines = table::profiles(
+            records,
+            false,
+            false,
+            table::color_for(&std::io::stderr()),
+            None,
+        );
         let initial = records
             .iter()
             .position(|r| r["selected"] == true)
             .or_else(|| records.iter().position(|r| r["most_recent"] == true))
             .unwrap_or(0);
         (lines, initial)
-    })?;
+    };
+    let Choice::Chosen(store, chosen) = choose_with(store, root, title, None, no_terminal, render)?
+    else {
+        unreachable!("no action keys")
+    };
+    let store = *store;
     let recorded = record_selection(&store, key, &chosen);
     Ok((store, chosen, recorded))
-}
-
-/// The shared picker flow: with an active registration and a terminal (else
-/// `no_terminal`), lists active profiles as `ls` records (with sets), lets `render`
-/// annotate them and return the table lines and initial row, shows the picker with
-/// the lock released, then reacquires and revalidates the root and the choice.
-pub(crate) fn choose(
-    store: Store,
-    root: &Path,
-    title: &str,
-    no_terminal: impl FnOnce() -> Error,
-    render: impl FnOnce(&Store, &mut [Value]) -> (Vec<String>, usize),
-) -> Result<(Store, Registration)> {
-    match choose_with(store, root, title, None, no_terminal, render)? {
-        Choice::Chosen(store, registration) => Ok((*store, registration)),
-        Choice::Action(..) => unreachable!("no action keys"),
-    }
 }
 
 /// Extra picker keys for `choose_with`: the hint after the title, the action keys,
@@ -322,7 +316,11 @@ pub(crate) enum Choice {
     Action(Registration, usize),
 }
 
-/// `choose` with optional action keys.
+/// The shared picker flow: with an active registration and a terminal (else
+/// `no_terminal`), lists active profiles as `ls` records (with sets), lets `render`
+/// annotate them and return the table lines and initial row, shows the picker with
+/// the lock released (with optional action keys), then reacquires and revalidates
+/// the root and the choice.
 pub(crate) fn choose_with(
     store: Store,
     root: &Path,
@@ -361,17 +359,14 @@ pub(crate) fn choose_with(
     let root_id = store.root_id.clone();
     drop(store);
     let rows = &lines[1..=records.len()];
-    let index = match actions {
-        None => platform::pick(title, &lines[0], rows, initial)?,
-        Some(actions) => {
-            let initial = actions.initial.unwrap_or(initial);
-            match platform::pick_with(title, actions.hint, &lines[0], rows, initial, actions.keys)?
-            {
-                platform::Picked::Chosen(index) => index,
-                platform::Picked::Action(_, index) => {
-                    return Ok(Choice::Action(choices[index].clone(), index));
-                }
-            }
+    let (hint, keys, initial) = match actions {
+        None => ("↑/↓, Enter; Esc cancels", &[][..], initial),
+        Some(a) => (a.hint, a.keys, a.initial.unwrap_or(initial)),
+    };
+    let index = match platform::pick_with(title, hint, &lines[0], rows, initial, keys)? {
+        platform::Picked::Chosen(index) => index,
+        platform::Picked::Action(index) => {
+            return Ok(Choice::Action(choices[index].clone(), index));
         }
     };
     let chosen = &choices[index];
@@ -505,24 +500,29 @@ pub fn list_project() -> (Option<PathBuf>, Vec<String>) {
 /// so a later profile with the same name inherits nothing. Returns warnings.
 pub fn forget_removed(store: &Store, registration: &Registration) -> Vec<String> {
     let id = &registration.registration_id;
-    let named = store
-        .read_state_unfiltered()
-        .map(|state| state.selections.iter().any(|s| &s.registration_id == id));
-    let result = match named {
-        Ok(false) => Ok(()),
-        Ok(true) => store.update_state(|state| {
-            state.selections.retain(|s| &s.registration_id != id);
-            Ok(())
-        }),
-        Err(e) => Err(e),
-    };
-    match result {
+    match forget_in_state(store, |s| &mut s.selections, |s| &s.registration_id == id) {
         Ok(()) => vec![],
         Err(e) => vec![format!(
             "Selections naming {} were not cleared: {}; run roost switch --forget in affected projects",
             registration.name, e.message
         )],
     }
+}
+
+/// Drops the entries `names` picks from one `state.json` list, reading first so
+/// an unaffected file is not rewritten. Shared by remove's and purge's cleanups.
+pub(crate) fn forget_in_state<T>(
+    store: &Store,
+    list: impl Fn(&mut StateFile) -> &mut Vec<T>,
+    names: impl Fn(&T) -> bool,
+) -> Result<()> {
+    if !list(&mut store.read_state_unfiltered()?).iter().any(&names) {
+        return Ok(());
+    }
+    store.update_state(|state| {
+        list(state).retain(|entry| !names(entry));
+        Ok(())
+    })
 }
 
 #[cfg(test)]

@@ -467,7 +467,7 @@ pub fn command(action: SetAction, data: &mut Value) -> Result<Vec<String>> {
             })
             .column("Subscribers", list("subscribers"))
             .column("Items", list("items"))
-            .render(&records, crate::table::stdout_color()));
+            .render(&records, crate::table::color_for(&std::io::stdout())));
     }
     let store = Store::open(&root, true, OpenMode::Mutate)?;
     let mut lines = vec![];

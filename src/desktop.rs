@@ -185,7 +185,13 @@ fn picker_rows(store: &Store, records: &mut [Value]) -> (Vec<String>, usize) {
         .or_else(|| records.iter().position(|r| r["most_recent"] == true))
         .unwrap_or(0);
     (
-        crate::table::desktop_profiles(records, crate::table::stderr_color()),
+        crate::table::profiles(
+            records,
+            false,
+            true,
+            crate::table::color_for(&std::io::stderr()),
+            None,
+        ),
         initial,
     )
 }
@@ -443,15 +449,8 @@ pub fn unlink(name: &str) -> Result<Vec<String>> {
 /// folder). Failure warns; readers ignore links of removed registrations anyway.
 pub fn forget_removed(store: &Store, registration: &Registration) -> Vec<String> {
     let id = &registration.registration_id;
-    let result = match store.read_state_unfiltered() {
-        Ok(state) if !state.desktop_links.iter().any(|l| &l.registration_id == id) => Ok(()),
-        Ok(_) => store.update_state(|state| {
-            state.desktop_links.retain(|l| &l.registration_id != id);
-            Ok(())
-        }),
-        Err(e) => Err(e),
-    };
-    match result {
+    let named = |l: &DesktopLink| &l.registration_id == id;
+    match crate::select::forget_in_state(store, |s| &mut s.desktop_links, named) {
         Ok(()) => vec![],
         Err(e) => vec![format!(
             "The Claude Desktop link of {} was not cleared: {}; run roost desktop --unlink {} if it is still listed",

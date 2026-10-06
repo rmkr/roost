@@ -561,10 +561,7 @@ fn recognized_status(
         warnings.push("Claude did not report a valid absolute configuration directory".to_owned());
     }
     let expected = if registration.kind == Kind::DefaultAlias {
-        match env::var_os("CLAUDE_CONFIG_DIR").filter(|value| !value.is_empty()) {
-            Some(value) => platform::absolute(Path::new(&value)).ok(),
-            None => platform::default_directory().ok(),
-        }
+        platform::claude_config_dir().ok()
     } else {
         registration.directory.clone()
     };

@@ -782,10 +782,7 @@ impl Store {
         Ok(Some(platform::validate_token(&bytes)?))
     }
     fn alias_directory() -> Result<PathBuf> {
-        match std::env::var_os("CLAUDE_CONFIG_DIR").filter(|x| !x.is_empty()) {
-            Some(path) => platform::absolute(Path::new(&path)),
-            None => platform::default_directory(),
-        }
+        platform::claude_config_dir()
     }
     pub fn profiles(&self, retained: bool) -> Result<Vec<Value>> {
         let mut records = self

@@ -1009,7 +1009,7 @@ fn list(root: &Path, data: &mut Value) -> Result<(Vec<String>, Vec<String>)> {
                     Cell::new("missing", Style::Yellow)
                 }
             })
-            .render(&plugins, crate::table::stdout_color())
+            .render(&plugins, crate::table::color_for(&std::io::stdout()))
     };
     lines.push(format!(
         "Auto-update: {}",
