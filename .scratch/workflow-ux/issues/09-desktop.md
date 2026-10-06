@@ -2,7 +2,7 @@
 
 Type: task
 Labels: workflow-ux
-Status: claimed
+Status: resolved
 Assignee: Claude subagent ticket-09
 Parent: [Make Roost simpler to work with day to day](../map.md)
 Blocked by: 01, 10
@@ -26,3 +26,7 @@ The ticket stays open. Still to do with the user: check whether Cowork works in 
 ### 2026-10-06: user decisions after implementation
 
 Accepted: purge and upstream remove must refuse with `desktop_running` while that profile's Desktop is running (not yet implemented; scheduled for the code-review fix pass), and the runtime `remove --yes` rule as implemented. Both are in the spec's remove/purge paragraph.
+
+## Answer
+
+2026-10-06: `roost desktop` is merged and in use. Cowork check with the user (`work` borrowing the conventional Desktop folder, `personal` on its own Roost folder, both running): Cowork's helper is per user and is started by whichever Desktop uses Cowork first (here `personal`, launched second), where Cowork works; the other Desktop cannot use Cowork until both are closed and reopened. Chat and the Code tab work in both. Layout differences between the two windows come from the signed-in accounts (same layout running alone). The warning shown when another Desktop is running now says exactly this, and ADR 0002 and the spec record it.

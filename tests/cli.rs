@@ -1258,7 +1258,9 @@ fn desktop_refuses_a_running_profile_and_warns_about_other_instances() {
 
     // Another profile still launches, with the Cowork warning.
     let out = f.ok(&["desktop", "--foreground", "Other"]);
-    assert!(String::from_utf8_lossy(&out.stderr).contains("Cowork is untested"));
+    assert!(
+        String::from_utf8_lossy(&out.stderr).contains("only one running Desktop can use Cowork")
+    );
 
     // A stale lock (dead PID or another host) is not running.
     let mut child = Command::new("/bin/true").spawn().unwrap();
@@ -1277,13 +1279,17 @@ fn desktop_refuses_a_running_profile_and_warns_about_other_instances() {
     fs::create_dir_all(&conventional).unwrap();
     std::os::unix::fs::symlink(&live, conventional.join("SingletonLock")).unwrap();
     let out = f.ok(&["desktop", "--foreground", "Work"]);
-    assert!(String::from_utf8_lossy(&out.stderr).contains("Cowork is untested"));
+    assert!(
+        String::from_utf8_lossy(&out.stderr).contains("only one running Desktop can use Cowork")
+    );
     f.ok(&["add", "personal", "--link-default"]);
     fs::remove_file(conventional.join("SingletonLock")).unwrap();
     fs::remove_file(&lock).unwrap();
     std::os::unix::fs::symlink(&live, &lock).unwrap();
     let out = f.ok(&["desktop", "--foreground", "personal"]);
-    assert!(String::from_utf8_lossy(&out.stderr).contains("Cowork is untested"));
+    assert!(
+        String::from_utf8_lossy(&out.stderr).contains("only one running Desktop can use Cowork")
+    );
 }
 
 #[test]

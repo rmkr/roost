@@ -19,7 +19,7 @@ use std::{
     process::Command,
 };
 
-const COWORK: &str = "Another Claude Desktop is already running; Cowork is untested with a second concurrent Desktop";
+const COWORK: &str = "Another Claude Desktop is already running; only one running Desktop can use Cowork (the first to use it), and the other gets it back only after both are closed";
 
 fn supported() -> Result<()> {
     if cfg!(target_os = "linux") {

@@ -23,6 +23,7 @@ Roost remembers which profile each project uses, shows profiles in a readable ta
 - [Raise the minimum Claude version to 2.1.280](issues/02-raise-claude-floor.md): floor raised for `CLAUDE_CODE_PLUGIN_DIRS`.
 - [Lay shared scaffolding for the workflow UX features](issues/10-shared-scaffold.md): table renderer, link helpers, reusable profile environment, side-file store API and `Launch` open mode.
 - [Render `roost ls` as a worktrunk-style table](issues/03-ls-table.md): aligned table with summary line and width fitting; `--full` runs parallel probes.
+- [Launch Claude Desktop per profile with `roost desktop`](issues/09-desktop.md): per-profile Desktop sign-in, detached launch; only one running Desktop can use Cowork.
 - [Remember the selected profile per project and add `roost switch`](issues/04-selected-profile.md): per-repo selection with picker, bare `roost`, `switch`, last-use recording and `ls` markers.
 - [Add shared sets with linked skills](issues/05-skill-sets.md): `set` commands, default and copied subscriptions, launch-time skill links in owned profiles.
 - [Share instruction fragments through sets](issues/11-shared-instructions.md): fragments linked into owned profiles' `rules/`; no import fallback needed.
