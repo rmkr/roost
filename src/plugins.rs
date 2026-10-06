@@ -1143,14 +1143,12 @@ fn add(
                     .into_iter()
                     .map(|(id, _, _)| id),
             );
-            if !candidates.iter().any(|id| plugin_name(id) == name) {
-                return Err(Error::new(
-                    "not_found",
-                    format!("No marketplace in the plugin store offers {name}"),
-                )
-                .next("Add its marketplace with roost plugin marketplace add SOURCE"));
-            }
-            resolve_known(&candidates, plugin)?
+            let missing = Error::new(
+                "not_found",
+                format!("No marketplace in the plugin store offers {name}"),
+            )
+            .next("Add its marketplace with roost plugin marketplace add SOURCE");
+            resolve_known(&candidates, plugin, missing, "Name one: roost plugin add")?
         }
     };
     let item = Item {
@@ -1213,7 +1211,20 @@ fn add(
 }
 
 /// Resolves PLUGIN[@MARKETPLACE] against known store plugins (record and sets).
-fn resolve_known(known: &BTreeSet<String>, plugin: &str) -> Result<String> {
+fn resolve_store(known: &BTreeSet<String>, plugin: &str) -> Result<String> {
+    let missing = Error::new("not_found", format!("No store plugin named {plugin}"))
+        .next("List store plugins with roost plugin list");
+    resolve_known(known, plugin, missing, "Name one as")
+}
+
+/// Resolves PLUGIN[@MARKETPLACE] against `known`: `missing` when no ID has
+/// that name, and `name_one` prefixes the hint when several do.
+fn resolve_known(
+    known: &BTreeSet<String>,
+    plugin: &str,
+    missing: Error,
+    name_one: &str,
+) -> Result<String> {
     let (name, marketplace) = parse_id(plugin)?;
     if marketplace.is_some() {
         return Ok(plugin.to_owned());
@@ -1221,10 +1232,7 @@ fn resolve_known(known: &BTreeSet<String>, plugin: &str) -> Result<String> {
     let matches: Vec<&String> = known.iter().filter(|id| plugin_name(id) == name).collect();
     match matches.as_slice() {
         [id] => Ok((*id).clone()),
-        [] => Err(
-            Error::new("not_found", format!("No store plugin named {name}"))
-                .next("List store plugins with roost plugin list"),
-        ),
+        [] => Err(missing),
         _ => Err(Error::new(
             "not_found",
             format!(
@@ -1236,7 +1244,7 @@ fn resolve_known(known: &BTreeSet<String>, plugin: &str) -> Result<String> {
                     .join(", ")
             ),
         )
-        .next(format!("Name one as {name}@MARKETPLACE"))),
+        .next(format!("{name_one} {name}@MARKETPLACE"))),
     }
 }
 
@@ -1249,7 +1257,7 @@ fn update(root: &Path, plugin: Option<&str>) -> Result<(Vec<String>, Vec<String>
     let known: BTreeSet<String> = record.plugins.iter().map(|p| p.id.clone()).collect();
     let ids: Vec<String> = match plugin {
         Some(plugin) => {
-            let id = resolve_known(&known, plugin)?;
+            let id = resolve_store(&known, plugin)?;
             if !known.contains(&id) {
                 return Err(Error::new(
                     "not_found",
@@ -1292,7 +1300,7 @@ fn remove(root: &Path, plugin: &str) -> Result<(Vec<String>, Vec<String>)> {
         let manager = Store::open(root, true, OpenMode::Mutate)?;
         let record = read_record(&manager)?.map(|(_, r)| r);
         let known = known_ids(record.as_ref(), &manager.read_sets()?);
-        let id = resolve_known(&known, plugin)?;
+        let id = resolve_store(&known, plugin)?;
         manager.update_sets(|sets| {
             for set in &mut sets.sets {
                 set.items

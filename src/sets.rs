@@ -232,7 +232,7 @@ pub(crate) fn find_set_mut<'a>(sets: &'a mut SetsFile, name: &str) -> Result<&'a
         .find(|s| s.name.eq_ignore_ascii_case(name))
         .ok_or_else(|| not_found(name))
 }
-pub(crate) fn not_found(name: &str) -> Error {
+fn not_found(name: &str) -> Error {
     Error::new("not_found", format!("No set named {name}")).next("List sets with roost set list")
 }
 pub(crate) fn validate_set_name(name: &str) -> Result<()> {

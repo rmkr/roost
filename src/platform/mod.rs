@@ -5,7 +5,7 @@ use std::path::{Component, Path, PathBuf};
 
 #[cfg(not(unix))]
 compile_error!(
-    "Native Windows is unsupported. Use a Linux Roost and Claude installation in WSL 2."
+    "Use a Linux Roost and Claude installation in WSL 2; native Windows support requires verified handle and DACL operations"
 );
 
 mod unix;

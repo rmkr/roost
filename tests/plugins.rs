@@ -296,7 +296,9 @@ fn bare_names_resolve_through_the_store_listing() {
     );
     f.ok(&["plugin", "marketplace", "add", "other"]);
     let out = f.fails(&["plugin", "add", "lint", "--no-set"], "not_found");
-    assert!(String::from_utf8_lossy(&out.stderr).contains("ambiguous"));
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(stderr.contains("ambiguous"));
+    assert!(stderr.contains("Name one: roost plugin add lint@MARKETPLACE"));
     let out = f.fails(&["plugin", "add", "nothing", "--no-set"], "not_found");
     assert!(String::from_utf8_lossy(&out.stderr).contains("No marketplace"));
     f.fails(&["plugin", "add", "bad/name", "--no-set"], "usage");

@@ -138,19 +138,21 @@ impl Store {
         let parent = self
             .reserved_dir(Reserved::Desktop, true)?
             .ok_or_else(|| err("io", "Desktop parent directory is unavailable"))?;
-        let marker = |root_id: String, identity| DesktopMarker {
-            schema_version: 1,
-            root_id,
-            registration_id: id.clone(),
-            directory_identity: identity,
-        };
         let folder = self.create_marked_dir(
             Operation::DesktopCreate,
+            Some(id.clone()),
             Some(&parent),
             &id,
             Role::DesktopData,
             DESKTOP_MARKER,
-            |root_id, identity| encode(&marker(root_id, identity)),
+            |root_id, directory_identity| {
+                encode(&DesktopMarker {
+                    schema_version: 1,
+                    root_id,
+                    registration_id: id.clone(),
+                    directory_identity,
+                })
+            },
         )?;
         Ok(folder.path)
     }

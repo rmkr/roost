@@ -804,7 +804,12 @@ impl Drop for TerminalMode<'_> {
 
 /// Switches `fd` to byte-at-a-time input without echo (and without `extra` local
 /// modes), keeping ISIG so Ctrl-C still raises SIGINT for the cancel handler.
-fn raw_mode(fd: BorrowedFd<'_>, extra: LocalModes) -> Result<TerminalMode<'_>> {
+/// `failure` is the error message when the mode cannot be set.
+fn raw_mode<'a>(
+    fd: BorrowedFd<'a>,
+    extra: LocalModes,
+    failure: &'static str,
+) -> Result<TerminalMode<'a>> {
     let original = rustix::termios::tcgetattr(fd)
         .map_err(|_| Error::new("io", "Cannot inspect terminal mode"))?;
     let mut raw = original.clone();
@@ -812,7 +817,7 @@ fn raw_mode(fd: BorrowedFd<'_>, extra: LocalModes) -> Result<TerminalMode<'_>> {
     raw.special_codes[SpecialCodeIndex::VMIN] = 1;
     raw.special_codes[SpecialCodeIndex::VTIME] = 0;
     rustix::termios::tcsetattr(fd, OptionalActions::Now, &raw)
-        .map_err(|_| Error::new("io", "Cannot switch terminal mode"))?;
+        .map_err(|_| Error::new("io", failure))?;
     Ok(TerminalMode { fd, original })
 }
 
@@ -873,7 +878,11 @@ pub fn token_input(stdin: bool) -> Result<String> {
     }
     let tty = terminal()?;
     // Noncanonical input avoids the kernel's much smaller canonical-line ceiling.
-    let guard = raw_mode(tty.as_fd(), LocalModes::ECHONL)?;
+    let guard = raw_mode(
+        tty.as_fd(),
+        LocalModes::ECHONL,
+        "Cannot disable terminal echo",
+    )?;
     (&tty)
         .write_all(b"Token: ")
         .map_err(|_| Error::new("io", "Cannot write terminal prompt"))?;
@@ -1058,7 +1067,11 @@ pub fn pick_with(
     }
     let descriptor = libc::STDIN_FILENO;
     let stdin = std::io::stdin();
-    let guard = raw_mode(stdin.as_fd(), LocalModes::empty())?;
+    let guard = raw_mode(
+        stdin.as_fd(),
+        LocalModes::empty(),
+        "Cannot switch terminal mode",
+    )?;
     let mut out = std::io::stderr();
     let height = rows.len() + 2;
     let draw =

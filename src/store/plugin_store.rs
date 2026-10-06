@@ -68,6 +68,7 @@ impl Store {
         self.create_marked_dir(
             Operation::StoreCreate,
             None,
+            None,
             PLUGIN_STORE,
             Role::Store,
             STORE_MARKER,

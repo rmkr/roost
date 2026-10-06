@@ -1388,18 +1388,19 @@ impl Store {
     }
     /// The journaled `desktop_create` / `store_create` operation: exclusively create
     /// `name` (in `parent`, else the root), record its identity, write its marker,
-    /// then increment the registry generation. A folder under `parent` is named by
-    /// the registration ID the journal records.
+    /// then increment the registry generation. `id` is the registration ID the
+    /// journal records, if any.
+    #[allow(clippy::too_many_arguments)] // Explicit journal ID rather than one inferred from `parent`.
     fn create_marked_dir(
         &mut self,
         operation: Operation,
+        id: Option<String>,
         parent: Option<&Directory>,
         name: &str,
         role: Role,
         marker_name: &str,
         marker: impl FnOnce(String, FileIdentity) -> Result<Vec<u8>>,
     ) -> Result<Directory> {
-        let id = parent.map(|_| name.to_owned());
         let stage = self.begin(operation, id)?;
         // Exclusive creation: an object appearing meanwhile fails here.
         let created = parent.unwrap_or(&self.directory).create_dir(name)?;

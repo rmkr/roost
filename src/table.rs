@@ -203,15 +203,23 @@ pub fn color_for(stream: &impl std::io::IsTerminal) -> bool {
     )
 }
 
-/// The human `list` table over ProfileRecord values. With `desktop`, the `roost
-/// desktop` picker rows: a Desktop column from each record's `desktop` value
-/// (`running`, `signed_in`, `plain` for a default alias, `shared` with
-/// `desktop_shared_with` for an alias whose folder a profile borrows, otherwise
-/// never launched).
+/// Extra columns of the profile table.
+#[derive(Clone, Copy, PartialEq)]
+pub enum Columns {
+    Basic,
+    /// `ls --full`: the probed Login, Auth and Claude dir columns.
+    Full,
+    /// The `roost desktop` picker: a Desktop column from each record's `desktop`
+    /// value (`running`, `signed_in`, `plain` for a default alias, `shared` with
+    /// `desktop_shared_with` for an alias whose folder a profile borrows,
+    /// otherwise never launched).
+    Desktop,
+}
+
+/// The human `list` table over ProfileRecord values.
 pub fn profiles(
     records: &[Value],
-    full: bool,
-    desktop: bool,
+    columns: Columns,
     color: bool,
     width: Option<usize>,
 ) -> Vec<String> {
@@ -265,7 +273,7 @@ pub fn profiles(
                 None => Cell::new("never", Style::Dim),
             }
         });
-    if desktop {
+    if columns == Columns::Desktop {
         table = table.column("Desktop", |r: &Value| match r["desktop"].as_str() {
             Some("running") => Cell::new("running", Style::Green),
             Some("signed_in") => Cell::plain("signed in"),
@@ -277,7 +285,7 @@ pub fn profiles(
             _ => Cell::new("—", Style::Dim),
         });
     }
-    if full {
+    if columns == Columns::Full {
         table = table
             .column("Login", |r: &Value| {
                 probe_cell(r, |p| match p["reported_logged_in"].as_bool()? {

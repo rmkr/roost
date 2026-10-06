@@ -279,8 +279,11 @@ fn dispatch(action: Action, data: &mut Value) -> Result<Outcome> {
             warnings.extend(run_probes(&mut profiles, jobs));
             let lines = table::profiles(
                 &profiles,
-                full,
-                false,
+                if full {
+                    table::Columns::Full
+                } else {
+                    table::Columns::Basic
+                },
                 table::color_for(&std::io::stdout()),
                 platform::stdout_width(),
             );

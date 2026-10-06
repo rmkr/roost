@@ -187,8 +187,7 @@ fn picker_rows(store: &Store, records: &mut [Value]) -> (Vec<String>, usize) {
     (
         crate::table::profiles(
             records,
-            false,
-            true,
+            crate::table::Columns::Desktop,
             crate::table::color_for(&std::io::stderr()),
             None,
         ),

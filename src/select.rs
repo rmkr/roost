@@ -279,8 +279,7 @@ fn pick(store: Store, root: &Path, key: &Path) -> Result<(Store, Registration, R
         let _ = annotate(store, records, Some(key));
         let lines = table::profiles(
             records,
-            false,
-            false,
+            table::Columns::Basic,
             table::color_for(&std::io::stderr()),
             None,
         );
