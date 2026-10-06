@@ -2,6 +2,7 @@ mod cli;
 mod launch;
 mod platform;
 mod store;
+mod table;
 
 use cli::Action;
 use serde_json::{Value, json};
@@ -195,18 +196,7 @@ fn dispatch(action: Action, data: &mut Value) -> Result<Outcome> {
             } else {
                 vec![]
             };
-            let lines = profiles
-                .iter()
-                .map(|p| {
-                    format!(
-                        "{}\t{}\t{}\t{}",
-                        p["name"].as_str().unwrap_or("?"),
-                        p["kind"].as_str().unwrap_or("?"),
-                        p["state"].as_str().unwrap_or("?"),
-                        p["directory"].as_str().unwrap_or("-")
-                    )
-                })
-                .collect();
+            let lines = table::profiles(&profiles, table::stdout_color());
             *data = json!({"profiles":profiles});
             let mut output = Outcome::lines(lines);
             if store.as_ref().is_some_and(Store::pending) {

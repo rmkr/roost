@@ -150,6 +150,33 @@ fn help_version_and_usage_do_not_touch_storage() {
 }
 
 #[test]
+fn human_list_is_a_plain_aligned_table_when_piped() {
+    let f = Fixture::new();
+    f.add("Work");
+    f.ok(&["add", "personal", "--link-default"]);
+    let mut command = f.command();
+    command.env("NO_COLOR", "");
+    let out = command.arg("ls").output().unwrap();
+    assert!(out.status.success());
+    let text = String::from_utf8(out.stdout).unwrap();
+    assert!(!text.contains('\x1b'), "{text}");
+    let work = f.root.join("profiles/Work");
+    let lines: Vec<&str> = text.lines().collect();
+    assert_eq!(lines[0], "Profile   Kind           State   Directory");
+    assert_eq!(
+        lines[1],
+        format!(
+            "personal  default_alias  active  {}",
+            f.home.join(".claude").display()
+        )
+    );
+    assert_eq!(lines[2], format!("Work      owned          active  {}", work.display()));
+    assert_eq!(lines[3], "");
+    assert_eq!(lines[4], "○ 2 profiles · 0 upstream");
+    assert_eq!(lines.len(), 5);
+}
+
+#[test]
 fn lifecycle_retains_tokens_and_requires_explicit_reuse() {
     let f = Fixture::new();
     f.add("Work");
