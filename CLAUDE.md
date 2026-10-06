@@ -46,4 +46,4 @@ Key invariants that cut across modules:
 
 ## Planning tracker
 
-`.scratch/` is a local Markdown tracker (`map.md` + numbered `issues/` tickets with `Status`/`Assignee`/`Blocked by` metadata); see `.scratch/README.md` for the claim/resolve conventions before editing tickets. The rust-port and workflow-ux maps are complete; workflow-ux decisions are in `.scratch/workflow-ux/design.md` and ADRs in `docs/adr/`.
+Work is tracked in GitHub issues on `rmkr/roost`: a spec is a parent issue, its tickets are sub-issues, and order uses GitHub's "blocked by" relations. PRs close their issues. `.scratch/` is a read-only archive of the completed rust-port and workflow-ux efforts (Markdown tracker conventions in `.scratch/README.md`); workflow-ux decisions are in `.scratch/workflow-ux/design.md` and ADRs in `docs/adr/`.
