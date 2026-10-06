@@ -40,7 +40,18 @@ Worktrunk-style table, colored on a terminal and plain when piped; `--json` unch
 - Links are reconciled at every launch: Roost adds and removes only the links it recorded in that profile. Reconcile failure warns and still launches.
 - Conflicts: content already in the profile always wins and is never replaced. Two subscribed sets providing the same name are refused at subscribe time; a conflict found at launch warns and skips the item.
 - Never link `skills/synced` or `plugins/synced`; they are per account and Claude-managed.
-- v1 item kinds: skills (linked) and plugins (injected). Later: agents, commands, output-styles and rules (linked), and hooks/settings through a shared `--settings` file. `CLAUDE.md` is not shared.
+- v1 item kinds: skills (linked), instruction fragments (linked) and plugins (injected). Later: agents, commands and output-styles (linked), and hooks/settings through a shared `--settings` file.
+
+## Shared instructions
+
+Added 2026-10-06, reversing the earlier "`CLAUDE.md` is not shared" decision.
+
+- Instructions are shared as **instruction fragments**: one topic per `.md` file, kept in a directory the user manages (for example `~/.agents/instructions/`). Roost never owns or edits them.
+- A set's instruction items are linked into an owned profile's `rules/` folder and reconciled at launch exactly like skills (same recording, conflict and purge rules). A profile's own `CLAUDE.md` is never touched.
+- Fallback if `rules/` in the config directory does not load like `CLAUDE.md`: a Roost-managed delimited import block of `@path` lines in the profile's `CLAUDE.md`, leaving content outside the block to the user. See [Investigate injected plugin behavior](issues/06-injected-plugin-behavior.md) for the check.
+- No section-level selection inside one file: split large files into fragments instead.
+- Owned profiles only; registered upstream profiles and the default alias receive no instructions.
+- The user's `~/.claude/CLAUDE.md` is split into fragments and placed in a default set (for example `core`); the original becomes a thin list of imports of the same fragments so projects under `$HOME` do not load them twice.
 
 ## Plugin store
 

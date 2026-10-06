@@ -21,10 +21,10 @@ Roost remembers which profile each project uses, shows profiles in a readable ta
 
 ## Not yet specified
 
-- Shared agents, commands, output-styles and rules (linked like skills), and hooks/settings through a shared `--settings` file: agreed as later item kinds, not yet ticketed.
+- Shared agents, commands and output-styles (linked like skills), and hooks/settings through a shared `--settings` file: agreed as later item kinds, not yet ticketed.
 
 ## Out of scope
 
 - Roost installing or owning skills: skills stay with the user's own installer and are only linked.
-- Sharing `CLAUDE.md`, `.claude.json`, credentials, or Claude's synced skill and plugin folders.
+- Sharing a whole `CLAUDE.md`, `.claude.json`, credentials, or Claude's synced skill and plugin folders.
 - Writing into registered upstream or default-alias data.

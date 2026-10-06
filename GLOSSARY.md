@@ -59,3 +59,7 @@ _Avoid_: Shared profile, global config, bundle
 **Plugin store**:
 The manager's own single installation of shared plugins, from which shared sets draw their plugins. It belongs to no profile and no account.
 _Avoid_: Shared profile, plugin cache
+
+**Instruction fragment**:
+A self-contained file of Claude instructions on one topic that a shared set can carry.
+_Avoid_: Shared CLAUDE.md, snippet, partial
