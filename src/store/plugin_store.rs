@@ -9,8 +9,8 @@
 //! [ADR 0001]: ../../docs/adr/0001-shared-plugins-injected-at-launch.md
 
 use super::{
-    Action, Artifact, Directory, LIMIT, Operation, REGISTRY, Result, Role, Store, encode, err,
-    file_name, file_state, read_record, recovery, side::PLUGIN_STORE, state,
+    Artifact, Directory, LIMIT, Operation, Result, Role, Store, encode, err, recovery,
+    side::PLUGIN_STORE,
 };
 use crate::platform::{Entry, FileIdentity};
 use serde::{Deserialize, Serialize};
@@ -65,30 +65,20 @@ impl Store {
         if let Some(store) = self.plugin_store()? {
             return Ok(store);
         }
-        let stage = self.begin(Operation::StoreCreate, None)?;
-        // Exclusive creation: an object appearing meanwhile fails here.
-        let created = self.directory.create_dir(PLUGIN_STORE)?;
-        let identity = created.identity()?;
-        self.record(Artifact {
-            role: Role::Store,
-            destination: created.path.clone(),
-            staged: None,
-            before: None,
-            after: Some(state(identity.clone())),
-            action: Action::Create,
-            completed: false,
-        })?;
-        let marker = StoreMarker {
-            schema_version: 1,
-            root_id: self.root_id.clone(),
-            directory_identity: identity,
-        };
-        created.write_new(STORE_MARKER, &encode(&marker)?, 0o600)?;
-        created.sync()?;
-        self.directory.sync()?;
-        let next = self.registry.clone();
-        self.commit(next, &stage)?;
-        Ok(created)
+        self.create_marked_dir(
+            Operation::StoreCreate,
+            None,
+            PLUGIN_STORE,
+            Role::Store,
+            STORE_MARKER,
+            |root_id, directory_identity| {
+                encode(&StoreMarker {
+                    schema_version: 1,
+                    root_id,
+                    directory_identity,
+                })
+            },
+        )
     }
 
     /// Whether a present store entry is the journaled, marked store directory.
@@ -112,79 +102,12 @@ impl Store {
         Ok(())
     }
 
-    /// Recovery of an uncommitted `store_create`: remove a proven new directory that
-    /// is empty or holds only a partial marker, or complete bookkeeping for a marked
-    /// one.
+    /// Recovery of an uncommitted `store_create` (an unmarked store left for
+    /// inspection is never used).
     pub(super) fn recover_store_create(&mut self) -> Result<()> {
-        let journal = self.intent.clone().unwrap();
-        let stage_artifact = journal
-            .artifacts
-            .iter()
-            .find(|a| a.role == Role::StagingDirectory)
-            .ok_or_else(|| recovery("Plugin store creation has no staging identity"))?;
-        if !self.matches(stage_artifact, stage_artifact.after.as_ref())? {
-            return Err(recovery("Plugin store creation staging identity changed"));
-        }
-        let stage = self
-            .stages
-            .child(file_name(&stage_artifact.destination)?, true)?;
-        // Without a recorded identity nothing authorizes cleanup: any directory stays
-        // for inspection (an unmarked store is never used).
-        let Some(a) = journal.artifacts.iter().find(|a| a.role == Role::Store) else {
-            return self.cleanup();
-        };
-        let parent = self.parent_for(&a.destination)?;
-        let name = file_name(&a.destination)?;
-        let Some(entry) = parent.entry(name)? else {
-            return self.cleanup();
-        };
-        if entry.is_link
-            || !entry.is_dir
-            || Some(&entry.identity) != a.after.as_ref().map(|s| &s.object_identity)
-        {
-            return Err(recovery(format!(
-                "Plugin store matches neither recorded state: {}",
-                a.destination.display()
-            )));
-        }
-        if self.matches(a, a.after.as_ref())? {
-            if let Some(index) = journal
-                .artifacts
-                .iter()
-                .position(|a| a.role == Role::Registry)
-            {
-                self.publish(index)?;
-                self.registry = read_record(&self.directory, REGISTRY)?;
-                return self.cleanup();
-            }
-            let next = self.registry.clone();
-            return self.commit(next, &stage);
-        }
-        let store = parent.child(name, true)?;
-        let entries = store.entries()?;
-        if entries == [STORE_MARKER] {
-            let bytes = store.read(STORE_MARKER, true, LIMIT)?.unwrap_or_default();
-            if serde_json::from_slice::<StoreMarker>(&bytes).is_ok()
-                || file_state(&store, STORE_MARKER, true)?.is_none()
-            {
-                return Err(recovery(format!(
-                    "Plugin store marker belongs elsewhere; preserve {}",
-                    a.destination.display()
-                )));
-            }
-            store.remove(STORE_MARKER, false)?;
-        } else if !entries.is_empty() {
-            return Err(recovery(format!(
-                "New plugin store holds unexpected data; preserve {}",
-                a.destination.display()
-            )));
-        }
-        if parent.entry(name)?.map(|e| e.identity) != Some(entry.identity) {
-            return Err(recovery("Plugin store changed during recovery"));
-        }
-        parent.remove(name, true)?;
-        parent.sync()?;
-        self.cleanup()
+        self.recover_marked_dir_create(Role::Store, STORE_MARKER, "Plugin store", |b| {
+            serde_json::from_slice::<StoreMarker>(b).is_ok()
+        })
     }
 }
 

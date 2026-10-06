@@ -7,9 +7,8 @@
 //! `desktop_data` artifact that keeps the marker until every other entry is gone.
 
 use super::{
-    Action, Artifact, Directory, Error, Kind, LIMIT, OpenMode, Operation, REGISTRY, Registration,
-    Result, Role, Store, encode, err, file_name, file_state, read_record, recovery, side::DESKTOP,
-    state,
+    Action, Artifact, Directory, Error, Kind, LIMIT, Operation, Registration, Result, Role, Store,
+    encode, err, file_name, partial_deletion, recovery, side::DESKTOP, state,
 };
 use crate::platform::{self, Entry, FileIdentity};
 use serde::{Deserialize, Serialize};
@@ -137,29 +136,20 @@ impl Store {
         let parent = self
             .reserved_dir(DESKTOP, true)?
             .ok_or_else(|| err("io", "Desktop parent directory is unavailable"))?;
-        let stage = self.begin(Operation::DesktopCreate, Some(id.clone()))?;
-        let folder = parent.create_dir(&id)?;
-        let identity = folder.identity()?;
-        self.record(Artifact {
-            role: Role::DesktopData,
-            destination: folder.path.clone(),
-            staged: None,
-            before: None,
-            after: Some(state(identity.clone())),
-            action: Action::Create,
-            completed: false,
-        })?;
-        let marker = DesktopMarker {
+        let marker = |root_id: String, identity| DesktopMarker {
             schema_version: 1,
-            root_id: self.root_id.clone(),
-            registration_id: id,
+            root_id,
+            registration_id: id.clone(),
             directory_identity: identity,
         };
-        folder.write_new(DESKTOP_MARKER, &encode(&marker)?, 0o600)?;
-        folder.sync()?;
-        parent.sync()?;
-        let next = self.registry.clone();
-        self.commit(next, &stage)?;
+        let folder = self.create_marked_dir(
+            Operation::DesktopCreate,
+            Some(&parent),
+            &id,
+            Role::DesktopData,
+            DESKTOP_MARKER,
+            |root_id, identity| encode(&marker(root_id, identity)),
+        )?;
         Ok(folder.path)
     }
 
@@ -213,9 +203,7 @@ impl Store {
     /// `desktop_delete` operation (the caller confirmed it); registrations are
     /// unchanged. Returns whether a folder was deleted.
     pub fn delete_desktop_folder(&mut self, r: &Registration) -> Result<bool> {
-        if !self.mode.journaled() {
-            return Err(err("ownership", "Read-only store cannot mutate"));
-        }
+        self.writable(false)?;
         let Some(artifact) = self.desktop_deletion(r)? else {
             return Ok(false);
         };
@@ -281,17 +269,7 @@ impl Store {
                 return Err(Error::cancelled());
             }
             folder.purge_children(DESKTOP_MARKER).map_err(|e| {
-                let mut error = Error::new(
-                    e.code,
-                    format!(
-                        "Partial deletion at {}; Desktop marker and journal remain; {}",
-                        folder.path.display(),
-                        e.message
-                    ),
-                )
-                .next("Quit Claude Desktop for this profile, inspect roost doctor, then repeat the removal.");
-                error.exit_code = e.exit_code;
-                error
+                partial_deletion(e, &folder.path, "Desktop marker", "Quit Claude Desktop for this profile, inspect roost doctor, then repeat the removal.")
             })?;
             self.check_root()?;
             if !self.matches(&a, a.before.as_ref())? {
@@ -308,89 +286,12 @@ impl Store {
         self.publish(index)
     }
 
-    /// Recovery of an uncommitted `desktop_create`: remove a proven new folder that is
-    /// empty or holds only a partial marker, or complete bookkeeping for a marked one.
+    /// Recovery of an uncommitted `desktop_create` (a later launch refuses an
+    /// unmarked folder left for inspection).
     pub(super) fn recover_desktop_create(&mut self) -> Result<()> {
-        let journal = self.intent.clone().unwrap();
-        let stage_artifact = journal
-            .artifacts
-            .iter()
-            .find(|a| a.role == Role::StagingDirectory)
-            .ok_or_else(|| recovery("Desktop creation has no staging identity"))?;
-        if !self.matches(stage_artifact, stage_artifact.after.as_ref())? {
-            return Err(recovery("Desktop creation staging identity changed"));
-        }
-        let stage = self
-            .stages
-            .child(file_name(&stage_artifact.destination)?, true)?;
-        // Without a recorded identity nothing authorizes cleanup: any folder stays
-        // for inspection (a later launch refuses an unmarked one).
-        let Some(a) = journal
-            .artifacts
-            .iter()
-            .find(|a| a.role == Role::DesktopData)
-        else {
-            return self.cleanup();
-        };
-        let parent = self.parent_for(&a.destination)?;
-        let name = file_name(&a.destination)?;
-        let Some(entry) = parent.entry(name)? else {
-            return self.cleanup();
-        };
-        if entry.is_link
-            || !entry.is_dir
-            || Some(&entry.identity) != a.after.as_ref().map(|s| &s.object_identity)
-        {
-            return Err(recovery(format!(
-                "Desktop folder matches neither recorded state: {}",
-                a.destination.display()
-            )));
-        }
-        if self.matches(a, a.after.as_ref())? {
-            if let Some(index) = journal
-                .artifacts
-                .iter()
-                .position(|a| a.role == Role::Registry)
-            {
-                self.publish(index)?;
-                self.registry = read_record(&self.directory, REGISTRY)?;
-                return self.cleanup();
-            }
-            let next = self.registry.clone();
-            return self.commit(next, &stage);
-        }
-        let folder = parent.child(name, true)?;
-        let entries = folder.entries()?;
-        if entries == [DESKTOP_MARKER] {
-            let bytes = folder
-                .read(DESKTOP_MARKER, true, LIMIT)?
-                .unwrap_or_default();
-            if serde_json::from_slice::<DesktopMarker>(&bytes).is_ok()
-                || file_state(&folder, DESKTOP_MARKER, true)?.is_none()
-            {
-                return Err(recovery(format!(
-                    "Desktop folder marker belongs elsewhere; preserve {}",
-                    a.destination.display()
-                )));
-            }
-            folder.remove(DESKTOP_MARKER, false)?;
-        } else if !entries.is_empty() {
-            return Err(recovery(format!(
-                "New Desktop folder holds unexpected data; preserve {}",
-                a.destination.display()
-            )));
-        }
-        if parent.entry(name)?.map(|e| e.identity) != Some(entry.identity) {
-            return Err(recovery("Desktop folder changed during recovery"));
-        }
-        parent.remove(name, true)?;
-        parent.sync()?;
-        self.cleanup()
-    }
-
-    /// Whether this open mode may run the journaled `desktop_create` operation.
-    pub(super) fn desktop_create_allowed(&self) -> bool {
-        self.mode == OpenMode::Launch
+        self.recover_marked_dir_create(Role::DesktopData, DESKTOP_MARKER, "Desktop folder", |b| {
+            serde_json::from_slice::<DesktopMarker>(b).is_ok()
+        })
     }
 }
 

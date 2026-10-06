@@ -217,6 +217,20 @@ pub struct Store {
 fn err(code: &'static str, message: impl Into<String>) -> Error {
     Error::new(code, message)
 }
+/// A deletion that stopped partway, keeping `kept` and the journal.
+fn partial_deletion(e: Error, path: &Path, kept: &str, next: &str) -> Error {
+    let mut error = Error::new(
+        e.code,
+        format!(
+            "Partial deletion at {}; {kept} and journal remain; {}",
+            path.display(),
+            e.message
+        ),
+    )
+    .next(next);
+    error.exit_code = e.exit_code;
+    error
+}
 fn recovery(message: impl Into<String>) -> Error {
     err("ownership", message).next("Inspect the pending operation with roost doctor; retry the explicit operation only after checking the changed state.")
 }
@@ -752,34 +766,33 @@ impl Store {
         }
         Ok(())
     }
-    pub fn token_present(&self, r: &Registration) -> Result<bool> {
+    /// The profile directory and manager token file name; `None` for default aliases.
+    fn token_file(&self, r: &Registration) -> Result<Option<(Directory, &'static str)>> {
         self.check_root()?;
         if r.kind == Kind::DefaultAlias {
-            return Ok(false);
+            return Ok(None);
         }
-        let directory = self.profile_directory(r)?;
         let name = if r.kind == Kind::Owned {
             ".roost-token"
         } else {
             ".ccm-oauth-token"
+        };
+        Ok(Some((self.profile_directory(r)?, name)))
+    }
+    pub fn token_present(&self, r: &Registration) -> Result<bool> {
+        let Some((directory, name)) = self.token_file(r)? else {
+            return Ok(false);
         };
         Ok(file_state(&directory, name, true)?.is_some())
     }
     pub fn token(&self, r: &Registration) -> Result<Option<String>> {
-        self.check_root()?;
-        if r.kind == Kind::DefaultAlias {
-            return Ok(None);
-        }
-        let directory = self.profile_directory(r)?;
-        let name = if r.kind == Kind::Owned {
-            ".roost-token"
-        } else {
-            ".ccm-oauth-token"
-        };
-        let Some(bytes) = directory.read(name, true, 65536)? else {
+        let Some((directory, name)) = self.token_file(r)? else {
             return Ok(None);
         };
-        Ok(Some(platform::validate_token(&bytes)?))
+        directory
+            .read(name, true, 65536)?
+            .map(|bytes| platform::validate_token(&bytes))
+            .transpose()
     }
     fn alias_directory() -> Result<PathBuf> {
         match std::env::var_os("CLAUDE_CONFIG_DIR").filter(|x| !x.is_empty()) {
@@ -879,13 +892,16 @@ impl Store {
         }
         Ok(())
     }
-    fn mutation_ready(&self) -> Result<()> {
-        self.journal_ready(false)
+    /// Refuses Read mode, and Launch mode unless `launch_allowed` (only the
+    /// journaled `desktop_create` runs while launching).
+    fn writable(&self, launch_allowed: bool) -> Result<()> {
+        if self.mode.journaled() || (launch_allowed && self.mode == OpenMode::Launch) {
+            return Ok(());
+        }
+        Err(err("ownership", "Read-only store cannot mutate"))
     }
     fn journal_ready(&self, launch_allowed: bool) -> Result<()> {
-        if !self.mode.journaled() && !(launch_allowed && self.desktop_create_allowed()) {
-            return Err(err("ownership", "Read-only store cannot mutate"));
-        }
+        self.writable(launch_allowed)?;
         self.check_root()?;
         if self.pending() {
             return Err(recovery(
@@ -1351,9 +1367,127 @@ impl Store {
         self.intent.as_mut().unwrap().artifacts[index].completed = true;
         self.save_intent()
     }
-    fn commit(&mut self, mut next: Registry, stage: &Directory) -> Result<()> {
+    /// Opens the journal's recorded staging directory after proving its identity.
+    fn journal_stage(&self, j: &Intent, what: &str) -> Result<Directory> {
+        let a = j
+            .artifacts
+            .iter()
+            .find(|a| a.role == Role::StagingDirectory)
+            .ok_or_else(|| recovery(format!("{what} has no staging identity")))?;
+        if !self.matches(a, a.after.as_ref())? {
+            return Err(recovery(format!("{what} staging identity changed")));
+        }
+        self.stages.child(file_name(&a.destination)?, true)
+    }
+    /// Completes an interrupted operation's bookkeeping: publishes its staged
+    /// registry if it has one, else commits the current registry.
+    fn finish_bookkeeping(&mut self, j: &Intent, stage: &Directory) -> Result<()> {
+        if let Some(index) = j.artifacts.iter().position(|a| a.role == Role::Registry) {
+            self.publish(index)?;
+            self.registry = read_record(&self.directory, REGISTRY)?;
+            return self.cleanup();
+        }
+        self.commit(self.registry.clone(), stage)
+    }
+    /// The journaled `desktop_create` / `store_create` operation: exclusively create
+    /// `name` (in `parent`, else the root), record its identity, write its marker,
+    /// then increment the registry generation. A folder under `parent` is named by
+    /// the registration ID the journal records.
+    fn create_marked_dir(
+        &mut self,
+        operation: Operation,
+        parent: Option<&Directory>,
+        name: &str,
+        role: Role,
+        marker_name: &str,
+        marker: impl FnOnce(String, FileIdentity) -> Result<Vec<u8>>,
+    ) -> Result<Directory> {
+        let id = parent.map(|_| name.to_owned());
+        let stage = self.begin(operation, id)?;
+        // Exclusive creation: an object appearing meanwhile fails here.
+        let created = parent.unwrap_or(&self.directory).create_dir(name)?;
+        let identity = created.identity()?;
+        self.record(Artifact {
+            role,
+            destination: created.path.clone(),
+            staged: None,
+            before: None,
+            after: Some(state(identity.clone())),
+            action: Action::Create,
+            completed: false,
+        })?;
+        created.write_new(marker_name, &marker(self.root_id.clone(), identity)?, 0o600)?;
+        created.sync()?;
+        parent.unwrap_or(&self.directory).sync()?;
+        self.commit(self.registry.clone(), &stage)?;
+        Ok(created)
+    }
+    /// Recovery of an uncommitted marked-directory creation: remove a proven new
+    /// directory that is empty or holds only a partial marker, or complete
+    /// bookkeeping for a marked one. Without a recorded identity nothing authorizes
+    /// cleanup, so any directory stays for inspection.
+    fn recover_marked_dir_create(
+        &mut self,
+        role: Role,
+        marker: &str,
+        what: &str,
+        is_ours: fn(&[u8]) -> bool,
+    ) -> Result<()> {
+        let journal = self.intent.clone().unwrap();
+        let stage = self.journal_stage(&journal, &format!("{what} creation"))?;
+        let Some(a) = journal.artifacts.iter().find(|a| a.role == role) else {
+            return self.cleanup();
+        };
+        let parent = self.parent_for(&a.destination)?;
+        let name = file_name(&a.destination)?;
+        let Some(entry) = parent.entry(name)? else {
+            return self.cleanup();
+        };
+        if entry.is_link
+            || !entry.is_dir
+            || Some(&entry.identity) != a.after.as_ref().map(|s| &s.object_identity)
+        {
+            return Err(recovery(format!(
+                "{what} matches neither recorded state: {}",
+                a.destination.display()
+            )));
+        }
+        if self.matches(a, a.after.as_ref())? {
+            return self.finish_bookkeeping(&journal, &stage);
+        }
+        let created = parent.child(name, true)?;
+        let entries = created.entries()?;
+        if entries == [marker] {
+            let bytes = created.read(marker, true, LIMIT)?.unwrap_or_default();
+            if is_ours(&bytes) || file_state(&created, marker, true)?.is_none() {
+                return Err(recovery(format!(
+                    "{what} marker belongs elsewhere; preserve {}",
+                    a.destination.display()
+                )));
+            }
+            created.remove(marker, false)?;
+        } else if !entries.is_empty() {
+            return Err(recovery(format!(
+                "New {what} holds unexpected data; preserve {}",
+                a.destination.display()
+            )));
+        }
+        if parent.entry(name)?.map(|e| e.identity) != Some(entry.identity) {
+            return Err(recovery(format!("{what} changed during recovery")));
+        }
+        parent.remove(name, true)?;
+        parent.sync()?;
+        self.cleanup()
+    }
+    fn has_artifact(&self, role: Role) -> bool {
+        self.intent
+            .as_ref()
+            .is_some_and(|j| j.artifacts.iter().any(|a| a.role == role))
+    }
+    /// Stages `next` as the registry at the journal's next generation.
+    fn stage_registry(&mut self, stage: &Directory, next: &mut Registry) -> Result<()> {
         next.generation = self.intent.as_ref().unwrap().next_generation;
-        let bytes = encode(&next)?;
+        let bytes = encode(&*next)?;
         if bytes.len() > LIMIT {
             return Err(err("io", "Registry exceeds metadata limit"));
         }
@@ -1374,7 +1508,10 @@ impl Store {
             &bytes,
             0o600,
             after,
-        )?;
+        )
+    }
+    fn commit(&mut self, mut next: Registry, stage: &Directory) -> Result<()> {
+        self.stage_registry(stage, &mut next)?;
         self.intent.as_mut().unwrap().phase = Phase::Publishing;
         self.save_intent()?;
         for index in 0..self.intent.as_ref().unwrap().artifacts.len() {
@@ -1794,7 +1931,6 @@ impl Store {
                 }
                 self.cleanup()
             }
-            Operation::Reuse => self.rollback_refresh(),
             Operation::DesktopDelete => {
                 self.cleanup()?;
                 // Deletion never continues automatically; a partly deleted folder
@@ -1812,61 +1948,22 @@ impl Store {
                     .iter()
                     .any(|i| journal.artifacts[*i].role == Role::Token)
                 {
-                    let stage_artifact = journal
-                        .artifacts
-                        .iter()
-                        .find(|a| a.role == Role::StagingDirectory)
-                        .ok_or_else(|| recovery("Token recovery has no staged directory"))?;
-                    if !self.matches(stage_artifact, stage_artifact.after.as_ref())? {
-                        return Err(recovery("Token staging changed"));
-                    }
-                    let stage = self
-                        .stages
-                        .child(file_name(&stage_artifact.destination)?, true)?;
-                    // If the staged complete next registry already exists, publish it;
-                    // otherwise stage bookkeeping now without inspecting token bytes.
-                    if let Some(index) = journal
-                        .artifacts
-                        .iter()
-                        .position(|a| a.role == Role::Registry)
-                    {
-                        self.publish(index)?;
-                        self.registry = read_record(&self.directory, REGISTRY)?;
-                        self.cleanup()?;
-                    } else {
-                        let next = self.registry.clone();
-                        self.commit(next, &stage)?;
-                    }
+                    let stage = self.journal_stage(&journal, "Token recovery")?;
+                    // Bookkeeping completes without inspecting token bytes.
+                    self.finish_bookkeeping(&journal, &stage)?;
                     Err(err("ownership", "Interrupted token operation left the published new/absent manager token; bookkeeping is now complete").next("Repeat roost token NAME if another change is intended."))
                 } else {
                     self.cleanup()
                 }
             }
             Operation::Initialize => {
-                let stage_artifact = journal
-                    .artifacts
-                    .iter()
-                    .find(|a| a.role == Role::StagingDirectory)
-                    .ok_or_else(|| recovery("Initialization stage was not recorded"))?;
-                if !self.matches(stage_artifact, stage_artifact.after.as_ref())? {
-                    return Err(recovery("Initialization staging identity changed"));
-                }
-                let stage = self
-                    .stages
-                    .child(file_name(&stage_artifact.destination)?, true)?;
-                if let Some(index) = journal
-                    .artifacts
-                    .iter()
-                    .position(|a| a.role == Role::Registry)
-                {
-                    self.publish(index)?;
-                    self.registry = read_record(&self.directory, REGISTRY)?;
-                    self.cleanup()
-                } else {
-                    self.commit(self.registry.clone(), &stage)
-                }
+                let stage = self.journal_stage(&journal, "Initialization")?;
+                self.finish_bookkeeping(&journal, &stage)
             }
-            Operation::Purge | Operation::DesktopCreate | Operation::StoreCreate => unreachable!(),
+            Operation::Purge
+            | Operation::Reuse
+            | Operation::DesktopCreate
+            | Operation::StoreCreate => unreachable!(),
         }
     }
     fn rollback_refresh(&mut self) -> Result<()> {
@@ -1878,17 +1975,7 @@ impl Store {
             .find(|r| Some(&r.registration_id) == journal.registration_id.as_ref())
             .cloned()
             .ok_or_else(|| recovery("Refresh has no previous registration"))?;
-        let stage_artifact = journal
-            .artifacts
-            .iter()
-            .find(|a| a.role == Role::StagingDirectory)
-            .ok_or_else(|| recovery("Refresh has no staging identity"))?;
-        if !self.matches(stage_artifact, stage_artifact.after.as_ref())? {
-            return Err(recovery("Refresh staging identity changed"));
-        }
-        let stage = self
-            .stages
-            .child(file_name(&stage_artifact.destination)?, true)?;
+        let stage = self.journal_stage(&journal, "Refresh")?;
         self.intent.as_mut().unwrap().phase = Phase::Cleanup;
         self.save_intent()?;
         for index in 0..self.intent.as_ref().unwrap().artifacts.len() {
@@ -1962,7 +2049,7 @@ impl Store {
         link_default: bool,
         copy: Option<&Path>,
     ) -> Result<Vec<String>> {
-        self.mutation_ready()?;
+        self.journal_ready(false)?;
         validate_name(name)?;
         if link_default && copy.is_some() {
             return Err(err("usage", "Link-default and copying cannot be combined"));
@@ -2012,14 +2099,7 @@ impl Store {
             launcher_binding: Some(current_binding()?),
         };
         // Preflight every launcher before creating any journal/staged profile.
-        for (path, _) in launch::templates(&self.root, &self.root_id, &registration)? {
-            if self.bin.entry(file_name(&path)?)?.is_some() {
-                return Err(err(
-                    "collision",
-                    format!("Launcher destination exists: {}", path.display()),
-                ));
-            }
-        }
+        self.launchers_free(&registration)?;
         let stage = self.begin(Operation::Add, Some(registration.registration_id.clone()))?;
         let mut messages = vec![];
         if !link_default {
@@ -2062,8 +2142,19 @@ impl Store {
         self.commit(next, &stage)?;
         Ok(messages)
     }
+    fn launchers_free(&self, r: &Registration) -> Result<()> {
+        for (path, _) in launch::templates(&self.root, &self.root_id, r)? {
+            if self.bin.entry(file_name(&path)?)?.is_some() {
+                return Err(err(
+                    "collision",
+                    format!("Launcher destination exists: {}", path.display()),
+                ));
+            }
+        }
+        Ok(())
+    }
     pub fn register(&mut self, name: &str, path: &Path) -> Result<Vec<String>> {
-        self.mutation_ready()?;
+        self.journal_ready(false)?;
         validate_name(name)?;
         let path = platform::absolute(path)?;
         self.upstream_shape(&path)?;
@@ -2105,11 +2196,7 @@ impl Store {
             upstream_linked_default: linked,
             launcher_binding: Some(current_binding()?),
         };
-        for (path, _) in launch::templates(&self.root, &self.root_id, &registration)? {
-            if self.bin.entry(file_name(&path)?)?.is_some() {
-                return Err(err("collision", "Launcher destination already exists"));
-            }
-        }
+        self.launchers_free(&registration)?;
         let stage = self.begin(
             Operation::Register,
             Some(registration.registration_id.clone()),
@@ -2123,7 +2210,7 @@ impl Store {
         ])
     }
     pub fn reuse(&mut self, name: &str) -> Result<Vec<String>> {
-        self.mutation_ready()?;
+        self.journal_ready(false)?;
         let old = self.find(name, true)?.clone();
         self.validate(&old)?;
         for (path, _) in launch::templates(&self.root, &self.root_id, &old)? {
@@ -2275,9 +2362,7 @@ impl Store {
         Ok((scope, r))
     }
     pub fn remove(&mut self, name: &str, purge: bool) -> Result<Vec<String>> {
-        if !self.mode.journaled() {
-            return Err(err("ownership", "Read-only store cannot mutate"));
-        }
+        self.writable(false)?;
         let (_, r) = self.preflight_remove(name, purge)?;
         if !purge && r.state == State::Retained {
             return Ok(vec![
@@ -2323,14 +2408,7 @@ impl Store {
             // the marker record. Complete proof before publishing or deleting data.
             self.delete_launchers(r)?;
             let profile = self.profile_directory(r)?;
-            if !self
-                .intent
-                .as_ref()
-                .unwrap()
-                .artifacts
-                .iter()
-                .any(|a| a.role == Role::Marker)
-            {
+            if !self.has_artifact(Role::Marker) {
                 let mut before = file_state(&profile, PROFILE_MARKER, true)?
                     .ok_or_else(|| recovery("Profile marker disappeared"))?;
                 before.profile_id = r.profile_id.clone();
@@ -2344,14 +2422,7 @@ impl Store {
                     completed: false,
                 })?;
             }
-            if !self
-                .intent
-                .as_ref()
-                .unwrap()
-                .artifacts
-                .iter()
-                .any(|a| a.role == Role::Profile)
-            {
+            if !self.has_artifact(Role::Profile) {
                 let mut before = state(profile.identity()?);
                 before.profile_id = r.profile_id.clone();
                 self.record(Artifact {
@@ -2364,13 +2435,7 @@ impl Store {
                     completed: false,
                 })?;
             }
-            if !self
-                .intent
-                .as_ref()
-                .unwrap()
-                .artifacts
-                .iter()
-                .any(|a| a.role == Role::DesktopData)
+            if !self.has_artifact(Role::DesktopData)
                 && let Some(desktop) = self.desktop_deletion(r)?
             {
                 self.record(desktop)?;
@@ -2386,46 +2451,21 @@ impl Store {
             self.cleanup()?;
             return Ok(vec!["Previously completed purge bookkeeping is now clean; native authentication was not revoked.".into()]);
         }
-        let stage_artifact = journal
-            .artifacts
-            .iter()
-            .find(|a| a.role == Role::StagingDirectory)
-            .ok_or_else(|| recovery("Purge staging identity is missing"))?;
-        if !self.matches(stage_artifact, stage_artifact.after.as_ref())? {
-            return Err(recovery("Purge staging directory changed"));
-        }
-        let stage = self
-            .stages
-            .child(file_name(&stage_artifact.destination)?, true)?;
-        let mut next = self.registry.clone();
-        next.registrations
-            .retain(|x| x.registration_id != r.registration_id);
-        if !journal.artifacts.iter().any(|a| a.role == Role::Registry) {
-            next.generation = journal.next_generation;
-            let mut before = file_state(&self.directory, REGISTRY, true)?
-                .ok_or_else(|| recovery("Registry disappeared during purge"))?;
-            before.registry_generation = Some(self.registry.generation);
-            let mut after = state(self.directory.identity()?);
-            after.registry_generation = Some(next.generation);
-            self.stage_file(
-                &stage,
-                Role::Registry,
-                self.root.join(REGISTRY),
-                Some(before),
-                &encode(&next)?,
-                0o600,
-                after,
-            )?;
+        let stage = self.journal_stage(&journal, "Purge")?;
+        if !self.has_artifact(Role::Registry) {
+            let mut next = self.registry.clone();
+            next.registrations
+                .retain(|x| x.registration_id != r.registration_id);
+            self.stage_registry(&stage, &mut next)?;
         }
         self.intent.as_mut().unwrap().phase = Phase::Publishing;
         self.save_intent()?;
         let artifacts = self.intent.as_ref().unwrap().artifacts.clone();
-        for (index, a) in artifacts
+        for (index, _) in artifacts
             .iter()
             .enumerate()
             .filter(|(_, a)| a.role == Role::Launcher)
         {
-            let _ = a;
             self.publish(index)?;
         }
         let profile_artifact = artifacts
@@ -2439,9 +2479,7 @@ impl Store {
                     return Err(Error::cancelled());
                 }
                 profile.purge_children(PROFILE_MARKER).map_err(|e| {
-                    let mut error = Error::new(e.code, format!("Partial deletion at {}; owned marker and journal remain; {}", profile.path.display(), e.message)).next("Stop writers, inspect roost doctor, then explicitly repeat remove NAME --purge.");
-                    error.exit_code = e.exit_code;
-                    error
+                    partial_deletion(e, &profile.path, "owned marker", "Stop writers, inspect roost doctor, then explicitly repeat remove NAME --purge.")
                 })?;
                 self.check_root()?;
                 if !self.matches(profile_artifact, profile_artifact.before.as_ref())? {
@@ -2486,7 +2524,7 @@ impl Store {
         ])
     }
     pub fn set_token(&mut self, name: &str, value: Option<&str>) -> Result<Vec<String>> {
-        self.mutation_ready()?;
+        self.journal_ready(false)?;
         let r = self.find(name, false)?.clone();
         self.validate(&r)?;
         if r.kind != Kind::Owned {
@@ -2604,24 +2642,7 @@ mod tests {
         (stage, r)
     }
     fn stage_registry(store: &mut Store, stage: &Directory, mut next: Registry) {
-        next.generation = store.intent.as_ref().unwrap().next_generation;
-        let mut before = file_state(&store.directory, REGISTRY, true)
-            .unwrap()
-            .unwrap();
-        before.registry_generation = Some(store.registry.generation);
-        let mut after = state(store.directory.identity().unwrap());
-        after.registry_generation = Some(next.generation);
-        store
-            .stage_file(
-                stage,
-                Role::Registry,
-                store.root.join(REGISTRY),
-                Some(before),
-                &encode(&next).unwrap(),
-                0o600,
-                after,
-            )
-            .unwrap();
+        store.stage_registry(stage, &mut next).unwrap();
         store.intent.as_mut().unwrap().phase = Phase::Publishing;
         store.save_intent().unwrap();
     }
