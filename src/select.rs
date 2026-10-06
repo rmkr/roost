@@ -138,7 +138,7 @@ pub(crate) fn stamp(list: &mut Vec<Timestamp>, id: &str, at: u64) {
     }
 }
 
-fn open_launch(root: &Path) -> Result<Store> {
+pub(crate) fn open_launch(root: &Path) -> Result<Store> {
     Store::open(root, false, OpenMode::Launch).map_err(|e| {
         if e.code == "not_found" && e.next_step.is_none() {
             e.next("Create a profile with roost add NAME")
@@ -257,7 +257,7 @@ fn warn_unrecorded(registration: &Registration, recorded: Result<()>) {
     }
 }
 
-fn terminal() -> bool {
+pub(crate) fn terminal() -> bool {
     use std::io::IsTerminal;
     std::io::stdin().is_terminal() && std::io::stderr().is_terminal()
 }
@@ -267,6 +267,39 @@ fn terminal() -> bool {
 /// reacquires, revalidates the choice and records the selection, returning the
 /// recording result for the caller to warn about or fail on.
 fn pick(store: Store, root: &Path, key: &Path) -> Result<(Store, Registration, Result<()>)> {
+    let no_terminal = || {
+        Error::new(
+            "usage",
+            "No profile is selected for this project and no terminal is available to choose one",
+        )
+        .next("roost switch NAME selects one for this project; roost run NAME launches once")
+    };
+    let title = "Choose a profile for this project";
+    let (store, chosen) = choose(store, root, title, no_terminal, |store, records| {
+        let _ = annotate(store, records, Some(key));
+        let lines = table::profiles(records, false, table::stderr_color(), None);
+        let initial = records
+            .iter()
+            .position(|r| r["selected"] == true)
+            .or_else(|| records.iter().position(|r| r["most_recent"] == true))
+            .unwrap_or(0);
+        (lines, initial)
+    })?;
+    let recorded = record_selection(&store, key, &chosen);
+    Ok((store, chosen, recorded))
+}
+
+/// The shared picker flow: with an active registration and a terminal (else
+/// `no_terminal`), lists active profiles as `ls` records (with sets), lets `render`
+/// annotate them and return the table lines and initial row, shows the picker with
+/// the lock released, then reacquires and revalidates the root and the choice.
+pub(crate) fn choose(
+    store: Store,
+    root: &Path,
+    title: &str,
+    no_terminal: impl FnOnce() -> Error,
+    render: impl FnOnce(&Store, &mut [Value]) -> (Vec<String>, usize),
+) -> Result<(Store, Registration)> {
     let active = store
         .registry
         .registrations
@@ -277,14 +310,9 @@ fn pick(store: Store, root: &Path, key: &Path) -> Result<(Store, Registration, R
             .next("Create a profile with roost add NAME"));
     }
     if !terminal() {
-        return Err(Error::new(
-            "usage",
-            "No profile is selected for this project and no terminal is available to choose one",
-        )
-        .next("roost switch NAME selects one for this project; roost run NAME launches once"));
+        return Err(no_terminal());
     }
     let mut records = store.profiles(false)?;
-    let _ = annotate(&store, &mut records, Some(key));
     let _ = sets::annotate(&store, &mut records);
     let choices: Vec<Registration> = records
         .iter()
@@ -298,15 +326,10 @@ fn pick(store: Store, root: &Path, key: &Path) -> Result<(Store, Registration, R
                 .ok_or_else(|| Error::new("ownership", "Profile list changed while reading"))
         })
         .collect::<Result<_>>()?;
-    let lines = table::profiles(&records, false, table::stderr_color(), None);
-    let initial = records
-        .iter()
-        .position(|r| r["selected"] == true)
-        .or_else(|| records.iter().position(|r| r["most_recent"] == true))
-        .unwrap_or(0);
+    let (lines, initial) = render(&store, &mut records);
     let root_id = store.root_id.clone();
     drop(store);
-    let index = platform::pick(&lines[0], &lines[1..=records.len()], initial)?;
+    let index = platform::pick(title, &lines[0], &lines[1..=records.len()], initial)?;
     let chosen = &choices[index];
     let store = open_launch(root)?;
     let current = store
@@ -317,11 +340,10 @@ fn pick(store: Store, root: &Path, key: &Path) -> Result<(Store, Registration, R
     if store.root_id != root_id || current != Some(chosen) {
         return Err(
             Error::new("ownership", "Profile changed while the picker was open")
-                .next("Run roost again to choose from the current profiles"),
+                .next("Repeat the command to choose from the current profiles"),
         );
     }
-    let recorded = record_selection(&store, key, chosen);
-    Ok((store, chosen.clone(), recorded))
+    Ok((store, chosen.clone()))
 }
 
 /// `roost switch`: select NAME (or, without NAME, the picker's choice) for this

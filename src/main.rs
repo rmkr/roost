@@ -235,7 +235,7 @@ fn dispatch(action: Action, data: &mut Value) -> Result<Outcome> {
         )?)),
         Action::Doctor { .. } => doctor(data),
         Action::Desktop { name, foreground } => Ok(Outcome {
-            exit: desktop::run(&name, foreground)?,
+            exit: desktop::run(name.as_deref(), foreground)?,
             ..Outcome::quiet()
         }),
         Action::List { retained, full, .. } => {

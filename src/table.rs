@@ -219,6 +219,23 @@ pub fn stderr_color() -> bool {
 
 /// The human `list` table over ProfileRecord values. Later columns append here.
 pub fn profiles(records: &[Value], full: bool, color: bool, width: Option<usize>) -> Vec<String> {
+    profile_table(records, full, false, color, width)
+}
+
+/// The `roost desktop` picker rows: the list table plus a Desktop column from each
+/// record's `desktop` value (`running`, `signed_in`, `plain` for a default alias,
+/// otherwise never launched).
+pub fn desktop_profiles(records: &[Value], color: bool) -> Vec<String> {
+    profile_table(records, false, true, color, None)
+}
+
+fn profile_table(
+    records: &[Value],
+    full: bool,
+    desktop: bool,
+    color: bool,
+    width: Option<usize>,
+) -> Vec<String> {
     let upstream = records.iter().filter(|r| r["kind"] == "upstream").count();
     let now = crate::platform::unix_seconds();
     let mut table = Table::new()
@@ -271,6 +288,14 @@ pub fn profiles(records: &[Value], full: bool, color: bool, width: Option<usize>
                 None => Cell::new("never", Style::Dim),
             }
         });
+    if desktop {
+        table = table.column("Desktop", |r: &Value| match r["desktop"].as_str() {
+            Some("running") => Cell::new("running", Style::Green),
+            Some("signed_in") => Cell::plain("signed in"),
+            Some("plain") => Cell::new("plain", Style::Dim),
+            _ => Cell::new("—", Style::Dim),
+        });
+    }
     if full {
         table = table
             .column("Login", |r: &Value| {

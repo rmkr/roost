@@ -2019,3 +2019,143 @@ fn picker_rows_use_list_styles_on_a_terminal_unless_no_color() {
     );
     assert!(text.contains("\x1b[7m> "), "{text:?}");
 }
+
+/// Runs `roost desktop ARGS` under a PTY from the fixture directory with NO_COLOR,
+/// sending `keys` once the picker shows. Detached, the fake Desktop lingers so it
+/// passes the startup watch. Returns `{exit, picker, text}`.
+fn desktop_picker(f: &Fixture, args: &[&str], keys: &[&str]) -> Value {
+    let record = f.path.join("desktop.jsonl");
+    let mut command = vec!["desktop"];
+    command.extend_from_slice(args);
+    let results = pty_session(
+        f,
+        &[
+            ("FAKE_DESKTOP_RECORD", record.to_str().unwrap()),
+            // Detached launches must outlive the startup watch.
+            (
+                "FAKE_DESKTOP_MODE",
+                if args.contains(&"--foreground") {
+                    ""
+                } else {
+                    "long"
+                },
+            ),
+            ("NO_COLOR", "1"),
+        ],
+        &[(&f.path, &command, keys)],
+    );
+    results[0].clone()
+}
+
+/// The picker row naming `name` (the last one drawn).
+fn picker_row(text: &str, name: &str) -> String {
+    text.split(['\r', '\n'])
+        .rfind(|line| line.contains(&format!(" {name} ")))
+        .unwrap_or_else(|| panic!("no row for {name}: {text:?}"))
+        .to_owned()
+}
+
+#[test]
+fn desktop_without_name_highlights_the_last_desktop_launch_and_launches_detached() {
+    let f = Fixture::new();
+    f.add("Work");
+    f.add("Home");
+    f.add("Other");
+    f.ok(&["desktop", "--foreground", "Work"]);
+    // A later terminal launch does not move the Desktop highlight.
+    launched(&f.run(&["run", "Home"]));
+    let result = desktop_picker(&f, &[], &["\r"]);
+    let text = result["text"].as_str().unwrap();
+    assert_eq!(result["exit"], 0, "{text}");
+    assert_eq!(result["picker"], true);
+    assert!(text.contains("Started Claude Desktop for Work"), "{text}");
+    // Desktop column: a folder means signed in, none means never launched.
+    assert!(picker_row(text, "Work").contains("signed in"), "{text}");
+    assert!(picker_row(text, "Home").trim_end().ends_with('—'), "{text}");
+    let launch = &f.desktop_launches()[1];
+    assert_eq!(
+        launch["arguments"],
+        json!([format!(
+            "--user-data-dir={}",
+            f.desktop_folder("Work").display()
+        )])
+    );
+    assert_eq!(launch["session_leader"], true);
+    assert_eq!(launch["stdin"], "/dev/null");
+    // Keys move the highlight; the choice is never a project selection.
+    let result = desktop_picker(&f, &[], &["k", "\r"]);
+    assert_eq!(result["exit"], 0, "{}", result["text"]);
+    assert_eq!(
+        f.desktop_launches()[2]["arguments"],
+        json!([format!(
+            "--user-data-dir={}",
+            f.desktop_folder("Other").display()
+        )])
+    );
+    let state: Value =
+        serde_json::from_slice(&fs::read(f.root.join("state.json")).unwrap()).unwrap();
+    assert_eq!(state["selections"], json!([]), "{state}");
+}
+
+#[test]
+fn desktop_picker_falls_back_to_last_used_and_foreground_stays_attached() {
+    let f = Fixture::new();
+    f.add("Work");
+    f.add("Home");
+    f.ok(&["add", "personal", "--link-default"]);
+    launched(&f.run(&["run", "Work"]));
+    let result = desktop_picker(&f, &["--foreground"], &["\r"]);
+    let text = result["text"].as_str().unwrap();
+    assert_eq!(result["exit"], 0, "{text}");
+    assert!(text.contains("chromium console noise"), "{text}");
+    assert!(picker_row(text, "personal").contains("plain"), "{text}");
+    assert_eq!(
+        f.desktop_launches()[0]["arguments"],
+        json!([format!(
+            "--user-data-dir={}",
+            f.desktop_folder("Work").display()
+        )])
+    );
+}
+
+#[test]
+fn desktop_picker_marks_and_refuses_a_running_profile_and_cancels_with_130() {
+    let f = Fixture::new();
+    f.add("Work");
+    f.add("Home");
+    f.ok(&["desktop", "--foreground", "Work"]);
+    let live = format!("{}-{}", hostname(), std::process::id());
+    std::os::unix::fs::symlink(&live, f.desktop_folder("Work").join("SingletonLock")).unwrap();
+    let result = desktop_picker(&f, &[], &["\r"]);
+    let text = result["text"].as_str().unwrap();
+    assert_eq!(result["exit"], 1, "{text}");
+    assert!(picker_row(text, "Work").contains("running"), "{text}");
+    assert!(
+        text.contains("desktop_running: this profile's Desktop is already running"),
+        "{text}"
+    );
+    assert_eq!(f.desktop_launches().len(), 1);
+    let state = fs::read(f.root.join("state.json")).unwrap();
+    for keys in [&["\x1b"][..], &["j", "\x03"], &["q"]] {
+        let result = desktop_picker(&f, &[], keys);
+        assert_eq!(result["exit"], 130, "{}", result["text"]);
+        assert_eq!(result["picker"], true);
+    }
+    assert_eq!(f.desktop_launches().len(), 1);
+    assert_eq!(fs::read(f.root.join("state.json")).unwrap(), state);
+}
+
+#[test]
+fn desktop_without_name_and_terminal_is_usage_naming_desktop_name() {
+    let f = Fixture::new();
+    f.add("Work");
+    for args in [vec!["desktop"], vec!["desktop", "--foreground"]] {
+        let out = f.run(&args);
+        assert_eq!(out.status.code(), Some(2), "{args:?}");
+        let stderr = String::from_utf8_lossy(&out.stderr);
+        assert!(stderr.contains("roost desktop NAME"), "{args:?}: {stderr}");
+    }
+    assert!(f.desktop_launches().is_empty());
+    assert!(!f.root.join("state.json").exists());
+    assert!(!f.root.join("desktop").exists());
+}

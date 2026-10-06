@@ -111,12 +111,13 @@ pub enum Action {
     /// Show help for Roost or one manager command
     Help { command: Option<String> },
     /// Experimental, Linux only: start Claude Desktop with this profile's own Desktop
-    /// data folder (sign-in) and configuration; detached unless --foreground
+    /// data folder (sign-in) and configuration; detached unless --foreground.
+    /// Without NAME, choose the profile from a picker
     Desktop {
         /// Stay attached with Desktop's console output, for debugging
         #[arg(long)]
         foreground: bool,
-        name: String,
+        name: Option<String>,
     },
     /// Manage the shared plugin store and its plugins
     #[command(disable_help_subcommand = true)]
@@ -301,7 +302,9 @@ impl Action {
             | Self::Status { name, .. }
             | Self::Token { name, .. }
             | Self::Remove { name, .. }
-            | Self::Desktop { name, .. }
+            | Self::Desktop {
+                name: Some(name), ..
+            }
             | Self::Set {
                 action: SetAction::Subscribe { name, .. } | SetAction::Unsubscribe { name, .. },
             }
@@ -395,6 +398,10 @@ fn parse_from(args: Vec<OsString>) -> std::result::Result<Action, clap::Error> {
     }
     if args.get(1).is_some_and(|v| v == "switch") {
         return parse_switch(&args);
+    }
+    // Desktop forwards nothing, so even a lone `--` is refused.
+    if args.get(1).is_some_and(|v| v == "desktop") && args[2..].iter().any(|v| v == "--") {
+        return Err(usage("roost desktop takes no argument tail"));
     }
     let cli = Cli::try_parse_from(args)?;
     if cli.version {
@@ -553,12 +560,12 @@ mod tests {
         assert_eq!(arguments, vec!["--", "--help", "--allow-auth-env", ""]);
     }
     #[test]
-    fn desktop_takes_one_name_and_no_forwarded_tail() {
+    fn desktop_takes_an_optional_name_and_no_forwarded_tail() {
         let Action::Desktop { foreground, name } = parse(&["roost", "desktop", "Work"]) else {
             panic!()
         };
         assert!(!foreground);
-        assert_eq!(name, "Work");
+        assert_eq!(name.as_deref(), Some("Work"));
         assert!(matches!(
             parse(&["roost", "desktop", "Work", "--foreground"]),
             Action::Desktop {
@@ -566,8 +573,23 @@ mod tests {
                 ..
             }
         ));
+        // Without NAME the picker chooses.
+        assert!(matches!(
+            parse(&["roost", "desktop"]),
+            Action::Desktop {
+                foreground: false,
+                name: None
+            }
+        ));
+        assert!(matches!(
+            parse(&["roost", "desktop", "--foreground"]),
+            Action::Desktop {
+                foreground: true,
+                name: None
+            }
+        ));
         for values in [
-            vec!["roost", "desktop"],
+            vec!["roost", "desktop", "--"],
             vec!["roost", "desktop", "Work", "--", "--flag"],
             vec!["roost", "desktop", "Work", "extra"],
         ] {

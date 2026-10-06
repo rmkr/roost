@@ -16,8 +16,9 @@ use std::{
 
 const COWORK: &str = "Another Claude Desktop is already running; Cowork is untested with a second concurrent Desktop";
 
-/// Prepares and starts Claude Desktop for `name`; returns the manager exit code.
-pub fn run(name: &str, foreground: bool) -> Result<i32> {
+/// Prepares and starts Claude Desktop for `name`, or without it for the picker's
+/// choice; returns the manager exit code.
+pub fn run(name: Option<&str>, foreground: bool) -> Result<i32> {
     if !cfg!(target_os = "linux") {
         return Err(Error::new(
             "claude_unavailable",
@@ -25,8 +26,80 @@ pub fn run(name: &str, foreground: bool) -> Result<i32> {
         )
         .next("Start Claude Desktop directly on this platform"));
     }
-    let mut store = Store::open(&platform::root()?, false, OpenMode::Launch)?;
-    let registration = store.find(name, false)?.clone();
+    let no_terminal = || {
+        Error::new(
+            "usage",
+            "roost desktop without NAME needs a terminal to choose a profile",
+        )
+        .next("roost desktop NAME starts Claude Desktop for one profile")
+    };
+    if name.is_none() && !crate::select::terminal() {
+        return Err(no_terminal());
+    }
+    let root = platform::root()?;
+    let (store, registration) = match name {
+        Some(name) => {
+            let store = Store::open(&root, false, OpenMode::Launch)?;
+            let registration = store.find(name, false)?.clone();
+            (store, registration)
+        }
+        None => {
+            let store = crate::select::open_launch(&root)?;
+            crate::select::choose(
+                store,
+                &root,
+                "Choose a profile for Claude Desktop",
+                no_terminal,
+                picker_rows,
+            )?
+        }
+    };
+    start(store, registration, foreground)
+}
+
+/// Annotates the picker records with their Desktop state and renders them; the
+/// initial row is the most recent Desktop launch, else the most recent launch.
+fn picker_rows(store: &Store, records: &mut [Value]) -> (Vec<String>, usize) {
+    let _ = crate::select::annotate(store, records, None);
+    let host = linux::hostname();
+    let locks = store.desktop_locks().unwrap_or_default();
+    let launched = store
+        .read_state()
+        .map(|state| state.desktop_launched)
+        .unwrap_or_default();
+    let latest = launched.iter().max_by_key(|t| t.at);
+    let mut initial = None;
+    for (index, record) in records.iter_mut().enumerate() {
+        let Some(registration) = store
+            .registry
+            .registrations
+            .iter()
+            .find(|r| record["name"] == r.name.as_str())
+        else {
+            continue;
+        };
+        let id = registration.registration_id.as_str();
+        if latest.is_some_and(|t| t.registration_id == id) {
+            initial = Some(index);
+        }
+        let folder = locks.iter().find(|(lock_id, _)| lock_id == id);
+        record["desktop"] = json!(match folder {
+            _ if registration.kind == Kind::DefaultAlias => "plain",
+            Some((_, Some(target))) if linux::live_lock(target, host.as_deref()) => "running",
+            Some(_) => "signed_in",
+            None => "never",
+        });
+    }
+    let initial = initial
+        .or_else(|| records.iter().position(|r| r["most_recent"] == true))
+        .unwrap_or(0);
+    (
+        crate::table::desktop_profiles(records, crate::table::stderr_color()),
+        initial,
+    )
+}
+
+fn start(mut store: Store, registration: Registration, foreground: bool) -> Result<i32> {
     let mut env = launch::profile_env(&store, &registration, false)?;
     let program = launch::resolve_program("claude-desktop")?;
     let host = linux::hostname();
