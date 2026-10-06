@@ -90,3 +90,7 @@ See [ADR 0002](../../docs/adr/0002-desktop-per-profile-via-user-data-dir.md).
 ## Migration
 
 The `personal` profile currently has 60 hand-made, unrecorded links in `skills/` pointing at `~/.claude/skills/*`. Roost treats them as foreign. Once skill sets ship, remove them by hand and subscribe `personal` to a set covering `~/.claude/skills`.
+
+## Desktop: borrowing the existing data folder
+
+Added 2026-10-06. A profile can borrow the conventional Claude Desktop data folder in place (`roost desktop --link NAME`, undone with `--unlink`), so `roost desktop NAME` opens the already signed-in Desktop with that profile's configuration. Roost never copies, moves, repairs or deletes the borrowed folder; only one profile may borrow it, and the default alias then shares it. See [Let a profile borrow the existing Claude Desktop data folder](issues/16-desktop-link-existing.md).
