@@ -10,7 +10,7 @@
 
 use super::{
     Artifact, Directory, LIMIT, Operation, Result, Role, Store, encode, err, recovery,
-    side::PLUGIN_STORE,
+    side::{PLUGIN_STORE, Reserved},
 };
 use crate::platform::{Entry, FileIdentity};
 use serde::{Deserialize, Serialize};
@@ -43,7 +43,7 @@ impl Store {
     /// Opens the plugin store without following links; `None` when it was never
     /// created. A store without this root's valid marker is never used.
     pub fn plugin_store(&self) -> Result<Option<Directory>> {
-        let Some(store) = self.reserved_dir(PLUGIN_STORE, false)? else {
+        let Some(store) = self.reserved_dir(Reserved::PluginStore, false)? else {
             return Ok(None);
         };
         if !self.store_marker_valid(&store)? {
@@ -161,7 +161,7 @@ mod tests {
         let read = f.open(OpenMode::Read).unwrap();
         assert!(read.plugin_store().unwrap().is_some());
         assert_eq!(
-            read.reserved_dir(PLUGIN_STORE, false)
+            read.reserved_dir(Reserved::PluginStore, false)
                 .unwrap()
                 .unwrap()
                 .identity()

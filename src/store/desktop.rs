@@ -8,7 +8,9 @@
 
 use super::{
     Action, Artifact, Directory, Error, Kind, LIMIT, Operation, Registration, Result, Role, Store,
-    encode, err, file_name, partial_deletion, recovery, side::DESKTOP, state,
+    encode, err, file_name, partial_deletion, recovery,
+    side::{DESKTOP, Reserved},
+    state,
 };
 use crate::platform::{self, Entry, FileIdentity};
 use serde::{Deserialize, Serialize};
@@ -51,7 +53,7 @@ impl Store {
     /// Opens `desktop/<id>` without following links. Absent is `None`; a folder with
     /// data but no valid marker is never claimed.
     fn desktop_folder_at(&self, id: &str) -> Result<Option<Folder>> {
-        let Some(parent) = self.reserved_dir(DESKTOP, false)? else {
+        let Some(parent) = self.reserved_dir(Reserved::Desktop, false)? else {
             return Ok(None);
         };
         let Some(entry) = parent.entry(id)? else {
@@ -134,7 +136,7 @@ impl Store {
             .next("Remove that empty folder, then retry"));
         }
         let parent = self
-            .reserved_dir(DESKTOP, true)?
+            .reserved_dir(Reserved::Desktop, true)?
             .ok_or_else(|| err("io", "Desktop parent directory is unavailable"))?;
         let marker = |root_id: String, identity| DesktopMarker {
             schema_version: 1,
@@ -156,7 +158,7 @@ impl Store {
     /// Registration IDs of every Desktop folder with its `SingletonLock` link text,
     /// read without following anything. Unreadable entries are skipped.
     pub fn desktop_locks(&self) -> Result<Vec<(String, Option<PathBuf>)>> {
-        let Some(parent) = self.reserved_dir(DESKTOP, false)? else {
+        let Some(parent) = self.reserved_dir(Reserved::Desktop, false)? else {
             return Ok(vec![]);
         };
         let mut locks = vec![];
@@ -335,7 +337,10 @@ mod tests {
         fn interrupted(&self, contents: impl FnOnce(&Store, &Directory)) -> PathBuf {
             let r = self.work();
             let mut store = self.open(OpenMode::Launch).unwrap();
-            let parent = store.reserved_dir(DESKTOP, true).unwrap().unwrap();
+            let parent = store
+                .reserved_dir(Reserved::Desktop, true)
+                .unwrap()
+                .unwrap();
             let _stage = store
                 .begin(Operation::DesktopCreate, Some(r.registration_id.clone()))
                 .unwrap();

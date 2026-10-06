@@ -211,8 +211,9 @@ fn absolute(name: &str, path: &Path) -> Result<()> {
     }
 }
 
-impl StateFile {
-    pub fn empty(root_id: &str) -> Self {
+impl SideFile for StateFile {
+    const NAME: &'static str = STATE;
+    fn empty_for(root_id: &str) -> Self {
         Self {
             schema_version: 1,
             root_id: root_id.to_owned(),
@@ -224,12 +225,6 @@ impl StateFile {
             desktop_links: vec![],
             settings: vec![],
         }
-    }
-}
-impl SideFile for StateFile {
-    const NAME: &'static str = STATE;
-    fn empty_for(root_id: &str) -> Self {
-        Self::empty(root_id)
     }
     fn header(&self) -> (u32, &str) {
         (self.schema_version, &self.root_id)
@@ -301,8 +296,9 @@ impl SideFile for StateFile {
         self.settings.retain(|s| keep(&s.registration_id));
     }
 }
-impl SetsFile {
-    pub fn empty(root_id: &str) -> Self {
+impl SideFile for SetsFile {
+    const NAME: &'static str = SETS;
+    fn empty_for(root_id: &str) -> Self {
         Self {
             schema_version: 1,
             root_id: root_id.to_owned(),
@@ -310,12 +306,6 @@ impl SetsFile {
             subscriptions: vec![],
             plugin_auto_update: false,
         }
-    }
-}
-impl SideFile for SetsFile {
-    const NAME: &'static str = SETS;
-    fn empty_for(root_id: &str) -> Self {
-        Self::empty(root_id)
     }
     fn header(&self) -> (u32, &str) {
         (self.schema_version, &self.root_id)
@@ -374,15 +364,16 @@ impl Store {
         self.update_side(change)
     }
 
-    /// Opens the reserved root directory `name` (`PLUGIN_STORE` or `DESKTOP`) through
+    /// Opens the reserved root directory `name` through
     /// the verified root handle without following links; `None` when absent. With
     /// `create`, an absent directory is created private (0700), which Read mode and a
     /// pending operation refuse. The plugin store's own creation is journaled
     /// (`store_create`), so its owner should create it through the journal instead.
-    pub fn reserved_dir(&self, name: &str, create: bool) -> Result<Option<Directory>> {
-        if ![PLUGIN_STORE, DESKTOP].contains(&name) {
-            return Err(err("usage", format!("{name} is not a reserved directory")));
-        }
+    pub fn reserved_dir(&self, name: Reserved, create: bool) -> Result<Option<Directory>> {
+        let name = match name {
+            Reserved::PluginStore => PLUGIN_STORE,
+            Reserved::Desktop => DESKTOP,
+        };
         if self.directory.entry(name)?.is_some() {
             return self.directory.child(name, true).map(Some);
         }
@@ -501,6 +492,12 @@ pub const SETS: &str = "sets.json";
 pub const PLUGIN_STORE: &str = "plugin-store";
 /// Lazily created parent of per-registration Desktop folders (ticket 09).
 pub const DESKTOP: &str = "desktop";
+/// A lazily created reserved root directory.
+#[derive(Clone, Copy)]
+pub enum Reserved {
+    PluginStore,
+    Desktop,
+}
 const TEMP_PREFIX: &str = ".roost-state-";
 const TEMP_SUFFIX: &str = ".tmp";
 
@@ -622,10 +619,10 @@ mod tests {
         let f = Fixture::new();
         let store = f.open(OpenMode::Read).unwrap();
         let state = store.read_state().unwrap();
-        assert_eq!(state, StateFile::empty(&store.root_id));
+        assert_eq!(state, StateFile::empty_for(&store.root_id));
         assert!(state.selections.is_empty() && state.plugin_auto_update_at.is_none());
         let sets = store.read_sets().unwrap();
-        assert_eq!(sets, SetsFile::empty(&store.root_id));
+        assert_eq!(sets, SetsFile::empty_for(&store.root_id));
         assert!(!sets.plugin_auto_update);
         assert!(!f.root.join(STATE).exists() && !f.root.join(SETS).exists());
     }
@@ -779,7 +776,7 @@ mod tests {
         store.add("Work", false, None).unwrap();
         let id = store.find("Work", false).unwrap().registration_id.clone();
         let gone = platform::random_id().unwrap();
-        let mut state = StateFile::empty(&store.root_id);
+        let mut state = StateFile::empty_for(&store.root_id);
         for registration_id in [&id, &gone] {
             state.last_used.push(Timestamp {
                 registration_id: registration_id.clone(),
@@ -965,22 +962,36 @@ mod tests {
     fn reserved_directories_are_opened_or_created_lazily_and_privately() {
         let f = Fixture::new();
         let read = f.open(OpenMode::Read).unwrap();
-        assert!(read.reserved_dir(DESKTOP, false).unwrap().is_none());
+        assert!(
+            read.reserved_dir(Reserved::Desktop, false)
+                .unwrap()
+                .is_none()
+        );
         assert_eq!(
-            read.reserved_dir(DESKTOP, true).err().unwrap().code,
+            read.reserved_dir(Reserved::Desktop, true)
+                .err()
+                .unwrap()
+                .code,
             "ownership"
         );
         assert!(!f.root.join(DESKTOP).exists());
-        assert_eq!(
-            read.reserved_dir("profiles", false).err().unwrap().code,
-            "usage"
-        );
         drop(read);
         let store = f.open(OpenMode::Launch).unwrap();
-        let created = store.reserved_dir(DESKTOP, true).unwrap().unwrap();
+        let created = store
+            .reserved_dir(Reserved::Desktop, true)
+            .unwrap()
+            .unwrap();
         assert_eq!(mode_of(&f.root.join(DESKTOP)), 0o700);
-        let again = store.reserved_dir(DESKTOP, false).unwrap().unwrap();
+        let again = store
+            .reserved_dir(Reserved::Desktop, false)
+            .unwrap()
+            .unwrap();
         assert_eq!(created.identity().unwrap(), again.identity().unwrap());
-        assert!(store.reserved_dir(PLUGIN_STORE, false).unwrap().is_none());
+        assert!(
+            store
+                .reserved_dir(Reserved::PluginStore, false)
+                .unwrap()
+                .is_none()
+        );
     }
 }
