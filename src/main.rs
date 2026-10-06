@@ -252,7 +252,12 @@ fn dispatch(action: Action, data: &mut Value) -> Result<Outcome> {
             };
             drop(store);
             warnings.extend(run_probes(&mut profiles, jobs));
-            let lines = table::profiles(&profiles, full, table::stdout_color());
+            let lines = table::profiles(
+                &profiles,
+                full,
+                table::stdout_color(),
+                platform::stdout_width(),
+            );
             *data = json!({"project":null,"profiles":profiles});
             Ok(Outcome {
                 warnings,

@@ -9,7 +9,6 @@ use std::ffi::OsStr;
 
 /// Terminal styling for one cell. Ignored unless color is enabled.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-#[allow(dead_code, reason = "style palette shared by later list columns")]
 pub enum Style {
     Plain,
     Bold,
@@ -62,6 +61,7 @@ pub struct Table<'a, R> {
     columns: Vec<Column<'a, R>>,
     summary: Option<String>,
     hidden: Vec<String>,
+    width: Option<usize>,
 }
 impl<'a, R> Default for Table<'a, R> {
     fn default() -> Self {
@@ -70,6 +70,7 @@ impl<'a, R> Default for Table<'a, R> {
             columns: Vec::new(),
             summary: None,
             hidden: Vec::new(),
+            width: None,
         }
     }
 }
@@ -99,6 +100,12 @@ impl<'a, R> Table<'a, R> {
     /// Names a column left out of this view; the summary lists hidden columns.
     pub fn hidden(mut self, header: &str) -> Self {
         self.hidden.push(header.to_owned());
+        self
+    }
+    /// Limits rendered lines to `width` display columns (None: unlimited) by
+    /// hiding columns from the right; the first column is always shown.
+    pub fn width(mut self, width: Option<usize>) -> Self {
+        self.width = width;
         self
     }
     /// Renders header, rows and optional summary as lines without trailing padding.
@@ -137,6 +144,20 @@ impl<'a, R> Table<'a, R> {
                 2
             }
         };
+        let mut hidden = self.hidden.clone();
+        if let Some(limit) = self.width {
+            let line_width =
+                |k: usize| widths[..k].iter().sum::<usize>() + (0..k - 1).map(gap).sum::<usize>();
+            let first = usize::from(self.marker.is_some()) + 1;
+            let mut keep = count;
+            while keep > first && line_width(keep) > limit {
+                keep -= 1;
+            }
+            hidden.extend(grid[0][keep..].iter().map(|c| c.text.clone()));
+            for line in &mut grid {
+                line.truncate(keep);
+            }
+        }
         let mut lines: Vec<String> = grid
             .iter()
             .map(|line| {
@@ -154,9 +175,9 @@ impl<'a, R> Table<'a, R> {
             .collect();
         if let Some(summary) = &self.summary {
             let mut summary = summary.clone();
-            if !self.hidden.is_empty() {
+            if !hidden.is_empty() {
                 summary.push_str(" · hidden: ");
-                summary.push_str(&self.hidden.join(", "));
+                summary.push_str(&hidden.join(", "));
             }
             lines.push(String::new());
             lines.push(summary);
@@ -189,7 +210,7 @@ pub fn stdout_color() -> bool {
 }
 
 /// The human `list` table over ProfileRecord values. Later columns append here.
-pub fn profiles(records: &[Value], full: bool, color: bool) -> Vec<String> {
+pub fn profiles(records: &[Value], full: bool, color: bool, width: Option<usize>) -> Vec<String> {
     let upstream = records.iter().filter(|r| r["kind"] == "upstream").count();
     let mut table = Table::new()
         .column("Profile", |r: &Value| {
@@ -235,6 +256,7 @@ pub fn profiles(records: &[Value], full: bool, color: bool) -> Vec<String> {
             records.len(),
             if records.len() == 1 { "" } else { "s" }
         ))
+        .width(width)
         .render(records, color)
 }
 
@@ -365,6 +387,29 @@ mod tests {
                 "○ 2 profiles · @ selected here",
             ]
         );
+    }
+
+    #[test]
+    fn a_width_limit_hides_trailing_columns_and_names_them_in_the_summary() {
+        let lines = table()
+            .hidden("Path")
+            .summary("○ 2 profiles")
+            .width(Some(17))
+            .render(&rows(), false);
+        assert_eq!(
+            lines,
+            [
+                "  Profile   Token",
+                "@ personal  ✓",
+                "  w         –",
+                "",
+                "○ 2 profiles · hidden: Path, Kind",
+            ]
+        );
+        let lines = table().width(Some(24)).render(&rows(), false);
+        assert_eq!(lines[0], "  Profile   Token  Kind");
+        let lines = table().width(Some(1)).render(&rows(), false);
+        assert_eq!(lines[0], "  Profile");
     }
 
     #[test]
