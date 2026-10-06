@@ -1740,7 +1740,7 @@ fn state_write_failure_warns_and_still_launches() {
         .unwrap();
     assert_eq!(out.status.code(), Some(1));
     assert_eq!(fs::read(&path).unwrap(), b"not json");
-    // A pending launch never records on a refused profile.
+    // An unknown profile is refused before any state is touched.
     assert_eq!(
         f.command()
             .current_dir(&app)
@@ -1750,5 +1750,124 @@ fn state_write_failure_warns_and_still_launches() {
             .status
             .code(),
         Some(1)
+    );
+}
+
+/// Runs bare `roost` in each project under a PTY, sending keys once the picker
+/// shows. Returns `[{exit, picker, launched}]`, `launched` being the fake Claude's
+/// CLAUDE_CONFIG_DIR or null.
+fn pick_in_pty(f: &Fixture, cases: &[(&Path, &[&str])]) -> Value {
+    let script = r#"
+import errno,json,os,pty,select,sys,time
+exe,root,binpath,home,cases=sys.argv[1:]
+results=[]
+for cwd,keys in json.loads(cases):
+    pid,fd=pty.fork()
+    if pid==0:
+        os.chdir(cwd)
+        os.execve(exe,[exe],{'ROOST_DIR':root,'HOME':home,'PATH':binpath+':/usr/bin:/bin'})
+    data=b'';sent=False;deadline=time.monotonic()+10
+    while time.monotonic()<deadline:
+        if not select.select([fd],[],[],0.1)[0]:continue
+        try:chunk=os.read(fd,65536)
+        except OSError as e:
+            if e.errno==errno.EIO:break
+            raise
+        if not chunk:break
+        data+=chunk
+        if not sent and b'Choose a profile' in data:
+            time.sleep(0.1)
+            for key in keys:
+                os.write(fd,key.encode('latin-1'));time.sleep(0.1)
+            sent=True
+    else:
+        os.kill(pid,9);raise RuntimeError('PTY deadline exceeded: %r'%data)
+    os.close(fd);_,status=os.waitpid(pid,0)
+    text=data.decode(errors='replace')
+    launched=None
+    for line in text.replace('\r','\n').split('\n'):
+        if '{' in line:launched=json.loads(line[line.index('{'):])['env'].get('CLAUDE_CONFIG_DIR')
+    results.append({'exit':os.waitstatus_to_exitcode(status),'picker':'Choose a profile' in text,'launched':launched})
+print(json.dumps(results))
+"#;
+    let cases: Vec<Value> = cases
+        .iter()
+        .map(|(cwd, keys)| json!([cwd.to_str().unwrap(), keys]))
+        .collect();
+    let out = Command::new("/usr/bin/python3")
+        .args([
+            "-c",
+            script,
+            env!("CARGO_BIN_EXE_roost"),
+            f.root.to_str().unwrap(),
+            f.bin.to_str().unwrap(),
+            f.home.to_str().unwrap(),
+            &serde_json::to_string(&cases).unwrap(),
+        ])
+        .env_clear()
+        .env("PATH", "/usr/bin:/bin")
+        .output()
+        .unwrap();
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    parsed(&out)
+}
+
+#[test]
+fn picker_highlights_last_used_moves_with_keys_and_remembers_the_choice() {
+    let f = Fixture::new();
+    f.add("Work");
+    f.add("Home");
+    launched(&f.run(&["run", "Work"]));
+    let work = f.root.join("profiles/Work");
+    let home = f.root.join("profiles/Home");
+    let projects: Vec<PathBuf> = ["a", "b", "c", "d"].iter().map(|p| repo(&f, p)).collect();
+    let results = pick_in_pty(
+        &f,
+        &[
+            // Enter takes the initial highlight: the most recently launched.
+            (&projects[0], &["\r"]),
+            (&projects[1], &["k", "\r"]),
+            (&projects[2], &["\x1b[A", "\x1b[B", "j", "\x1bOA", "\r"]),
+            (&projects[3], &["k", "j", "\n"]),
+        ],
+    );
+    let expect = |path: &Path| json!({"exit":0,"picker":true,"launched":path.to_str().unwrap()});
+    assert_eq!(
+        results,
+        json!([expect(&work), expect(&home), expect(&home), expect(&work)])
+    );
+    // The choice is remembered: no picker, no terminal needed.
+    let probe = launched(&f.command().current_dir(&projects[1]).output().unwrap());
+    assert_eq!(
+        probe["env"]["CLAUDE_CONFIG_DIR"],
+        json!(home.to_str().unwrap())
+    );
+}
+
+#[test]
+fn picker_cancels_with_130_and_no_state_change_and_shows_for_one_profile() {
+    let f = Fixture::new();
+    f.add("Work");
+    let app = repo(&f, "app");
+    let results = pick_in_pty(
+        &f,
+        &[
+            (&app, &["\x1b"]),
+            (&app, &["q"]),
+            (&app, &["\x03"]),
+            (&app, &["\x04"]),
+        ],
+    );
+    let cancelled = json!({"exit":130,"picker":true,"launched":null});
+    assert_eq!(results, json!([cancelled, cancelled, cancelled, cancelled]));
+    assert!(!f.root.join("state.json").exists());
+    let results = pick_in_pty(&f, &[(&app, &["\r"])]);
+    assert_eq!(
+        results,
+        json!([{"exit":0,"picker":true,"launched":f.root.join("profiles/Work").to_str().unwrap()}])
     );
 }
