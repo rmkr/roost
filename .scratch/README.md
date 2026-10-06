@@ -1,6 +1,6 @@
 # Local Markdown tracker
 
-Each effort has a `map.md` and numbered tickets in `issues/`. The [Rust port decision map](rust-port/map.md) is complete; its accepted handoff is the [Roost specification](rust-port/spec.md). The [workflow UX map](workflow-ux/map.md) is open for docs, CI and a namespace-check follow-up.
+Each effort has a `map.md` and numbered tickets in `issues/`. The [Rust port decision map](rust-port/map.md) is complete; its accepted handoff is the [Roost specification](rust-port/spec.md). The [workflow UX map](workflow-ux/map.md) is complete.
 
 ## Wayfinding operations
 

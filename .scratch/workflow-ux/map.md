@@ -1,7 +1,7 @@
 # Make Roost simpler to work with day to day
 
 Labels: workflow-ux
-Status: open
+Status: resolved
 
 ## Destination
 
@@ -42,6 +42,7 @@ Roost remembers which profile each project uses, shows profiles in a readable ta
 - [Move the user's hooks and status line into core](issues/22-migrate-settings.md): 10 hooks and the status line shared via `core`, verified with `/hooks`; style files shared, style choice per profile.
 - [Document the workflow UX features](issues/23-user-docs.md): README and CLAUDE.md cover everything shipped.
 - [Run checks on GitHub Actions](issues/24-ci.md): dropped by the user; CI deferred to Later.
+- [Accept group-writable folders shared only with the user's private group](issues/25-private-group-namespace.md): Ubuntu's umask 002 folders accepted when only the user's private group can write.
 - [Investigate injected plugin behavior](issues/06-injected-plugin-behavior.md): injection works as ADR 0001 assumes (`name@inline`, per-profile opt-out, config and data per profile); inject `installPath` from the store's `installed_plugins.json` at every launch; no claude.ai org marketplaces in the store; ADR accepted.
 
 ## Not yet specified
