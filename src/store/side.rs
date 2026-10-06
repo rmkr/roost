@@ -28,6 +28,10 @@ pub struct StateFile {
     pub desktop_launched: Vec<Timestamp>,
     #[serde(deserialize_with = "nullable")]
     pub plugin_auto_update_at: Option<u64>,
+    /// The registration borrowing the conventional Desktop data folder (at most one).
+    /// Optional on read and omitted while empty, so older documents stay valid.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub desktop_links: Vec<DesktopLink>,
 }
 /// A project's selected profile; `project` is the absolute project key.
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
@@ -42,6 +46,12 @@ pub struct Selection {
 pub struct Timestamp {
     pub registration_id: String,
     pub at: u64,
+}
+/// A registration whose Desktop borrows the conventional Desktop data folder in place.
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct DesktopLink {
+    pub registration_id: String,
 }
 /// A link Roost created in an owned profile; `path` is relative to the profile.
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
@@ -142,6 +152,7 @@ impl StateFile {
             links: vec![],
             desktop_launched: vec![],
             plugin_auto_update_at: None,
+            desktop_links: vec![],
         }
     }
 }
@@ -161,8 +172,12 @@ impl SideFile for StateFile {
                 .map(|s| &s.registration_id)
                 .chain(self.last_used.iter().map(|t| &t.registration_id))
                 .chain(self.links.iter().map(|l| &l.registration_id))
-                .chain(self.desktop_launched.iter().map(|t| &t.registration_id)),
+                .chain(self.desktop_launched.iter().map(|t| &t.registration_id))
+                .chain(self.desktop_links.iter().map(|l| &l.registration_id)),
         )?;
+        if self.desktop_links.len() > 1 {
+            return Err(invalid(STATE));
+        }
         for selection in &self.selections {
             absolute(STATE, &selection.project)?;
         }
@@ -199,6 +214,7 @@ impl SideFile for StateFile {
         self.last_used.retain(|t| keep(&t.registration_id));
         self.links.retain(|l| keep(&l.registration_id));
         self.desktop_launched.retain(|t| keep(&t.registration_id));
+        self.desktop_links.retain(|l| keep(&l.registration_id));
     }
 }
 impl SetsFile {
@@ -691,6 +707,52 @@ mod tests {
         let error = store.update_state(|_| Err(err("usage", "no"))).unwrap_err();
         assert_eq!(error.code, "usage");
         assert!(!f.root.join(STATE).exists());
+    }
+
+    #[test]
+    fn desktop_link_is_optional_in_older_state_and_holds_one_registration() {
+        let f = Fixture::new();
+        let mut store = f.open(OpenMode::Mutate).unwrap();
+        store.add("Work", false, None).unwrap();
+        store.add("Other", false, None).unwrap();
+        let work = store.find("Work", false).unwrap().registration_id.clone();
+        let other = store.find("Other", false).unwrap().registration_id.clone();
+        // A state.json written before Desktop links existed still reads.
+        let old = serde_json::json!({"schema_version":1,"root_id":store.root_id,
+            "selections":[],"last_used":[{"registration_id":work,"at":5}],"links":[],
+            "desktop_launched":[],"plugin_auto_update_at":null});
+        fs::write(f.root.join(STATE), serde_json::to_vec(&old).unwrap()).unwrap();
+        fs::set_permissions(f.root.join(STATE), fs::Permissions::from_mode(0o600)).unwrap();
+        let state = store.read_state().unwrap();
+        assert!(state.desktop_links.is_empty());
+        assert_eq!(state.last_used[0].at, 5);
+        // Without a link the written document keeps the older shape.
+        store.update_state(|_| Ok(())).unwrap();
+        let text = fs::read_to_string(f.root.join(STATE)).unwrap();
+        assert!(!text.contains("desktop_links"), "{text}");
+        store
+            .update_state(|state| {
+                state.desktop_links.push(DesktopLink {
+                    registration_id: work.clone(),
+                });
+                Ok(())
+            })
+            .unwrap();
+        assert_eq!(
+            store.read_state().unwrap().desktop_links[0].registration_id,
+            work
+        );
+        // Only one registration may borrow the conventional folder.
+        let error = store
+            .update_state(|state| {
+                state.desktop_links.push(DesktopLink {
+                    registration_id: other.clone(),
+                });
+                Ok(())
+            })
+            .unwrap_err();
+        assert_eq!(error.code, "ownership");
+        assert_eq!(store.read_state().unwrap().desktop_links.len(), 1);
     }
 
     #[test]

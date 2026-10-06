@@ -112,11 +112,24 @@ pub enum Action {
     Help { command: Option<String> },
     /// Experimental, Linux only: start Claude Desktop with this profile's own Desktop
     /// data folder (sign-in) and configuration; detached unless --foreground.
-    /// Without NAME, choose the profile from a picker
+    /// Without NAME, choose the profile from a picker. --link NAME makes NAME's
+    /// Desktop borrow the existing Claude Desktop data folder in place
     Desktop {
         /// Stay attached with Desktop's console output, for debugging
-        #[arg(long)]
+        #[arg(long, conflicts_with_all = ["link", "unlink"])]
         foreground: bool,
+        /// Let NAME's Desktop use the existing Claude Desktop data folder in place
+        #[arg(long, requires = "name", conflicts_with = "unlink")]
+        link: bool,
+        /// Stop NAME borrowing the existing Claude Desktop data folder
+        #[arg(long, requires = "name", conflicts_with_all = ["replace", "yes"])]
+        unlink: bool,
+        /// With --link: delete NAME's own Roost Desktop folder (after confirmation)
+        #[arg(long, requires = "link")]
+        replace: bool,
+        /// With --replace: skip the confirmation
+        #[arg(long, requires = "replace")]
+        yes: bool,
         name: Option<String>,
     },
     /// Manage the shared plugin store and its plugins
@@ -561,7 +574,10 @@ mod tests {
     }
     #[test]
     fn desktop_takes_an_optional_name_and_no_forwarded_tail() {
-        let Action::Desktop { foreground, name } = parse(&["roost", "desktop", "Work"]) else {
+        let Action::Desktop {
+            foreground, name, ..
+        } = parse(&["roost", "desktop", "Work"])
+        else {
             panic!()
         };
         assert!(!foreground);
@@ -578,14 +594,16 @@ mod tests {
             parse(&["roost", "desktop"]),
             Action::Desktop {
                 foreground: false,
-                name: None
+                name: None,
+                ..
             }
         ));
         assert!(matches!(
             parse(&["roost", "desktop", "--foreground"]),
             Action::Desktop {
                 foreground: true,
-                name: None
+                name: None,
+                ..
             }
         ));
         for values in [
@@ -594,6 +612,53 @@ mod tests {
             vec!["roost", "desktop", "Work", "extra"],
         ] {
             assert!(parse_from(values.iter().map(OsString::from).collect()).is_err());
+        }
+    }
+    #[test]
+    fn desktop_link_and_unlink_need_name_and_reject_meaningless_combinations() {
+        assert!(matches!(
+            parse(&["roost", "desktop", "--link", "Work"]),
+            Action::Desktop {
+                link: true,
+                unlink: false,
+                replace: false,
+                yes: false,
+                foreground: false,
+                name: Some(_),
+            }
+        ));
+        assert!(matches!(
+            parse(&["roost", "desktop", "Work", "--link", "--replace", "--yes"]),
+            Action::Desktop {
+                link: true,
+                replace: true,
+                yes: true,
+                ..
+            }
+        ));
+        assert!(matches!(
+            parse(&["roost", "desktop", "--unlink", "Work"]),
+            Action::Desktop {
+                unlink: true,
+                link: false,
+                ..
+            }
+        ));
+        for values in [
+            vec!["roost", "desktop", "--link"],
+            vec!["roost", "desktop", "--unlink"],
+            vec!["roost", "desktop", "--link", "--unlink", "Work"],
+            vec!["roost", "desktop", "--link", "--foreground", "Work"],
+            vec!["roost", "desktop", "--unlink", "--foreground", "Work"],
+            vec!["roost", "desktop", "--unlink", "--replace", "Work"],
+            vec!["roost", "desktop", "--unlink", "--yes", "Work"],
+            vec!["roost", "desktop", "--replace", "Work"],
+            vec!["roost", "desktop", "--yes", "Work"],
+            vec!["roost", "desktop", "--link", "--yes", "Work"],
+            vec!["roost", "desktop", "--link", "Work", "--", "x"],
+        ] {
+            let error = parse_from(values.iter().map(OsString::from).collect()).unwrap_err();
+            assert_eq!(error.exit_code(), 2, "{values:?}");
         }
     }
     #[test]

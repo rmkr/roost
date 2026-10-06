@@ -209,6 +209,24 @@ impl Store {
             }))
     }
 
+    /// Deletes the registration's own Desktop folder, if it has one, as the journaled
+    /// `desktop_delete` operation (the caller confirmed it); registrations are
+    /// unchanged. Returns whether a folder was deleted.
+    pub fn delete_desktop_folder(&mut self, r: &Registration) -> Result<bool> {
+        if !self.mode.journaled() {
+            return Err(err("ownership", "Read-only store cannot mutate"));
+        }
+        let Some(artifact) = self.desktop_deletion(r)? else {
+            return Ok(false);
+        };
+        let stage = self.begin(Operation::DesktopDelete, Some(r.registration_id.clone()))?;
+        self.record(artifact)?;
+        self.delete_desktop(self.intent.as_ref().unwrap().artifacts.len() - 1)?;
+        let next = self.registry.clone();
+        self.commit(next, &stage)?;
+        Ok(true)
+    }
+
     /// Whether a present Desktop folder entry is the journaled object: a marked
     /// folder, or (while deleting, after the marker went last) an empty one.
     pub(super) fn desktop_matches(
@@ -530,6 +548,35 @@ mod tests {
         assert!(f.open(OpenMode::Mutate).is_err());
         assert!(folder.join("Preferences").exists());
         assert!(f.open(OpenMode::Read).unwrap().pending());
+    }
+
+    #[test]
+    fn desktop_delete_is_journaled_and_an_interruption_never_continues_it() {
+        let f = Fixture::new();
+        let r = f.work();
+        let mut launch = f.open(OpenMode::Launch).unwrap();
+        let folder = launch.ensure_desktop_folder(&r).unwrap();
+        fs::write(folder.join("Preferences"), "{}").unwrap();
+        assert!(launch.delete_desktop_folder(&r).is_err());
+        drop(launch);
+        // Interrupted after recording the deletion: recovery stops once, keeping data.
+        let mut store = f.open(OpenMode::Mutate).unwrap();
+        let artifact = store.desktop_deletion(&r).unwrap().unwrap();
+        let _stage = store
+            .begin(Operation::DesktopDelete, Some(r.registration_id.clone()))
+            .unwrap();
+        store.record(artifact).unwrap();
+        drop(store);
+        assert_eq!(f.open(OpenMode::Mutate).err().unwrap().code, "ownership");
+        assert!(folder.join("Preferences").exists());
+        let mut store = f.open(OpenMode::Mutate).unwrap();
+        assert!(!store.pending());
+        let generation = store.registry.generation;
+        assert!(store.delete_desktop_folder(&r).unwrap());
+        assert!(!folder.exists());
+        assert_eq!(store.registry.generation, generation + 1);
+        assert!(!store.delete_desktop_folder(&r).unwrap());
+        assert_eq!(store.registry.registrations.len(), 1);
     }
 
     #[test]

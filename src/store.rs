@@ -96,6 +96,7 @@ enum Operation {
     TokenSet,
     TokenClear,
     DesktopCreate,
+    DesktopDelete,
     StoreCreate,
 }
 #[derive(Clone, Copy, Debug, Serialize, Deserialize, PartialEq, Eq)]
@@ -1522,7 +1523,7 @@ impl Store {
             Operation::TokenSet | Operation::TokenClear => {
                 registration.is_some_and(|r| r.kind == Kind::Owned && r.state == State::Active)
             }
-            Operation::DesktopCreate => registration
+            Operation::DesktopCreate | Operation::DesktopDelete => registration
                 .is_some_and(|r| r.kind != Kind::DefaultAlias && r.state == State::Active),
             Operation::StoreCreate => j.registration_id.is_none(),
         };
@@ -1576,7 +1577,9 @@ impl Store {
                 Role::StagingDirectory => a.action == Action::Create,
                 Role::DesktopData => match j.operation {
                     Operation::DesktopCreate => a.action == Action::Create,
-                    Operation::Purge | Operation::Remove => a.action == Action::Delete,
+                    Operation::Purge | Operation::Remove | Operation::DesktopDelete => {
+                        a.action == Action::Delete
+                    }
                     _ => false,
                 },
                 Role::Store => j.operation == Operation::StoreCreate && a.action == Action::Create,
@@ -1811,6 +1814,12 @@ impl Store {
                 self.cleanup()
             }
             Operation::Reuse => self.rollback_refresh(),
+            Operation::DesktopDelete => {
+                self.cleanup()?;
+                // Deletion never continues automatically; a partly deleted folder
+                // keeps its marker and stays this registration's own folder.
+                Err(err("ownership", "Interrupted Desktop folder deletion stopped; the registration and its Desktop link are unchanged").next("Repeat roost desktop --link NAME --replace."))
+            }
             Operation::Remove => {
                 self.cleanup()?;
                 // Preserve prior bookkeeping; the explicit next reuse/remove supplies

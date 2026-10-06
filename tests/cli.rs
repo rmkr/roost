@@ -44,7 +44,9 @@ if data and not os.environ.get('FAKE_DESKTOP_IGNORE_DIR'):open(os.path.join(data
 print('chromium console noise');print('[ERROR] gpu noise',file=sys.stderr)
 if os.environ.get('FAKE_DESKTOP_MODE')=='long':
     # Like Electron: a SingletonLock link naming HOST-PID while running.
-    lock=os.path.join(data[0],'SingletonLock') if data and os.environ.get('FAKE_DESKTOP_LOCK') else None
+    # Without --user-data-dir: the conventional folder, when it exists.
+    folder=data[0] if data else os.path.join(os.environ.get('XDG_CONFIG_HOME') or os.path.join(os.environ['HOME'],'.config'),'Claude')
+    lock=os.path.join(folder,'SingletonLock') if os.path.isdir(folder) and os.environ.get('FAKE_DESKTOP_LOCK') else None
     if lock:os.symlink('%s-%d'%(socket.gethostname(),os.getpid()),lock)
     time.sleep(8)
     try:
@@ -2158,4 +2160,281 @@ fn desktop_without_name_and_terminal_is_usage_naming_desktop_name() {
     assert!(f.desktop_launches().is_empty());
     assert!(!f.root.join("state.json").exists());
     assert!(!f.root.join("desktop").exists());
+}
+
+/// The fixture's conventional Desktop folder, signed in and with permissive modes
+/// Roost must never repair.
+fn signed_in_desktop(f: &Fixture) -> PathBuf {
+    let conventional = f.home.join(".config/Claude");
+    fs::create_dir_all(&conventional).unwrap();
+    fs::write(conventional.join("Preferences"), "signed-in").unwrap();
+    fs::set_permissions(&conventional, fs::Permissions::from_mode(0o755)).unwrap();
+    conventional
+}
+
+fn state_json(f: &Fixture) -> Value {
+    serde_json::from_slice(&fs::read(f.root.join("state.json")).unwrap()).unwrap()
+}
+
+#[test]
+fn linked_desktop_borrows_the_conventional_folder_in_place() {
+    let f = Fixture::new();
+    f.add("Work");
+    f.add("Other");
+    f.ok(&["add", "personal", "--link-default"]);
+    let conventional = signed_in_desktop(&f);
+    let out = f.ok(&["desktop", "--link", "Work"]);
+    assert!(
+        String::from_utf8_lossy(&out.stdout).contains(conventional.to_str().unwrap()),
+        "{}",
+        String::from_utf8_lossy(&out.stdout)
+    );
+    assert_eq!(
+        state_json(&f)["desktop_links"],
+        json!([{"registration_id": f.registration_id("Work")}])
+    );
+    // Linking again is a no-op; aliases already use the folder.
+    f.ok(&["desktop", "--link", "work"]);
+    let out = f.fails(&["desktop", "--link", "personal"], "usage");
+    assert_eq!(out.status.code(), Some(2));
+    // Only one registration may borrow it.
+    let out = f.fails(&["desktop", "--link", "Other"], "collision");
+    assert!(String::from_utf8_lossy(&out.stderr).contains("Work"));
+
+    f.ok(&["desktop", "--foreground", "Work"]);
+    let launch = &f.desktop_launches()[0];
+    assert_eq!(launch["arguments"], json!([]));
+    assert_eq!(
+        launch["env"]["CLAUDE_CONFIG_DIR"],
+        f.root.join("profiles/Work").to_str().unwrap()
+    );
+    assert_eq!(launch["env"]["DISABLE_AUTOUPDATER"], "1");
+    assert!(!f.root.join("desktop").exists());
+    let state = state_json(&f);
+    assert_eq!(
+        state["desktop_launched"][0]["registration_id"],
+        f.registration_id("Work")
+    );
+    assert_eq!(
+        state["last_used"][0]["registration_id"],
+        f.registration_id("Work")
+    );
+    // The borrowed folder is untouched.
+    assert_eq!(
+        fs::metadata(&conventional).unwrap().permissions().mode() & 0o777,
+        0o755
+    );
+    assert_eq!(
+        fs::read_to_string(conventional.join("Preferences")).unwrap(),
+        "signed-in"
+    );
+    // Doctor's isolation check does not apply to a borrowed folder.
+    let doctor = parsed(&f.run(&["doctor", "--json"]));
+    assert!(
+        !doctor.to_string().contains("desktop_data_not_isolated"),
+        "{doctor}"
+    );
+
+    // A detached linked Desktop holds the conventional lock, so the alias sharing
+    // that folder refuses to start a second time.
+    let out = f
+        .command()
+        .args(["desktop", "Work"])
+        .env("FAKE_DESKTOP_MODE", "long")
+        .env("FAKE_DESKTOP_LOCK", "1")
+        .output()
+        .unwrap();
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let target = fs::read_link(conventional.join("SingletonLock")).unwrap();
+    let pid: i32 = target
+        .to_str()
+        .unwrap()
+        .rsplit_once('-')
+        .unwrap()
+        .1
+        .parse()
+        .unwrap();
+    f.fails(&["desktop", "--foreground", "personal"], "desktop_running");
+    unsafe { libc::kill(pid, libc::SIGTERM) };
+    fs::remove_file(conventional.join("SingletonLock")).unwrap();
+    assert_eq!(f.desktop_launches().len(), 2);
+
+    // Unlinking returns Work to its own Roost folder; unlinking twice is harmless.
+    f.ok(&["desktop", "--unlink", "Work"]);
+    f.ok(&["desktop", "--unlink", "Work"]);
+    assert!(state_json(&f).get("desktop_links").is_none());
+    f.ok(&["desktop", "--foreground", "Work"]);
+    assert_eq!(
+        f.desktop_launches()[2]["arguments"],
+        json!([format!(
+            "--user-data-dir={}",
+            f.desktop_folder("Work").display()
+        )])
+    );
+    assert_eq!(f.desktop_launches().len(), 3);
+    // Another profile may borrow it now.
+    f.ok(&["desktop", "--link", "Other"]);
+}
+
+#[test]
+fn link_follows_xdg_config_home_from_the_caller_environment() {
+    let f = Fixture::new();
+    f.add("Work");
+    let config = f.path.join("xdg");
+    fs::create_dir(&config).unwrap();
+    let out = f
+        .command()
+        .env("XDG_CONFIG_HOME", &config)
+        .args(["desktop", "--link", "Work"])
+        .output()
+        .unwrap();
+    assert!(out.status.success());
+    assert!(String::from_utf8_lossy(&out.stdout).contains(config.join("Claude").to_str().unwrap()));
+    assert!(!config.join("Claude").exists());
+    assert!(!f.home.join(".config").exists());
+}
+
+/// Runs `args` with no controlling terminal.
+fn detached_from_terminal(f: &Fixture, args: &[&str]) -> Output {
+    let mut command = f.command();
+    command.args(args);
+    unsafe {
+        use std::os::unix::process::CommandExt;
+        command.pre_exec(|| {
+            libc::setsid();
+            Ok(())
+        });
+    }
+    command.output().unwrap()
+}
+
+#[test]
+fn link_replaces_an_own_desktop_folder_only_after_confirmation() {
+    let f = Fixture::new();
+    f.add("Work");
+    let conventional = signed_in_desktop(&f);
+    f.ok(&["desktop", "--foreground", "Work"]);
+    let own = f.desktop_folder("Work");
+    let out = f.fails(&["desktop", "--link", "Work"], "collision");
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(stderr.contains(own.to_str().unwrap()), "{stderr}");
+    assert!(stderr.contains("--replace"), "{stderr}");
+    // No terminal and no --yes: usage, nothing changed.
+    let out = detached_from_terminal(&f, &["desktop", "--link", "Work", "--replace"]);
+    assert_eq!(out.status.code(), Some(2));
+    assert!(own.join("Preferences").exists());
+    assert!(state_json(&f).get("desktop_links").is_none());
+    // A running own Desktop refuses before confirmation.
+    let lock = own.join("SingletonLock");
+    std::os::unix::fs::symlink(format!("{}-{}", hostname(), std::process::id()), &lock).unwrap();
+    f.fails(
+        &["desktop", "--link", "Work", "--replace", "--yes"],
+        "desktop_running",
+    );
+    fs::remove_file(&lock).unwrap();
+    assert!(own.join("Preferences").exists());
+
+    let out = f.ok(&["desktop", "--link", "Work", "--replace", "--yes"]);
+    assert!(String::from_utf8_lossy(&out.stderr).contains(own.to_str().unwrap()));
+    assert!(!own.exists());
+    assert_eq!(
+        state_json(&f)["desktop_links"][0]["registration_id"],
+        f.registration_id("Work")
+    );
+    assert_eq!(
+        fs::read_to_string(conventional.join("Preferences")).unwrap(),
+        "signed-in"
+    );
+    f.ok(&["desktop", "--foreground", "Work"]);
+    assert_eq!(f.desktop_launches()[1]["arguments"], json!([]));
+    assert!(!own.exists());
+    f.ok(&["doctor"]);
+}
+
+#[test]
+fn linked_desktop_shares_one_instance_with_the_alias_and_survives_removal() {
+    let f = Fixture::new();
+    f.add("Work");
+    f.ok(&["add", "personal", "--link-default"]);
+    let conventional = signed_in_desktop(&f);
+    f.ok(&["desktop", "--link", "Work"]);
+    let lock = conventional.join("SingletonLock");
+    std::os::unix::fs::symlink(format!("{}-{}", hostname(), std::process::id()), &lock).unwrap();
+    let out = f.fails(&["desktop", "--foreground", "Work"], "desktop_running");
+    assert!(String::from_utf8_lossy(&out.stderr).contains("already running"));
+    let out = f.fails(&["desktop", "--foreground", "personal"], "desktop_running");
+    assert!(String::from_utf8_lossy(&out.stderr).contains("shared with Work"));
+    assert!(f.desktop_launches().is_empty());
+    // Q51 applies to the borrowed folder: purge refuses while it runs.
+    let out = f.fails(&["remove", "Work", "--purge", "--yes"], "desktop_running");
+    assert!(String::from_utf8_lossy(&out.stderr).contains("Quit Claude Desktop for Work"));
+    f.ok(&["where", "Work"]);
+    fs::remove_file(&lock).unwrap();
+
+    // Ordinary remove drops the link even though the registration is retained.
+    f.ok(&["remove", "Work"]);
+    assert!(state_json(&f).get("desktop_links").is_none());
+    f.ok(&["reuse", "Work"]);
+    f.ok(&["desktop", "--link", "Work"]);
+    f.ok(&["remove", "Work", "--purge", "--yes"]);
+    assert!(state_json(&f).get("desktop_links").is_none());
+    assert_eq!(
+        fs::read_to_string(conventional.join("Preferences")).unwrap(),
+        "signed-in"
+    );
+
+    // Upstream: remove refuses while the borrowed Desktop runs, then drops the link
+    // without asking (Roost has no folder of its own to delete).
+    let upstream = f.upstream("Up");
+    f.ok(&["register", "Up", "--path", upstream.to_str().unwrap()]);
+    f.ok(&["desktop", "--link", "Up"]);
+    std::os::unix::fs::symlink(format!("{}-{}", hostname(), std::process::id()), &lock).unwrap();
+    f.fails(&["remove", "Up"], "desktop_running");
+    fs::remove_file(&lock).unwrap();
+    let out = detached_from_terminal(&f, &["remove", "Up"]);
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert!(state_json(&f).get("desktop_links").is_none());
+    assert_eq!(
+        fs::read_to_string(conventional.join("Preferences")).unwrap(),
+        "signed-in"
+    );
+    assert!(upstream.exists());
+}
+
+#[test]
+fn desktop_picker_shows_the_borrowed_folder_for_the_linked_and_alias_rows() {
+    let f = Fixture::new();
+    f.add("Work");
+    f.add("Home");
+    f.ok(&["add", "personal", "--link-default"]);
+    let conventional = signed_in_desktop(&f);
+    f.ok(&["desktop", "--link", "Work"]);
+    let result = desktop_picker(&f, &[], &["\x1b"]);
+    let text = result["text"].as_str().unwrap();
+    assert_eq!(result["exit"], 130, "{text}");
+    assert!(picker_row(text, "Work").contains("signed in"), "{text}");
+    assert!(
+        picker_row(text, "personal").contains("shared with Work"),
+        "{text}"
+    );
+    let home = picker_row(text, "Home");
+    assert!(
+        !home.contains("signed in") && !home.contains("shared"),
+        "{text}"
+    );
+    let live = format!("{}-{}", hostname(), std::process::id());
+    std::os::unix::fs::symlink(&live, conventional.join("SingletonLock")).unwrap();
+    let result = desktop_picker(&f, &[], &["\x1b"]);
+    let text = result["text"].as_str().unwrap();
+    assert!(picker_row(text, "Work").contains("running"), "{text}");
+    assert!(picker_row(text, "personal").contains("running"), "{text}");
+    assert!(f.desktop_launches().is_empty());
 }

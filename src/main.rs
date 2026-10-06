@@ -234,7 +234,21 @@ fn dispatch(action: Action, data: &mut Value) -> Result<Outcome> {
             apply,
         )?)),
         Action::Doctor { .. } => doctor(data),
-        Action::Desktop { name, foreground } => Ok(Outcome {
+        Action::Desktop {
+            name: Some(name),
+            link: true,
+            replace,
+            yes,
+            ..
+        } => Ok(Outcome::lines(desktop::link(&name, replace, yes)?)),
+        Action::Desktop {
+            name: Some(name),
+            unlink: true,
+            ..
+        } => Ok(Outcome::lines(desktop::unlink(&name)?)),
+        Action::Desktop {
+            name, foreground, ..
+        } => Ok(Outcome {
             exit: desktop::run(name.as_deref(), foreground)?,
             ..Outcome::quiet()
         }),
@@ -516,6 +530,8 @@ fn dispatch(action: Action, data: &mut Value) -> Result<Outcome> {
             out.warnings
                 .extend(select::forget_removed(&store, &current));
             out.warnings.extend(sets::forget_removed(&store));
+            out.warnings
+                .extend(desktop::forget_removed(&store, &current));
             Ok(out)
         }
         Action::Set { action } => Ok(Outcome::lines(sets::command(action, data)?)),

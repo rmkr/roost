@@ -224,6 +224,7 @@ pub fn profiles(records: &[Value], full: bool, color: bool, width: Option<usize>
 
 /// The `roost desktop` picker rows: the list table plus a Desktop column from each
 /// record's `desktop` value (`running`, `signed_in`, `plain` for a default alias,
+/// `shared` with `desktop_shared_with` for an alias whose folder a profile borrows,
 /// otherwise never launched).
 pub fn desktop_profiles(records: &[Value], color: bool) -> Vec<String> {
     profile_table(records, false, true, color, None)
@@ -293,6 +294,10 @@ fn profile_table(
             Some("running") => Cell::new("running", Style::Green),
             Some("signed_in") => Cell::plain("signed in"),
             Some("plain") => Cell::new("plain", Style::Dim),
+            Some("shared") => Cell::plain(format!(
+                "shared with {}",
+                r["desktop_shared_with"].as_str().unwrap_or("?")
+            )),
             _ => Cell::new("—", Style::Dim),
         });
     }
