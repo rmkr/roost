@@ -170,7 +170,10 @@ fn human_list_is_a_plain_aligned_table_when_piped() {
             f.home.join(".claude").display()
         )
     );
-    assert_eq!(lines[2], format!("Work      owned          active  {}", work.display()));
+    assert_eq!(
+        lines[2],
+        format!("Work      owned          active  {}", work.display())
+    );
     assert_eq!(lines[3], "");
     assert_eq!(lines[4], "○ 2 profiles · 0 upstream");
     assert_eq!(lines.len(), 5);

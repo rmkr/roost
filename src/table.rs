@@ -122,7 +122,13 @@ impl<'a, R> Table<'a, R> {
                     .unwrap_or(0)
             })
             .collect();
-        let gap = |i: usize| if i == 0 && self.marker.is_some() { 1 } else { 2 };
+        let gap = |i: usize| {
+            if i == 0 && self.marker.is_some() {
+                1
+            } else {
+                2
+            }
+        };
         let mut lines: Vec<String> = grid
             .iter()
             .map(|line| {
@@ -299,12 +305,18 @@ mod tests {
     #[test]
     fn color_wraps_styled_cells_without_changing_alignment() {
         let lines = table().render(&rows(), true);
-        assert_eq!(lines[0], "  \x1b[1mProfile\x1b[0m   \x1b[1mToken\x1b[0m  \x1b[1mKind\x1b[0m");
+        assert_eq!(
+            lines[0],
+            "  \x1b[1mProfile\x1b[0m   \x1b[1mToken\x1b[0m  \x1b[1mKind\x1b[0m"
+        );
         assert_eq!(
             lines[1],
             "@ \x1b[1mpersonal\x1b[0m  \x1b[32m✓\x1b[0m      owned"
         );
-        assert_eq!(lines[2], "  \x1b[1mw\x1b[0m         \x1b[2m–\x1b[0m      owned");
+        assert_eq!(
+            lines[2],
+            "  \x1b[1mw\x1b[0m         \x1b[2m–\x1b[0m      owned"
+        );
     }
 
     #[test]

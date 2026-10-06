@@ -234,7 +234,10 @@ impl Directory {
 
     /// Creates `name` as a symbolic link to the absolute `target`, relative to this
     /// verified handle. Never replaces an existing entry; returns the link's own identity.
-    #[allow(dead_code, reason = "shared scaffold for set links (05) and Desktop (09)")]
+    #[allow(
+        dead_code,
+        reason = "shared scaffold for set links (05) and Desktop (09)"
+    )]
     pub fn symlink(&self, target: &Path, name: &str) -> Result<FileIdentity> {
         valid_name(name)?;
         let text = target
@@ -261,7 +264,10 @@ impl Directory {
 
     /// Reads the text of the link `name` without following it. `None` when absent;
     /// any other object type is unsafe_path.
-    #[allow(dead_code, reason = "shared scaffold for set links (05) and Desktop (09)")]
+    #[allow(
+        dead_code,
+        reason = "shared scaffold for set links (05) and Desktop (09)"
+    )]
     pub fn read_link(&self, name: &str) -> Result<Option<PathBuf>> {
         valid_name(name)?;
         let path = self.path.join(name);
@@ -743,7 +749,11 @@ mod tests {
         assert_eq!(skills.read_link("absent").unwrap(), None);
         // Existing entries are never replaced and regular files are not links.
         assert_eq!(
-            skills.symlink(Path::new("/elsewhere"), "tdd").err().unwrap().code,
+            skills
+                .symlink(Path::new("/elsewhere"), "tdd")
+                .err()
+                .unwrap()
+                .code,
             "collision"
         );
         skills.write_new("plain", b"x", 0o600).unwrap();
