@@ -429,6 +429,43 @@ fn invalid_fragments_and_unsafe_settings_warn_and_never_block_launch() {
     assert!(leftovers.is_empty(), "{leftovers:?}");
 }
 
+#[test]
+fn rewrites_keep_number_text_exactly() {
+    let f = Fixture::new();
+    let numbers =
+        "[1e2, 1e21, 18446744073709551616, 0.1000000000000000055511151231257827, -0, 1.0]";
+    let dir = f.path.join("settings");
+    fs::create_dir(&dir).unwrap();
+    fs::write(
+        dir.join("a.json"),
+        r#"{"hooks":{"Stop":[{"hooks":[{"type":"command","command":"a","timeout":1E2}]}]}}"#,
+    )
+    .unwrap();
+    f.ok(&["set", "create", "core", "--default"]);
+    f.ok(&["set", "add", "core", "--settings-from", s(&dir)]);
+    f.ok(&["add", "Work"]);
+    f.write_settings("Work", &format!(r#"{{"n": {numbers}}}"#));
+    f.ok(&["run", "Work"]);
+    let text = f.settings_text("Work");
+    for number in [
+        "1e2",
+        "1e21",
+        "18446744073709551616",
+        "0.1000000000000000055511151231257827",
+        "-0",
+        "1.0",
+        "\"timeout\": 1E2",
+    ] {
+        assert!(text.contains(number), "{number}: {text}");
+    }
+    // The recorded handler still matches: unsubscribing removes it.
+    f.ok(&["set", "unsubscribe", "Work", "core"]);
+    f.ok(&["run", "Work"]);
+    let text = f.settings_text("Work");
+    assert!(!text.contains("hooks"), "{text}");
+    assert!(text.contains("18446744073709551616"), "{text}");
+}
+
 const FAKE_DESKTOP: &str = "#!/usr/bin/python3\nimport sys\nsys.exit(0)\n";
 
 #[test]

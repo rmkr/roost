@@ -5,9 +5,10 @@
 //! Roost co-edits a file Claude and the user also write, so it records in
 //! `state.json` exactly which hook handlers and keys it wrote, removes only
 //! recorded entries that are still identical, and replaces the file atomically only
-//! when it is unchanged since read. All other keys keep their order through
-//! [`Json`], an order-preserving document (serde_json's `preserve_order` would
-//! reorder every `--json` envelope in the crate).
+//! when it is unchanged since read. All other keys keep their order, and numbers
+//! their exact text, through [`Json`], an order-preserving document (serde_json's
+//! `preserve_order` would reorder every `--json` envelope in the crate, and
+//! `arbitrary_precision` would change how every other `Value` compares numbers).
 
 use crate::{
     Error, Result,
@@ -17,9 +18,10 @@ use crate::{
         side::{HookRecord, Item, ItemKind, SettingsRecord},
     },
 };
-use serde::de::{self, Deserialize, Deserializer, MapAccess, SeqAccess, Visitor};
-use serde_json::{Number, Value};
+use serde::de::{self, DeserializeSeed, Deserializer, MapAccess, SeqAccess, Visitor};
+use serde_json::Value;
 use std::{
+    cell::RefCell,
     fmt,
     path::{Path, PathBuf},
 };
@@ -33,86 +35,142 @@ const OUTPUT_STYLE: &str = "outputStyle";
 /// Keys a fragment may set.
 const ALLOWED: [&str; 3] = [HOOKS, STATUS_LINE, OUTPUT_STYLE];
 
-/// A JSON value whose objects keep their key order; duplicate keys are refused.
+/// A JSON value whose objects keep their key order and whose numbers keep their
+/// exact text; duplicate keys are refused.
 #[derive(Clone, Debug, PartialEq)]
 pub(crate) enum Json {
     Null,
     Bool(bool),
-    Number(Number),
+    /// The number exactly as written (`1e2` stays `1e2`, big integers keep every
+    /// digit), so a rewrite never changes numbers Roost does not own.
+    Number(String),
     String(String),
     Array(Vec<Json>),
     Object(Vec<(String, Json)>),
 }
 
-impl<'de> Deserialize<'de> for Json {
-    fn deserialize<D: Deserializer<'de>>(deserializer: D) -> std::result::Result<Self, D::Error> {
-        struct JsonVisitor;
-        impl<'de> Visitor<'de> for JsonVisitor {
-            type Value = Json;
-            fn expecting(&self, f: &mut fmt::Formatter) -> fmt::Result {
-                f.write_str("a JSON value")
-            }
-            fn visit_unit<E>(self) -> std::result::Result<Json, E> {
-                Ok(Json::Null)
-            }
-            fn visit_bool<E>(self, v: bool) -> std::result::Result<Json, E> {
-                Ok(Json::Bool(v))
-            }
-            fn visit_i64<E>(self, v: i64) -> std::result::Result<Json, E> {
-                Ok(Json::Number(v.into()))
-            }
-            fn visit_u64<E>(self, v: u64) -> std::result::Result<Json, E> {
-                Ok(Json::Number(v.into()))
-            }
-            fn visit_f64<E: de::Error>(self, v: f64) -> std::result::Result<Json, E> {
-                Number::from_f64(v)
-                    .map(Json::Number)
-                    .ok_or_else(|| E::custom("non-finite number"))
-            }
-            fn visit_str<E>(self, v: &str) -> std::result::Result<Json, E> {
-                Ok(Json::String(v.to_owned()))
-            }
-            fn visit_string<E>(self, v: String) -> std::result::Result<Json, E> {
-                Ok(Json::String(v))
-            }
-            fn visit_seq<A: SeqAccess<'de>>(
-                self,
-                mut seq: A,
-            ) -> std::result::Result<Json, A::Error> {
-                let mut items = vec![];
-                while let Some(item) = seq.next_element()? {
-                    items.push(item);
+/// Number tokens of a JSON text in document order, exactly as written. Only
+/// meaningful for text serde_json accepts, which visits numbers in the same order.
+fn number_texts(bytes: &[u8]) -> Vec<String> {
+    let mut found = vec![];
+    let mut i = 0;
+    while i < bytes.len() {
+        match bytes[i] {
+            b'"' => {
+                i += 1;
+                while i < bytes.len() && bytes[i] != b'"' {
+                    i += if bytes[i] == b'\\' { 2 } else { 1 };
                 }
-                Ok(Json::Array(items))
+                i += 1;
             }
-            fn visit_map<A: MapAccess<'de>>(
-                self,
-                mut map: A,
-            ) -> std::result::Result<Json, A::Error> {
-                let mut entries: Vec<(String, Json)> = vec![];
-                while let Some((key, value)) = map.next_entry::<String, Json>()? {
-                    if entries.iter().any(|(k, _)| *k == key) {
-                        return Err(de::Error::custom(format!("duplicate key {key}")));
-                    }
-                    entries.push((key, value));
+            b'-' | b'0'..=b'9' => {
+                let start = i;
+                while i < bytes.len()
+                    && matches!(bytes[i], b'0'..=b'9' | b'-' | b'+' | b'.' | b'e' | b'E')
+                {
+                    i += 1;
                 }
-                Ok(Json::Object(entries))
+                found.push(String::from_utf8_lossy(&bytes[start..i]).into_owned());
             }
+            _ => i += 1,
         }
-        deserializer.deserialize_any(JsonVisitor)
+    }
+    found
+}
+
+/// Builds a [`Json`] while serde_json validates the text, taking each number's
+/// text from the pre-scanned tokens.
+#[derive(Clone, Copy)]
+struct JsonSeed<'a>(&'a RefCell<std::vec::IntoIter<String>>);
+
+impl JsonSeed<'_> {
+    fn number<E: de::Error>(self) -> std::result::Result<Json, E> {
+        self.0
+            .borrow_mut()
+            .next()
+            .map(Json::Number)
+            .ok_or_else(|| E::custom("unexpected number"))
+    }
+}
+
+impl<'de> DeserializeSeed<'de> for JsonSeed<'_> {
+    type Value = Json;
+    fn deserialize<D: Deserializer<'de>>(
+        self,
+        deserializer: D,
+    ) -> std::result::Result<Json, D::Error> {
+        deserializer.deserialize_any(self)
+    }
+}
+
+impl<'de> Visitor<'de> for JsonSeed<'_> {
+    type Value = Json;
+    fn expecting(&self, f: &mut fmt::Formatter) -> fmt::Result {
+        f.write_str("a JSON value")
+    }
+    fn visit_unit<E>(self) -> std::result::Result<Json, E> {
+        Ok(Json::Null)
+    }
+    fn visit_bool<E>(self, v: bool) -> std::result::Result<Json, E> {
+        Ok(Json::Bool(v))
+    }
+    fn visit_i64<E: de::Error>(self, _: i64) -> std::result::Result<Json, E> {
+        self.number()
+    }
+    fn visit_u64<E: de::Error>(self, _: u64) -> std::result::Result<Json, E> {
+        self.number()
+    }
+    fn visit_f64<E: de::Error>(self, v: f64) -> std::result::Result<Json, E> {
+        if !v.is_finite() {
+            return Err(E::custom("non-finite number"));
+        }
+        self.number()
+    }
+    fn visit_str<E>(self, v: &str) -> std::result::Result<Json, E> {
+        Ok(Json::String(v.to_owned()))
+    }
+    fn visit_string<E>(self, v: String) -> std::result::Result<Json, E> {
+        Ok(Json::String(v))
+    }
+    fn visit_seq<A: SeqAccess<'de>>(self, mut seq: A) -> std::result::Result<Json, A::Error> {
+        let mut items = vec![];
+        while let Some(item) = seq.next_element_seed(self)? {
+            items.push(item);
+        }
+        Ok(Json::Array(items))
+    }
+    fn visit_map<A: MapAccess<'de>>(self, mut map: A) -> std::result::Result<Json, A::Error> {
+        let mut entries: Vec<(String, Json)> = vec![];
+        while let Some(key) = map.next_key::<String>()? {
+            if entries.iter().any(|(k, _)| *k == key) {
+                return Err(de::Error::custom(format!("duplicate key {key}")));
+            }
+            let value = map.next_value_seed(self)?;
+            entries.push((key, value));
+        }
+        Ok(Json::Object(entries))
     }
 }
 
 impl Json {
     pub(crate) fn parse(bytes: &[u8]) -> std::result::Result<Self, String> {
-        serde_json::from_slice(bytes).map_err(|e| e.to_string())
+        let numbers = RefCell::new(number_texts(bytes).into_iter());
+        let mut deserializer = serde_json::Deserializer::from_slice(bytes);
+        let value = JsonSeed(&numbers)
+            .deserialize(&mut deserializer)
+            .and_then(|value| deserializer.end().map(|()| value))
+            .map_err(|e| e.to_string())?;
+        if numbers.borrow_mut().next().is_some() {
+            return Err("unexpected number".into());
+        }
+        Ok(value)
     }
     /// The unordered value, for comparisons and records.
     pub(crate) fn to_value(&self) -> Value {
         match self {
             Self::Null => Value::Null,
             Self::Bool(b) => Value::Bool(*b),
-            Self::Number(n) => Value::Number(n.clone()),
+            Self::Number(n) => serde_json::from_str(n).unwrap_or(Value::Null),
             Self::String(s) => Value::String(s.clone()),
             Self::Array(items) => Value::Array(items.iter().map(Self::to_value).collect()),
             Self::Object(entries) => Value::Object(
@@ -166,7 +224,7 @@ impl Json {
         match self {
             Self::Null => out.push_str("null"),
             Self::Bool(b) => out.push_str(if *b { "true" } else { "false" }),
-            Self::Number(n) => out.push_str(&n.to_string()),
+            Self::Number(n) => out.push_str(n),
             Self::String(s) => out.push_str(&quote(s)),
             Self::Array(items) if items.is_empty() => out.push_str("[]"),
             Self::Object(entries) if entries.is_empty() => out.push_str("{}"),
@@ -961,5 +1019,12 @@ mod tests {
             "{\n  \"z\": 1,\n  \"a\": [\n    1.5,\n    \"x\\n\\\"\",\n    {},\n    []\n  ],\n  \"m\": {\n    \"k\": null,\n    \"b\": true\n  }\n}"
         );
         assert!(Json::parse(br#"{"a":1,"a":2}"#).is_err());
+        // Numbers keep their text; digits inside strings are not numbers.
+        let document = Json::parse(br#"{"s\"-1":"a\"1e5\\","n":[2.50,-0E+1]}"#).unwrap();
+        assert_eq!(
+            document.render(),
+            "{\n  \"s\\\"-1\": \"a\\\"1e5\\\\\",\n  \"n\": [\n    2.50,\n    -0E+1\n  ]\n}"
+        );
+        assert!(Json::parse(b"1e400").is_err());
     }
 }
