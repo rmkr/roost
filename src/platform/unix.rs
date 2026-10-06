@@ -1,9 +1,10 @@
 use super::{Entry, FileIdentity, absolute, valid_name, validate_token};
 use crate::{Error, Result};
 use rustix::fs::{self, AtFlags, Mode, OFlags};
+use rustix::termios::{LocalModes, OptionalActions, SpecialCodeIndex};
 use std::fs::File;
 use std::io::{Read, Write};
-use std::os::fd::AsRawFd;
+use std::os::fd::{AsFd, AsRawFd, BorrowedFd};
 use std::os::unix::fs::MetadataExt;
 use std::path::{Component, Path, PathBuf};
 use std::sync::{
@@ -235,29 +236,34 @@ fn passwd_account(record: &libc::passwd) -> Option<Account> {
     })
 }
 
+/// Reads the effective user's passwd record through `getpwuid_r`.
+fn current_passwd<T>(read: impl Fn(&libc::passwd) -> T) -> Option<T> {
+    with_buffer(|buffer| {
+        let mut record = std::mem::MaybeUninit::<libc::passwd>::uninit();
+        let mut result = std::ptr::null_mut();
+        // getpwuid_r writes into caller-owned storage.
+        let code = unsafe {
+            libc::getpwuid_r(
+                libc::geteuid(),
+                record.as_mut_ptr(),
+                buffer.as_mut_ptr().cast(),
+                buffer.len(),
+                &mut result,
+            )
+        };
+        if code != 0 {
+            return Err(code);
+        }
+        if result.is_null() {
+            return Err(libc::ENOENT);
+        }
+        Ok(read(unsafe { record.assume_init_ref() }))
+    })
+}
+
 impl AccountDatabase for SystemAccounts {
     fn current_user(&self) -> Option<Account> {
-        with_buffer(|buffer| {
-            let mut record = std::mem::MaybeUninit::<libc::passwd>::uninit();
-            let mut result = std::ptr::null_mut();
-            // getpwuid_r writes into caller-owned storage.
-            let code = unsafe {
-                libc::getpwuid_r(
-                    libc::geteuid(),
-                    record.as_mut_ptr(),
-                    buffer.as_mut_ptr().cast(),
-                    buffer.len(),
-                    &mut result,
-                )
-            };
-            if code != 0 {
-                return Err(code);
-            }
-            if result.is_null() {
-                return Err(libc::ENOENT);
-            }
-            passwd_account(unsafe { record.assume_init_ref() }).ok_or(libc::EINVAL)
-        })
+        current_passwd(passwd_account).flatten()
     }
 
     fn group_members(&self, gid: u32) -> Option<Vec<String>> {
@@ -723,33 +729,15 @@ pub fn home() -> Result<PathBuf> {
     if let Some(value) = std::env::var_os("HOME").filter(|v| !v.is_empty()) {
         return absolute(Path::new(&value));
     }
-    let mut buffer = vec![0_u8; 16384];
-    loop {
-        let mut record = std::mem::MaybeUninit::<libc::passwd>::uninit();
-        let mut result = std::ptr::null_mut();
-        // getpwuid_r writes into caller-owned storage; record pointers remain valid while buffer lives.
-        let code = unsafe {
-            libc::getpwuid_r(
-                libc::geteuid(),
-                record.as_mut_ptr(),
-                buffer.as_mut_ptr().cast(),
-                buffer.len(),
-                &mut result,
-            )
-        };
-        if code == libc::ERANGE && buffer.len() < 1048576 {
-            buffer.resize(buffer.len() * 2, 0);
-            continue;
-        }
-        if code != 0 || result.is_null() {
-            return Err(Error::new("io", "Cannot determine user home directory"));
-        }
-        let record = unsafe { record.assume_init() };
-        let text = unsafe { std::ffi::CStr::from_ptr(record.pw_dir) }
+    // pw_dir points into the lookup's buffer, which outlives the closure.
+    let dir = current_passwd(|r| {
+        unsafe { std::ffi::CStr::from_ptr(r.pw_dir) }
             .to_str()
-            .map_err(|_| Error::new("unsafe_path", "User home is not Unicode"))?;
-        return absolute(Path::new(text));
-    }
+            .map(str::to_owned)
+    })
+    .ok_or_else(|| Error::new("io", "Cannot determine user home directory"))?
+    .map_err(|_| Error::new("unsafe_path", "User home is not Unicode"))?;
+    absolute(Path::new(&dir))
 }
 
 static CANCELLED: AtomicBool = AtomicBool::new(false);
@@ -803,16 +791,34 @@ pub fn restore_for_exec() -> Result<()> {
     Ok(())
 }
 
-struct TerminalMode {
-    descriptor: libc::c_int,
-    original: libc::termios,
+/// The terminal's original mode, restored on drop.
+struct TerminalMode<'a> {
+    fd: BorrowedFd<'a>,
+    original: rustix::termios::Termios,
 }
-impl Drop for TerminalMode {
+impl Drop for TerminalMode<'_> {
     fn drop(&mut self) {
-        unsafe {
-            libc::tcsetattr(self.descriptor, libc::TCSANOW, &self.original);
-        }
+        let _ = rustix::termios::tcsetattr(self.fd, OptionalActions::Now, &self.original);
     }
+}
+
+/// Switches `fd` to byte-at-a-time input without echo (and without `extra` local
+/// modes), keeping ISIG so Ctrl-C still raises SIGINT for the cancel handler.
+/// `failure` is the error message when the mode cannot be set.
+fn raw_mode<'a>(
+    fd: BorrowedFd<'a>,
+    extra: LocalModes,
+    failure: &'static str,
+) -> Result<TerminalMode<'a>> {
+    let original = rustix::termios::tcgetattr(fd)
+        .map_err(|_| Error::new("io", "Cannot inspect terminal mode"))?;
+    let mut raw = original.clone();
+    raw.local_modes &= !(LocalModes::ECHO | LocalModes::ICANON | extra);
+    raw.special_codes[SpecialCodeIndex::VMIN] = 1;
+    raw.special_codes[SpecialCodeIndex::VTIME] = 0;
+    rustix::termios::tcsetattr(fd, OptionalActions::Now, &raw)
+        .map_err(|_| Error::new("io", failure))?;
+    Ok(TerminalMode { fd, original })
 }
 
 fn terminal() -> Result<File> {
@@ -826,40 +832,14 @@ fn bounded_input(descriptor: libc::c_int, terminal: bool, limit: usize) -> Resul
         if cancelled() {
             return Err(Error::cancelled());
         }
-        let mut poll = libc::pollfd {
-            fd: descriptor,
-            events: libc::POLLIN,
-            revents: 0,
-        };
-        let ready = unsafe { libc::poll(&mut poll, 1, 100) };
-        if ready < 0 {
-            if std::io::Error::last_os_error().kind() == std::io::ErrorKind::Interrupted {
-                continue;
-            }
-            return Err(Error::new("io", "Cannot wait for input"));
-        }
-        if ready == 0 {
+        let Some(chunk) = read_ready(descriptor, 100, limit + 1 - bytes.len())? else {
             continue;
-        }
-        let mut buffer = [0_u8; 512];
-        let count = unsafe {
-            libc::read(
-                descriptor,
-                buffer.as_mut_ptr().cast(),
-                buffer.len().min(limit + 1 - bytes.len()),
-            )
         };
-        if count < 0 {
-            if std::io::Error::last_os_error().kind() == std::io::ErrorKind::Interrupted {
-                continue;
-            }
-            return Err(Error::new("io", "Cannot read input"));
-        }
-        if count == 0 {
+        if chunk.is_empty() {
             break;
         }
         if terminal {
-            for byte in &buffer[..count as usize] {
+            for byte in &chunk {
                 if *byte == 4 {
                     return Ok(bytes);
                 }
@@ -877,7 +857,7 @@ fn bounded_input(descriptor: libc::c_int, terminal: bool, limit: usize) -> Resul
                 }
             }
         } else {
-            bytes.extend_from_slice(&buffer[..count as usize]);
+            bytes.extend_from_slice(&chunk);
         }
         if bytes.len() > limit {
             return Err(Error::new("invalid_token", "Input exceeds supported size"));
@@ -896,30 +876,19 @@ pub fn token_input(stdin: bool) -> Result<String> {
     if stdin {
         return validate_token(&bounded_input(libc::STDIN_FILENO, false, 65536)?);
     }
-    let mut tty = terminal()?;
-    let descriptor = tty.as_raw_fd();
-    let mut mode = std::mem::MaybeUninit::<libc::termios>::uninit();
-    if unsafe { libc::tcgetattr(descriptor, mode.as_mut_ptr()) } != 0 {
-        return Err(Error::new("io", "Cannot inspect terminal mode"));
-    }
-    let original = unsafe { mode.assume_init() };
-    let mut hidden = original;
+    let tty = terminal()?;
     // Noncanonical input avoids the kernel's much smaller canonical-line ceiling.
-    hidden.c_lflag &= !(libc::ECHO | libc::ECHONL | libc::ICANON);
-    hidden.c_cc[libc::VMIN] = 1;
-    hidden.c_cc[libc::VTIME] = 0;
-    if unsafe { libc::tcsetattr(descriptor, libc::TCSANOW, &hidden) } != 0 {
-        return Err(Error::new("io", "Cannot disable terminal echo"));
-    }
-    let guard = TerminalMode {
-        descriptor,
-        original,
-    };
-    tty.write_all(b"Token: ")
+    let guard = raw_mode(
+        tty.as_fd(),
+        LocalModes::ECHONL,
+        "Cannot disable terminal echo",
+    )?;
+    (&tty)
+        .write_all(b"Token: ")
         .map_err(|_| Error::new("io", "Cannot write terminal prompt"))?;
-    let bytes = bounded_input(descriptor, true, 65536);
+    let bytes = bounded_input(tty.as_raw_fd(), true, 65536);
     drop(guard);
-    let _ = tty.write_all(b"\n");
+    let _ = (&tty).write_all(b"\n");
     let bytes = bytes?;
     if bytes.is_empty() {
         return Err(Error::cancelled());
@@ -1015,9 +984,13 @@ fn decode_key(bytes: &[u8]) -> Option<(Key, usize)> {
     })
 }
 
-/// Waits up to `timeout` milliseconds for input on `descriptor`; `None` on timeout,
-/// an empty vector at EOF.
-fn read_ready(descriptor: libc::c_int, timeout: libc::c_int) -> Result<Option<Vec<u8>>> {
+/// Waits up to `timeout` milliseconds for at most `max` (up to 512) bytes of input
+/// on `descriptor`; `None` on timeout or interruption, an empty vector at EOF.
+fn read_ready(
+    descriptor: libc::c_int,
+    timeout: libc::c_int,
+    max: usize,
+) -> Result<Option<Vec<u8>>> {
     let mut poll = libc::pollfd {
         fd: descriptor,
         events: libc::POLLIN,
@@ -1033,8 +1006,8 @@ fn read_ready(descriptor: libc::c_int, timeout: libc::c_int) -> Result<Option<Ve
     if ready == 0 {
         return Ok(None);
     }
-    let mut buffer = [0_u8; 64];
-    let count = unsafe { libc::read(descriptor, buffer.as_mut_ptr().cast(), buffer.len()) };
+    let mut buffer = [0_u8; 512];
+    let count = unsafe { libc::read(descriptor, buffer.as_mut_ptr().cast(), max.min(512)) };
     if count < 0 {
         if std::io::Error::last_os_error().kind() == std::io::ErrorKind::Interrupted {
             return Ok(None);
@@ -1073,20 +1046,11 @@ fn picker_frame(
     text
 }
 
-/// Single-choice picker on stderr reading keys from the terminal on stdin. Up/Down
-/// or k/j move, Enter chooses; Ctrl-C, Esc, `q` or EOF cancel (exit 130). The
+/// Single-choice picker on stderr reading keys from the terminal on stdin, with
+/// `hint` after the title. Up/Down or k/j move, Enter chooses; Ctrl-C, Esc, `q` or
+/// EOF cancel (exit 130). Pressing one of the `actions` keys ends the picker like a
+/// choice, with the highlighted row, so the caller can act and show it again. The
 /// terminal mode is restored and the list erased on every exit.
-pub fn pick(title: &str, header: &str, rows: &[String], initial: usize) -> Result<usize> {
-    match pick_with(title, "↑/↓, Enter; Esc cancels", header, rows, initial, &[])? {
-        super::Picked::Chosen(index) => Ok(index),
-        super::Picked::Action(..) => unreachable!("no action keys"),
-    }
-}
-
-/// `pick` with a custom `hint` after the title and extra `actions` keys: pressing
-/// one ends the picker (restoring the terminal and erasing the list, like a
-/// choice) with that key and the highlighted row, so the caller can act and show
-/// the picker again.
 pub fn pick_with(
     title: &str,
     hint: &str,
@@ -1102,23 +1066,12 @@ pub fn pick_with(
         return Err(Error::cancelled());
     }
     let descriptor = libc::STDIN_FILENO;
-    let mut mode = std::mem::MaybeUninit::<libc::termios>::uninit();
-    if unsafe { libc::tcgetattr(descriptor, mode.as_mut_ptr()) } != 0 {
-        return Err(Error::new("io", "Cannot inspect terminal mode"));
-    }
-    let original = unsafe { mode.assume_init() };
-    let mut raw = original;
-    // Keep ISIG so Ctrl-C still raises SIGINT and reaches the cancel handler.
-    raw.c_lflag &= !(libc::ECHO | libc::ICANON);
-    raw.c_cc[libc::VMIN] = 1;
-    raw.c_cc[libc::VTIME] = 0;
-    if unsafe { libc::tcsetattr(descriptor, libc::TCSANOW, &raw) } != 0 {
-        return Err(Error::new("io", "Cannot switch terminal mode"));
-    }
-    let guard = TerminalMode {
-        descriptor,
-        original,
-    };
+    let stdin = std::io::stdin();
+    let guard = raw_mode(
+        stdin.as_fd(),
+        LocalModes::empty(),
+        "Cannot switch terminal mode",
+    )?;
     let mut out = std::io::stderr();
     let height = rows.len() + 2;
     let draw =
@@ -1133,7 +1086,7 @@ pub fn pick_with(
         }
         // A lone ESC waits briefly for the rest of an arrow-key sequence.
         let timeout = if pending.is_empty() { 100 } else { 50 };
-        match read_ready(descriptor, timeout) {
+        match read_ready(descriptor, timeout, 64) {
             Err(e) => break Err(e),
             Ok(Some(bytes)) if bytes.is_empty() => break Err(Error::cancelled()),
             Ok(Some(bytes)) => pending.extend(bytes),
@@ -1150,7 +1103,7 @@ pub fn pick_with(
                 Key::Choose => chosen = Some(Ok(super::Picked::Chosen(current))),
                 Key::Cancel => chosen = Some(Err(Error::cancelled())),
                 Key::Letter(letter) if actions.contains(&letter) => {
-                    chosen = Some(Ok(super::Picked::Action(letter, current)));
+                    chosen = Some(Ok(super::Picked::Action(current)));
                 }
                 Key::Letter(_) | Key::Other => (),
             }

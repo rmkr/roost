@@ -34,8 +34,6 @@ const STATUS_LINE: &str = "statusLine";
 const OUTPUT_STYLE: &str = "outputStyle";
 /// Keys a fragment may set.
 const ALLOWED: [&str; 3] = [HOOKS, STATUS_LINE, OUTPUT_STYLE];
-/// Single-value keys, in [`Fragment::singles`] order.
-const SINGLE_KEYS: [&str; 2] = [STATUS_LINE, OUTPUT_STYLE];
 
 /// A JSON value whose objects keep their key order and whose numbers keep their
 /// exact text; duplicate keys are refused.
@@ -289,8 +287,8 @@ impl Hook {
 #[derive(Debug, Default)]
 struct Fragment {
     hooks: Vec<Hook>,
-    /// Values of [`SINGLE_KEYS`], by position.
-    singles: [Option<Json>; 2],
+    status_line: Option<Json>,
+    output_style: Option<Json>,
 }
 
 /// The non-empty string `type` of an object (hook handler or `statusLine`).
@@ -311,10 +309,7 @@ fn parse_fragment(bytes: &[u8]) -> std::result::Result<Fragment, String> {
     let mut fragment = Fragment::default();
     for (key, value) in entries {
         match key.as_str() {
-            HOOKS => {
-                fragment.hooks = parse_hooks(&value)?;
-                continue;
-            }
+            HOOKS => fragment.hooks = parse_hooks(&value)?,
             STATUS_LINE => {
                 let valid = type_of(&value).is_some_and(|t| {
                     t != "command" || value.get("command").and_then(Json::as_str).is_some()
@@ -325,11 +320,13 @@ fn parse_fragment(bytes: &[u8]) -> std::result::Result<Fragment, String> {
                             .into(),
                     );
                 }
+                fragment.status_line = Some(value);
             }
             OUTPUT_STYLE => {
                 if !value.as_str().is_some_and(|s| !s.is_empty()) {
                     return Err("outputStyle must be a non-empty string".into());
                 }
+                fragment.output_style = Some(value);
             }
             other => {
                 return Err(format!(
@@ -337,9 +334,6 @@ fn parse_fragment(bytes: &[u8]) -> std::result::Result<Fragment, String> {
                     ALLOWED.join(", ")
                 ));
             }
-        }
-        if let Some(index) = SINGLE_KEYS.iter().position(|k| *k == key) {
-            fragment.singles[index] = Some(value);
         }
     }
     Ok(fragment)
@@ -468,12 +462,14 @@ enum Single {
 /// Merged desired settings of a registration's subscribed fragments.
 struct Desired {
     hooks: Vec<Hook>,
-    /// Desired values of [`SINGLE_KEYS`], by position.
-    singles: [Single; 2],
+    status_line: Single,
+    output_style: Single,
 }
 impl Desired {
     fn is_empty(&self) -> bool {
-        self.hooks.is_empty() && self.singles.iter().all(|s| matches!(s, Single::Absent))
+        self.hooks.is_empty()
+            && matches!(self.status_line, Single::Absent)
+            && matches!(self.output_style, Single::Absent)
     }
 }
 
@@ -522,58 +518,66 @@ fn subscribed_fragments(
     found
 }
 
-/// Single-value keys set by more than one fragment: (position in
-/// [`SINGLE_KEYS`], message).
-fn single_conflicts(fragments: &[(PathBuf, Fragment)]) -> Vec<(usize, String)> {
-    let mut found = vec![];
-    for (index, key) in SINGLE_KEYS.iter().enumerate() {
-        let paths: Vec<String> = fragments
-            .iter()
-            .filter(|(_, f)| f.singles[index].is_some())
-            .map(|(p, _)| p.display().to_string())
-            .collect();
-        if paths.len() > 1 {
-            found.push((
-                index,
-                format!("{key} would come from {}", paths.join(" and ")),
-            ));
+/// The desired value of the single-value `key` (read by `get`), with a conflict
+/// message when more than one fragment sets it.
+fn single(
+    fragments: &[(PathBuf, Fragment)],
+    key: &str,
+    get: fn(&Fragment) -> &Option<Json>,
+) -> (Single, Option<String>) {
+    let set: Vec<&(PathBuf, Fragment)> =
+        fragments.iter().filter(|(_, f)| get(f).is_some()).collect();
+    match set.as_slice() {
+        [] => (Single::Absent, None),
+        [(_, f)] => (get(f).clone().map_or(Single::Absent, Single::Value), None),
+        many => {
+            let paths: Vec<String> = many.iter().map(|(p, _)| p.display().to_string()).collect();
+            (
+                Single::Conflict,
+                Some(format!("{key} would come from {}", paths.join(" and "))),
+            )
         }
     }
-    found
+}
+
+/// `statusLine` and `outputStyle`, in that order.
+fn singles(fragments: &[(PathBuf, Fragment)]) -> [(Single, Option<String>); 2] {
+    [
+        single(fragments, STATUS_LINE, |f| &f.status_line),
+        single(fragments, OUTPUT_STYLE, |f| &f.output_style),
+    ]
 }
 
 /// Subscribe-time conflicts: a single-value key set by two subscribed fragments.
 /// Invalid or vanished fragments contribute nothing.
 pub(crate) fn conflicts(items: &[(&str, &Item)]) -> Vec<String> {
     let fragments = subscribed_fragments(items, |_| ());
-    single_conflicts(&fragments)
+    singles(&fragments)
         .into_iter()
-        .map(|(_, message)| message)
+        .filter_map(|(_, message)| message)
         .collect()
 }
 
 fn desired(items: &[(&str, &Item)], warnings: &mut Vec<String>) -> Desired {
     let fragments = subscribed_fragments(items, |w| warnings.push(w));
-    let conflicting = single_conflicts(&fragments);
-    for (_, message) in &conflicting {
+    let [
+        (status_line, status_conflict),
+        (output_style, style_conflict),
+    ] = singles(&fragments);
+    for message in [status_conflict, style_conflict].into_iter().flatten() {
         warnings.push(format!("Skipped shared {message}"));
     }
-    let singles = std::array::from_fn(|index| {
-        if conflicting.iter().any(|(i, _)| *i == index) {
-            return Single::Conflict;
-        }
-        fragments
-            .iter()
-            .find_map(|(_, f)| f.singles[index].clone())
-            .map_or(Single::Absent, Single::Value)
-    });
     let mut hooks: Vec<Hook> = vec![];
     for hook in fragments.into_iter().flat_map(|(_, f)| f.hooks) {
         if !hooks.iter().any(|h| h.matches_record(&hook.record())) {
             hooks.push(hook);
         }
     }
-    Desired { hooks, singles }
+    Desired {
+        hooks,
+        status_line,
+        output_style,
+    }
 }
 
 fn group_matcher(group: &Json) -> Option<Option<&str>> {
@@ -712,20 +716,6 @@ fn apply_hooks(
 
 /// Reconciles one single-value key; returns its new record. The profile's own
 /// value wins: Roost replaces or removes only the value it recorded, unchanged.
-/// A record's value for the single-value key at `index` in [`SINGLE_KEYS`].
-fn single_slot(record: &SettingsRecord, index: usize) -> &Option<Value> {
-    match SINGLE_KEYS[index] {
-        STATUS_LINE => &record.status_line,
-        _ => &record.output_style,
-    }
-}
-fn single_slot_mut(record: &mut SettingsRecord, index: usize) -> &mut Option<Value> {
-    match SINGLE_KEYS[index] {
-        STATUS_LINE => &mut record.status_line,
-        _ => &mut record.output_style,
-    }
-}
-
 fn apply_single(
     settings: &mut Json,
     key: &str,
@@ -947,7 +937,7 @@ pub(crate) fn reconcile(store: &Store, registration: &Registration) -> Vec<Strin
         },
     };
     let mut document = original.clone();
-    let mut record = SettingsRecord {
+    let record = SettingsRecord {
         registration_id: id.clone(),
         hooks: apply_hooks(
             &mut document,
@@ -955,18 +945,21 @@ pub(crate) fn reconcile(store: &Store, registration: &Registration) -> Vec<Strin
             &recorded.hooks,
             &mut warnings,
         ),
-        status_line: None,
-        output_style: None,
-    };
-    for (index, (key, single)) in SINGLE_KEYS.iter().zip(&desired.singles).enumerate() {
-        *single_slot_mut(&mut record, index) = apply_single(
+        status_line: apply_single(
             &mut document,
-            key,
-            single,
-            single_slot(&recorded, index).as_ref(),
+            STATUS_LINE,
+            &desired.status_line,
+            recorded.status_line.as_ref(),
             &mut warnings,
-        );
-    }
+        ),
+        output_style: apply_single(
+            &mut document,
+            OUTPUT_STYLE,
+            &desired.output_style,
+            recorded.output_style.as_ref(),
+            &mut warnings,
+        ),
+    };
     let save = |record: &SettingsRecord| {
         store.update_state(|state| {
             state.settings.retain(|r| &r.registration_id != id);
@@ -1026,7 +1019,7 @@ pub(crate) fn reconcile(store: &Store, registration: &Registration) -> Vec<Strin
     warnings
 }
 
-#[cfg(all(test, unix))]
+#[cfg(test)]
 mod tests {
     use super::*;
     use std::{fs, os::unix::fs::PermissionsExt};

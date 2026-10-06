@@ -1,4 +1,6 @@
-# Local Markdown tracker
+# Local Markdown tracker (archive)
+
+New work is tracked in GitHub issues on `rmkr/roost`. This directory is a read-only archive; the conventions below describe how it was kept.
 
 Each effort has a `map.md` and numbered tickets in `issues/`. The [Rust port decision map](rust-port/map.md) is complete; its accepted handoff is the [Roost specification](rust-port/spec.md). The [workflow UX map](workflow-ux/map.md) is complete.
 

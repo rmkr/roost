@@ -63,8 +63,8 @@ pub struct Table<'a, R> {
     hidden: Vec<String>,
     width: Option<usize>,
 }
-impl<'a, R> Default for Table<'a, R> {
-    fn default() -> Self {
+impl<'a, R> Table<'a, R> {
+    pub fn new() -> Self {
         Self {
             marker: None,
             columns: Vec::new(),
@@ -72,11 +72,6 @@ impl<'a, R> Default for Table<'a, R> {
             hidden: Vec::new(),
             width: None,
         }
-    }
-}
-impl<'a, R> Table<'a, R> {
-    pub fn new() -> Self {
-        Self::default()
     }
     /// Adds an unlabeled leading marker column (for example `@`).
     pub fn marker(mut self, cell: impl Fn(&R) -> Cell + 'a) -> Self {
@@ -199,41 +194,32 @@ pub fn color_enabled(terminal: bool, no_color: Option<&OsStr>) -> bool {
     terminal && no_color.is_none_or(OsStr::is_empty)
 }
 
-/// Color decision for standard output in the current process.
-pub fn stdout_color() -> bool {
-    use std::io::IsTerminal;
+/// Color decision for a standard stream (stdout for output, stderr where the
+/// picker draws) in the current process.
+pub fn color_for(stream: &impl std::io::IsTerminal) -> bool {
     color_enabled(
-        std::io::stdout().is_terminal(),
+        stream.is_terminal(),
         std::env::var_os("NO_COLOR").as_deref(),
     )
 }
 
-/// Color decision for standard error (where the picker draws).
-pub fn stderr_color() -> bool {
-    use std::io::IsTerminal;
-    color_enabled(
-        std::io::stderr().is_terminal(),
-        std::env::var_os("NO_COLOR").as_deref(),
-    )
+/// Extra columns of the profile table.
+#[derive(Clone, Copy, PartialEq)]
+pub enum Columns {
+    Basic,
+    /// `ls --full`: the probed Login, Auth and Claude dir columns.
+    Full,
+    /// The `roost desktop` picker: a Desktop column from each record's `desktop`
+    /// value (`running`, `signed_in`, `plain` for a default alias, `shared` with
+    /// `desktop_shared_with` for an alias whose folder a profile borrows,
+    /// otherwise never launched).
+    Desktop,
 }
 
-/// The human `list` table over ProfileRecord values. Later columns append here.
-pub fn profiles(records: &[Value], full: bool, color: bool, width: Option<usize>) -> Vec<String> {
-    profile_table(records, full, false, color, width)
-}
-
-/// The `roost desktop` picker rows: the list table plus a Desktop column from each
-/// record's `desktop` value (`running`, `signed_in`, `plain` for a default alias,
-/// `shared` with `desktop_shared_with` for an alias whose folder a profile borrows,
-/// otherwise never launched).
-pub fn desktop_profiles(records: &[Value], color: bool) -> Vec<String> {
-    profile_table(records, false, true, color, None)
-}
-
-fn profile_table(
+/// The human `list` table over ProfileRecord values.
+pub fn profiles(
     records: &[Value],
-    full: bool,
-    desktop: bool,
+    columns: Columns,
     color: bool,
     width: Option<usize>,
 ) -> Vec<String> {
@@ -287,7 +273,7 @@ fn profile_table(
                 None => Cell::new("never", Style::Dim),
             }
         });
-    if desktop {
+    if columns == Columns::Desktop {
         table = table.column("Desktop", |r: &Value| match r["desktop"].as_str() {
             Some("running") => Cell::new("running", Style::Green),
             Some("signed_in") => Cell::plain("signed in"),
@@ -299,7 +285,7 @@ fn profile_table(
             _ => Cell::new("—", Style::Dim),
         });
     }
-    if full {
+    if columns == Columns::Full {
         table = table
             .column("Login", |r: &Value| {
                 probe_cell(r, |p| match p["reported_logged_in"].as_bool()? {

@@ -15,7 +15,7 @@ use std::{
 };
 
 const PROBE_LIMIT: usize = 1024 * 1024;
-const PROBE_TIMEOUT: Duration = Duration::from_secs(10);
+pub(crate) const PROBE_TIMEOUT: Duration = Duration::from_secs(10);
 const AUTH_ENV: &[&str] = &[
     "ANTHROPIC_API_KEY",
     "ANTHROPIC_AUTH_TOKEN",
@@ -76,20 +76,6 @@ fn fixed_path(path: &Path) -> Result<&str> {
 fn quoted_sh(value: &str) -> String {
     format!("'{}'", value.replace('\'', "'\\''"))
 }
-#[cfg(windows)]
-fn quoted_ps(value: &str) -> String {
-    format!("'{}'", value.replace('\'', "''"))
-}
-#[cfg(windows)]
-fn quoted_cmd(value: &str) -> Result<String> {
-    if value.contains('"') {
-        return Err(Error::new(
-            "unsafe_path",
-            "Windows launcher binding contains a quote",
-        ));
-    }
-    Ok(format!("\"{}\"", value.replace('%', "%%")))
-}
 
 pub fn templates(
     root: &Path,
@@ -125,13 +111,9 @@ pub fn templates(
         &registration.registration_id,
         "--",
     ];
-    #[cfg(windows)]
-    let sh_executable = executable.replace('\\', "/");
-    #[cfg(not(windows))]
-    let sh_executable = executable.to_owned();
     let sh = format!(
         "#!/bin/sh\nexec {} {} \"$@\"\n",
-        quoted_sh(&sh_executable),
+        quoted_sh(executable),
         operands
             .iter()
             .map(|s| quoted_sh(s))
@@ -141,33 +123,7 @@ pub fn templates(
     let stem = root
         .join("bin")
         .join(format!("roost-{}", registration.name));
-    #[allow(unused_mut)]
-    let mut result = vec![(stem.clone(), sh.into_bytes())];
-    #[cfg(windows)]
-    {
-        let cmd = format!(
-            "@echo off\r\nsetlocal DisableDelayedExpansion\r\n{} {} %*\r\nendlocal & exit /b %errorlevel%\r\n",
-            quoted_cmd(executable)?,
-            operands
-                .iter()
-                .map(|s| quoted_cmd(s))
-                .collect::<Result<Vec<_>>>()?
-                .join(" ")
-        );
-        result.push((stem.with_extension("cmd"), cmd.into_bytes()));
-        let fixed = operands
-            .iter()
-            .map(|s| quoted_ps(s))
-            .collect::<Vec<_>>()
-            .join(", ");
-        let ps = format!(
-            "\u{feff}# Roost bound launcher format 1\r\n$ErrorActionPreference = 'Stop'\r\nfunction Quote-RoostArgument([string] $Value) {{\r\n    if ($Value.Length -gt 0 -and $Value -notmatch '[\\s\"]') {{ return $Value }}\r\n    $Out = New-Object System.Text.StringBuilder\r\n    [void] $Out.Append('\"')\r\n    $Slashes = 0\r\n    foreach ($Char in $Value.ToCharArray()) {{\r\n        if ($Char -eq '\\') {{ $Slashes++; continue }}\r\n        if ($Char -eq '\"') {{\r\n            [void] $Out.Append(('\\' * (2 * $Slashes + 1)))\r\n        }} else {{ [void] $Out.Append(('\\' * $Slashes)) }}\r\n        [void] $Out.Append($Char)\r\n        $Slashes = 0\r\n    }}\r\n    [void] $Out.Append(('\\' * (2 * $Slashes)))\r\n    [void] $Out.Append('\"')\r\n    return $Out.ToString()\r\n}}\r\n$Start = New-Object System.Diagnostics.ProcessStartInfo\r\n$Start.FileName = {}\r\n$Start.UseShellExecute = $false\r\n$Tail = @({}) + @($args)\r\nif ($null -ne $Start.PSObject.Properties['ArgumentList']) {{\r\n    foreach ($Value in $Tail) {{ [void] $Start.ArgumentList.Add([string] $Value) }}\r\n}} else {{\r\n    $Start.Arguments = (($Tail | ForEach-Object {{ Quote-RoostArgument ([string] $_) }}) -join ' ')\r\n}}\r\n$Child = [System.Diagnostics.Process]::Start($Start)\r\ntry {{ $Child.WaitForExit(); $Result = $Child.ExitCode }} finally {{ $Child.Dispose() }}\r\nexit $Result\r\n",
-            quoted_ps(executable),
-            fixed
-        );
-        result.push((stem.with_extension("ps1"), ps.into_bytes()));
-    }
-    Ok(result)
+    Ok(vec![(stem, sh.into_bytes())])
 }
 
 fn auth_conflicts(mut lookup: impl FnMut(&str) -> Option<OsString>) -> Vec<&'static str> {
@@ -234,16 +190,11 @@ impl ProfileEnv {
         self.set(name, value);
         Ok(())
     }
-    /// Applies the variables to `command`, consuming any token value.
-    pub fn apply(self, command: &mut Command) {
-        for (name, value) in self.vars {
-            command.env(name, value);
-        }
-    }
-    /// A command for `program` with this environment applied.
+    /// A command for `program` with this environment applied, consuming any token
+    /// value.
     pub fn command(self, program: PathBuf) -> Command {
         let mut command = Command::new(program);
-        self.apply(&mut command);
+        command.envs(self.vars);
         command
     }
 }
@@ -281,34 +232,26 @@ pub fn profile_env(
             .next("Use roost reuse NAME before launching"));
     }
     store.validate(registration)?;
-    if registration.kind != Kind::DefaultAlias && !allow_auth_env {
+    if registration.kind == Kind::DefaultAlias {
+        return Ok(ProfileEnv::pass_through());
+    }
+    if !allow_auth_env {
         let conflicts = auth_conflicts(|name| env::var_os(name));
         if !conflicts.is_empty() {
             return Err(Error::new("auth_conflict", format!("Inherited authentication controls: {}", conflicts.join(", "))).next("Use direct roost run/status --allow-auth-env to accept caller authentication precedence"));
         }
     }
     // Even override validates token protection, but never reads unused secret bytes.
-    let token = if registration.kind != Kind::DefaultAlias {
-        let present = store.token_present(registration)?;
-        if present && !allow_auth_env {
-            store.token(registration)?
-        } else {
-            None
-        }
+    let token = if store.token_present(registration)? && !allow_auth_env {
+        store.token(registration)?
     } else {
         None
     };
-    if registration.kind == Kind::DefaultAlias {
-        return Ok(ProfileEnv::pass_through());
-    }
     let directory = registration
         .directory
         .as_ref()
         .ok_or_else(|| Error::new("ownership", "Isolated profile has no directory"))?;
-    Ok(ProfileEnv::isolated(
-        directory,
-        token.filter(|_| !allow_auth_env),
-    ))
+    Ok(ProfileEnv::isolated(directory, token))
 }
 
 /// Constructs the profile's Claude command only: callers must release the Store
@@ -323,7 +266,7 @@ pub fn prepare(
 }
 
 /// Resolves `name` through the caller's PATH like a shell would (Unix: first
-/// executable regular file; Windows: PATHEXT search requiring a native `.exe`).
+/// executable regular file).
 pub fn resolve_program(name: &str) -> Result<PathBuf> {
     resolve_in(name, env::var_os("PATH"))
 }
@@ -331,41 +274,19 @@ pub fn resolve_program(name: &str) -> Result<PathBuf> {
 fn resolve_in(name: &str, path: Option<OsString>) -> Result<PathBuf> {
     let path = path
         .ok_or_else(|| Error::new("claude_unavailable", format!("PATH does not select {name}")))?;
-    #[cfg(unix)]
-    {
-        for directory in env::split_paths(&path) {
-            let candidate = platform::absolute(&directory.join(name))?;
-            if let Ok(metadata) = candidate.metadata()
-                && metadata.is_file()
-                && rustix::fs::accessat(
-                    rustix::fs::CWD,
-                    &candidate,
-                    rustix::fs::Access::EXEC_OK,
-                    rustix::fs::AtFlags::EACCESS,
-                )
-                .is_ok()
-            {
-                return Ok(candidate);
-            }
-        }
-    }
-    #[cfg(windows)]
-    {
-        let extensions =
-            env::var_os("PATHEXT").unwrap_or_else(|| OsString::from(".COM;.EXE;.BAT;.CMD"));
-        let extensions = extensions
-            .to_str()
-            .ok_or_else(|| Error::new("claude_unavailable", "PATHEXT is not Unicode"))?;
-        for directory in env::split_paths(&path) {
-            for extension in extensions.split(';').filter(|s| !s.is_empty()) {
-                let candidate = platform::absolute(&directory.join(format!("{name}{extension}")))?;
-                if candidate.is_file() {
-                    if !extension.eq_ignore_ascii_case(".exe") {
-                        return Err(Error::new("claude_unsupported", format!("PATH-selected {name} is not a native {name}.exe")).next("Select a native installation first on PATH; batch shims are unsupported"));
-                    }
-                    return Ok(candidate);
-                }
-            }
+    for directory in env::split_paths(&path) {
+        let candidate = platform::absolute(&directory.join(name))?;
+        if let Ok(metadata) = candidate.metadata()
+            && metadata.is_file()
+            && rustix::fs::accessat(
+                rustix::fs::CWD,
+                &candidate,
+                rustix::fs::Access::EXEC_OK,
+                rustix::fs::AtFlags::EACCESS,
+            )
+            .is_ok()
+        {
+            return Ok(candidate);
         }
     }
     Err(Error::new(
@@ -379,12 +300,6 @@ fn resolve_in(name: &str, path: Option<OsString>) -> Result<PathBuf> {
     }))
 }
 
-struct Probe {
-    stdout: Vec<u8>,
-    exit: ExitStatus,
-}
-
-#[cfg(unix)]
 fn nonblocking(pipe: &impl std::os::fd::AsRawFd) -> io::Result<()> {
     // SAFETY: the live pipe owns this fd; fcntl does not retain the descriptor.
     let flags = unsafe { libc::fcntl(pipe.as_raw_fd(), libc::F_GETFL) };
@@ -395,12 +310,7 @@ fn nonblocking(pipe: &impl std::os::fd::AsRawFd) -> io::Result<()> {
     }
     Ok(())
 }
-#[cfg(windows)]
-fn nonblocking(_pipe: &impl std::os::windows::io::AsRawHandle) -> io::Result<()> {
-    Ok(())
-}
 
-#[cfg(unix)]
 fn read_ready(
     pipe: &mut (impl Read + std::os::fd::AsRawFd),
     bytes: &mut [u8],
@@ -415,47 +325,13 @@ fn read_ready(
         result => result.map(Some),
     }
 }
-#[cfg(windows)]
-fn read_ready(
-    pipe: &mut (impl Read + std::os::windows::io::AsRawHandle),
-    bytes: &mut [u8],
-) -> io::Result<Option<usize>> {
-    use windows_sys::Win32::{
-        Foundation::{ERROR_BROKEN_PIPE, GetLastError},
-        System::Pipes::PeekNamedPipe,
-    };
-    let mut available = 0u32;
-    // SAFETY: live pipe handle, valid out pointer, no retained references.
-    if unsafe {
-        PeekNamedPipe(
-            pipe.as_raw_handle(),
-            std::ptr::null_mut(),
-            0,
-            std::ptr::null_mut(),
-            &mut available,
-            std::ptr::null_mut(),
-        )
-    } == 0
-    {
-        return if unsafe { GetLastError() } == ERROR_BROKEN_PIPE {
-            Ok(Some(0))
-        } else {
-            Err(io::Error::last_os_error())
-        };
-    }
-    if available == 0 {
-        return Ok(None);
-    }
-    let count = bytes.len().min(available as usize);
-    pipe.read(&mut bytes[..count]).map(Some)
-}
 
 fn capture(
     mut command: Command,
     code: &'static str,
     timeout: Duration,
     limit: usize,
-) -> Result<Probe> {
+) -> Result<(Vec<u8>, ExitStatus)> {
     let deadline = Instant::now() + timeout;
     command
         .stdin(Stdio::null())
@@ -516,10 +392,7 @@ fn capture(
                 && stderr_done
                 && let Some(exit) = exit
             {
-                return Ok(Probe {
-                    stdout: output,
-                    exit,
-                });
+                return Ok((output, exit));
             }
             thread::sleep(Duration::from_millis(2));
         }
@@ -533,19 +406,13 @@ fn capture(
     result
 }
 
-pub(crate) fn bounded_probe(command: Command, code: &'static str) -> Result<(Vec<u8>, ExitStatus)> {
-    let probe = capture(command, code, PROBE_TIMEOUT, PROBE_LIMIT)?;
-    Ok((probe.stdout, probe.exit))
-}
-
-/// A captured probe with its own deadline (plugin auto-update); 1 MiB per stream.
-pub(crate) fn deadline_probe(
+/// A captured probe: stdout and exit status, within `timeout` and 1 MiB per stream.
+pub(crate) fn probe(
     command: Command,
     code: &'static str,
     timeout: Duration,
 ) -> Result<(Vec<u8>, ExitStatus)> {
-    let probe = capture(command, code, timeout, PROBE_LIMIT)?;
-    Ok((probe.stdout, probe.exit))
+    capture(command, code, timeout, PROBE_LIMIT)
 }
 
 fn parse_version(bytes: &[u8]) -> Option<String> {
@@ -571,14 +438,14 @@ fn version_at(path: &OsStr) -> Result<String> {
     // Deliberately starts from caller environment, never a profile command/token.
     let mut command = Command::new(path);
     command.arg("--version");
-    let probe = capture(command, "claude_unsupported", PROBE_TIMEOUT, PROBE_LIMIT)?;
-    if !probe.exit.success() {
+    let (stdout, exit) = probe(command, "claude_unsupported", PROBE_TIMEOUT)?;
+    if !exit.success() {
         return Err(Error::new(
             "claude_unsupported",
             "Claude version probe failed",
         ));
     }
-    parse_version(&probe.stdout).ok_or_else(|| {
+    parse_version(&stdout).ok_or_else(|| {
         Error::new(
             "claude_unsupported",
             "Claude version is unsupported or unrecognized",
@@ -599,25 +466,12 @@ pub fn execute(mut command: Command, arguments: &[OsString]) -> Result<i32> {
     }
     command.args(arguments);
     platform::restore_for_exec()?;
-    #[cfg(unix)]
-    {
-        use std::os::unix::process::CommandExt;
-        let _ = command.exec();
-        // A failed exec may already have changed process environment/stdio.
-        // No returning to manager mutation/state reuse after this boundary.
-        eprintln!("roost: io: Could not execute the selected Claude installation");
-        std::process::exit(1);
-    }
-    #[cfg(windows)]
-    {
-        let mut child = command
-            .spawn()
-            .map_err(|_| Error::new("io", "Could not execute the selected Claude installation"))?;
-        let status = child
-            .wait()
-            .map_err(|_| Error::new("io", "Could not wait for Claude"))?;
-        Ok(status.code().unwrap_or(1))
-    }
+    use std::os::unix::process::CommandExt;
+    let _ = command.exec();
+    // A failed exec may already have changed process environment/stdio.
+    // No returning to manager mutation/state reuse after this boundary.
+    eprintln!("roost: io: Could not execute the selected Claude installation");
+    std::process::exit(1);
 }
 pub fn update() -> Result<i32> {
     eprintln!("roost: updating the shared Claude installation");
@@ -680,10 +534,7 @@ fn recognized_status(
         warnings.push("Claude did not report a valid absolute configuration directory".to_owned());
     }
     let expected = if registration.kind == Kind::DefaultAlias {
-        match env::var_os("CLAUDE_CONFIG_DIR").filter(|value| !value.is_empty()) {
-            Some(value) => platform::absolute(Path::new(&value)).ok(),
-            None => platform::default_directory().ok(),
-        }
+        platform::claude_config_dir().ok()
     } else {
         registration.directory.clone()
     };
@@ -727,8 +578,8 @@ pub fn probe_all<K: Send>(
 pub fn status(mut command: Command, registration: &Registration) -> Result<Status> {
     version_at(command.get_program())?;
     command.args(["auth", "status"]);
-    let probe = capture(command, "auth_status", PROBE_TIMEOUT, PROBE_LIMIT)?;
-    recognized_status(&probe.stdout, probe.exit.code(), registration)
+    let (stdout, exit) = probe(command, "auth_status", PROBE_TIMEOUT)?;
+    recognized_status(&stdout, exit.code(), registration)
 }
 
 #[cfg(test)]
@@ -742,21 +593,13 @@ mod tests {
             name: "Work".to_owned(),
             kind: Kind::Owned,
             state: State::Active,
-            directory: Some(PathBuf::from(if cfg!(windows) {
-                "C:\\profiles\\Work"
-            } else {
-                "/profiles/Work"
-            })),
+            directory: Some(PathBuf::from("/profiles/Work")),
             directory_identity: None,
             profile_id: Some("c".repeat(32)),
             upstream_linked_default: false,
             launcher_binding: Some(LauncherBinding {
                 format_version: 1,
-                executable: PathBuf::from(if cfg!(windows) {
-                    "C:\\manager\\roost.exe"
-                } else {
-                    "/manager/roost"
-                }),
+                executable: PathBuf::from("/manager/roost"),
             }),
         }
     }
@@ -822,7 +665,7 @@ mod tests {
     #[test]
     fn path_lists_follow_a_nonempty_inherited_value() {
         let paths = [PathBuf::from("/a"), PathBuf::from("/b")];
-        let sep = if cfg!(windows) { ";" } else { ":" };
+        let sep = ":";
         assert_eq!(
             path_list(Some("/x".into()), &paths).unwrap(),
             OsString::from(format!("/x{sep}/a{sep}/b"))
@@ -835,7 +678,6 @@ mod tests {
         assert!(path_list(None, &[PathBuf::from(format!("/a{sep}b"))]).is_err());
     }
 
-    #[cfg(unix)]
     #[test]
     fn program_resolution_selects_the_first_executable_on_path() {
         use std::os::unix::fs::PermissionsExt;
@@ -966,7 +808,6 @@ mod tests {
         }
     }
 
-    #[cfg(unix)]
     #[test]
     fn posix_quotes_and_bound_transport_preserve_literal_tail() {
         let values = [
@@ -1018,14 +859,14 @@ mod tests {
         assert!(!script.contains("ROOST_DIR="));
     }
 
-    #[cfg(unix)]
     #[test]
     fn captured_probes_drain_both_streams_and_bound_failure() {
         let mut command = Command::new("sh");
         command.args(["-c", "i=0; while [ $i -lt 2000 ]; do printf 'stdout-0123456789'; printf 'stderr-0123456789' >&2; i=$((i+1)); done"]);
-        let probe = capture(command, "auth_status", Duration::from_secs(3), 100_000).unwrap();
-        assert!(probe.exit.success());
-        assert_eq!(probe.stdout.len(), 17 * 2000);
+        let (stdout, exit) =
+            capture(command, "auth_status", Duration::from_secs(3), 100_000).unwrap();
+        assert!(exit.success());
+        assert_eq!(stdout.len(), 17 * 2000);
         let mut command = Command::new("sh");
         command.args(["-c", "while :; do printf 'too-large-secret'; done"]);
         let error = capture(command, "auth_status", Duration::from_secs(2), 100)
