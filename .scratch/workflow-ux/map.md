@@ -31,6 +31,7 @@ Roost remembers which profile each project uses, shows profiles in a readable ta
 
 ## Not yet specified
 
+- `set add --skill` accepts a directory that does not exist, and launch-time reconciliation links a missing target instead of skipping it with a warning (found migrating `personal`, 2026-10-06).
 - Shared agents, commands and output-styles (linked like skills), and hooks/settings through a shared `--settings` file: agreed as later item kinds, not yet ticketed.
 
 ## Out of scope
