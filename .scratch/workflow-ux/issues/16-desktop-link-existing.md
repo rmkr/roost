@@ -2,7 +2,7 @@
 
 Type: task
 Labels: workflow-ux
-Status: claimed
+Status: resolved
 Assignee: Claude subagent ticket-16
 Parent: [Make Roost simpler to work with day to day](../map.md)
 Blocked by: none
@@ -22,3 +22,7 @@ User request 2026-10-06 (Q58–Q61): the user wants `roost desktop work` to use 
 ## Comments
 
 2026-10-06 (Claude subagent ticket-16): implemented on branch `ticket/16-desktop-link-existing`. `roost desktop --link NAME [--replace [--yes]]` / `--unlink NAME` (clap rules: NAME required; link/unlink/foreground mutually exclusive; replace requires link; yes requires replace). The link lives in `state.json` as optional `desktop_links: [{registration_id}]` (at most one; omitted while empty, so older files and older binaries stay compatible). Linked launches run plain `claude-desktop` with the profile environment and record last use/`desktop_launched`; no Roost folder is created. `--replace` deletes the own folder via a new journaled `desktop_delete` operation (recovery abandons, never continues, deletion). Linked row/alias row in the picker show the conventional folder's state / `shared with NAME`; both refuse while the shared instance runs. Remove/purge drop the link only; Q51 covers the borrowed folder; doctor skips linked registrations. Spec (synopsis, parse rules, journal ops, state schema, Desktop, remove/purge table, Q51, A18) and ADR 0002 amended. Choice for review: an unreadable `state.json` now fails owned/upstream Desktop launches (the link decides which sign-in is used) instead of warning and launching. Not resolved; awaiting review.
+
+## Answer
+
+2026-10-06: Merged into `workflow-ux` (eadc45d) and installed. `roost desktop --link NAME [--replace [--yes]]` / `--unlink NAME` let one owned or upstream profile borrow the conventional Desktop folder in place, recorded as an optional `desktop_links` field in `state.json` (old files still read). The user accepted all four implementation choices: an unreadable `state.json` fails Desktop launches rather than guessing; an interrupted `--replace` deletion reports once and the user repeats it; `--link` works before the conventional folder exists; link and unlink are allowed while Desktop runs, taking effect at the next launch.
