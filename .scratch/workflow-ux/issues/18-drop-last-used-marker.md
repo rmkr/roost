@@ -2,8 +2,8 @@
 
 Type: task
 Labels: workflow-ux
-Status: open
-Assignee: unassigned
+Status: claimed
+Assignee: Claude subagent ticket-18-19
 Parent: [Make Roost simpler to work with day to day](../map.md)
 Blocked by: none
 
