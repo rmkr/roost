@@ -94,3 +94,13 @@ The `personal` profile currently has 60 hand-made, unrecorded links in `skills/`
 ## Desktop: borrowing the existing data folder
 
 Added 2026-10-06. A profile can borrow the conventional Claude Desktop data folder in place (`roost desktop --link NAME`, undone with `--unlink`), so `roost desktop NAME` opens the already signed-in Desktop with that profile's configuration. Roost never copies, moves, repairs or deletes the borrowed folder; only one profile may borrow it, and the default alias then shares it. See [Let a profile borrow the existing Claude Desktop data folder](issues/16-desktop-link-existing.md).
+
+## Shared settings
+
+Agreed 2026-10-06 (Q65–Q77); see [ADR 0003](../../docs/adr/0003-shared-settings-written-into-owned-profiles.md).
+
+- **Settings fragments** are small JSON files, one per concern (for example `atuin.json`, `cbm.json`, `herdr.json`, `statusline.json`), in a directory the user manages such as `~/.agents/settings/`, carried by sets like instruction fragments. Allowed keys: `hooks`, `statusLine`, `outputStyle`; anything else is refused at `set add`. Hook scripts stay where they are.
+- At launch of an owned profile, Roost merges the subscribed fragments and reconciles them into the profile's own `settings.json`, writing only when the result differs from what it recorded. Owned profiles only; upstream and the default alias get nothing.
+- Hooks combine across fragments and with the profile's own hooks; an identical handler is not duplicated, and a Roost-added hook removed by hand is re-added. `statusLine`/`outputStyle`: two subscribed fragments setting the same key are refused at subscribe time; a profile's own value wins and Roost stops managing that key there.
+- Writes are atomic compare-and-replace that preserve all other keys and their order in Claude's 2-space JSON style; a concurrent change skips the update with a warning until the next launch. An invalid fragment is skipped with a warning.
+

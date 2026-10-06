@@ -42,11 +42,11 @@ Roost remembers which profile each project uses, shows profiles in a readable ta
 
 ## Not yet specified
 
-- How settings and hooks are shared (ticket 21 pending design).
+None in scope.
 
 ## Later
 
-- Shared hooks/settings (status line, hooks) through a shared `--settings` file: being designed in a grilling session (2026-10-06); becomes ticket 21 and the user-present migration ticket 22.
+- Shared settings for registered upstream profiles and the default alias (not possible without writing borrowed data; revisit only if a non-writing route appears).
 
 ## Out of scope
 
