@@ -21,6 +21,8 @@ const JOURNAL: &str = ".roost-operation.json";
 const LOCK: &str = ".roost-lock";
 const LIMIT: usize = 4 * 1024 * 1024;
 
+pub mod side;
+
 #[derive(Clone, Copy, Debug, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 pub enum Kind {
@@ -173,9 +175,23 @@ struct Intent {
 }
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum OpenMode {
+    /// Never recovers or mutates anything.
     Read,
     Mutate,
     RetryPurge,
+    /// Launch preparation: like Read (no recovery, no journaled mutation), but may
+    /// replace side files (`state.json`, `sets.json`) while no intent is pending.
+    #[allow(
+        dead_code,
+        reason = "launch-time state writes arrive with tickets 04/05/07/09"
+    )]
+    Launch,
+}
+impl OpenMode {
+    /// Whether this mode may run journaled mutations (and so create a root).
+    fn journaled(self) -> bool {
+        matches!(self, OpenMode::Mutate | OpenMode::RetryPurge)
+    }
 }
 pub struct Store {
     pub root: PathBuf,
@@ -392,11 +408,11 @@ impl Store {
         let name = file_name(&root)?;
         let directory = match parent.entry(name)? {
             Some(_) => parent.child(name, true)?,
-            None if create && mode != OpenMode::Read => parent.create_dir(name)?,
+            None if create && mode.journaled() => parent.create_dir(name)?,
             None => return Err(err("not_found", "Roost storage is not initialized")),
         };
         if directory.entry(MARKER)?.is_none() {
-            if !create || mode == OpenMode::Read {
+            if !create || !mode.journaled() {
                 return Err(err("ownership", "Storage has no Roost root marker"));
             }
             let entries = directory.entries()?;
@@ -435,7 +451,7 @@ impl Store {
             ));
         }
         let absent_registry = directory.entry(REGISTRY)?.is_none();
-        if absent_registry && mode == OpenMode::Read {
+        if absent_registry && !mode.journaled() {
             return Err(recovery("Root marker exists without a committed registry"));
         }
         // Interrupted bootstrap is recognizable only by its exact private root marker,
@@ -853,7 +869,7 @@ impl Store {
         Ok(())
     }
     fn mutation_ready(&self) -> Result<()> {
-        if self.mode == OpenMode::Read {
+        if !self.mode.journaled() {
             return Err(err("ownership", "Read-only store cannot mutate"));
         }
         self.check_root()?;
@@ -879,6 +895,7 @@ impl Store {
                 ".roost-stage",
             ]
             .contains(&name.as_str())
+                && !side::admitted(&self.directory, &name)?
             {
                 return Err(recovery(format!(
                     "Unjournaled root residue at {}",
@@ -2197,7 +2214,7 @@ impl Store {
         Ok((scope, r))
     }
     pub fn remove(&mut self, name: &str, purge: bool) -> Result<Vec<String>> {
-        if self.mode == OpenMode::Read {
+        if !self.mode.journaled() {
             return Err(err("ownership", "Read-only store cannot mutate"));
         }
         let (_, r) = self.preflight_remove(name, purge)?;
