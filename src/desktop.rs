@@ -623,9 +623,13 @@ mod linux {
         let Some(pid) = lock_pid(target, host) else {
             return false;
         };
-        // Signal 0 only checks that the process exists.
-        let exists = unsafe { libc::kill(pid, 0) } == 0;
-        exists || std::io::Error::last_os_error().raw_os_error() == Some(libc::EPERM)
+        // Signal 0 only checks that the process exists; EPERM means it exists
+        // under another user.
+        let pid = rustix::process::Pid::from_raw(pid).expect("positive");
+        matches!(
+            rustix::process::test_kill_process(pid),
+            Ok(()) | Err(rustix::io::Errno::PERM)
+        )
     }
 
     /// Whether process `pid` runs `program` (the resolved `claude-desktop`), comparing
@@ -690,8 +694,8 @@ mod linux {
         program: &Path,
         name: &str,
     ) -> Result<bool> {
+        use rustix::event::{PollFd, PollFlags, Timespec, poll};
         use rustix::process::{Pid, PidfdFlags, Signal, pidfd_open, pidfd_send_signal};
-        use std::os::fd::AsRawFd;
         let Some(pid) = lock_pid(target, host) else {
             return Ok(false);
         };
@@ -733,14 +737,14 @@ mod linux {
         let deadline = Instant::now() + CLOSE_WAIT;
         loop {
             // A pidfd becomes readable once its process exits.
-            let mut poll = libc::pollfd {
-                fd: pidfd.as_raw_fd(),
-                events: libc::POLLIN,
-                revents: 0,
-            };
+            // Any error, EINTR included, just retries until the deadline.
             let left = deadline.saturating_duration_since(Instant::now());
-            let ready = unsafe { libc::poll(&mut poll, 1, left.as_millis().min(100) as i32) };
-            if ready > 0 {
+            let timeout = Timespec {
+                tv_sec: 0,
+                tv_nsec: (left.as_millis().min(100) * 1_000_000) as _,
+            };
+            let ready = poll(&mut [PollFd::new(&pidfd, PollFlags::IN)], Some(&timeout));
+            if matches!(ready, Ok(n) if n > 0) {
                 return Ok(true);
             }
             if Instant::now() >= deadline {
