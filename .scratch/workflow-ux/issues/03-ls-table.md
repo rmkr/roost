@@ -2,7 +2,7 @@
 
 Type: task
 Labels: workflow-ux
-Status: claimed
+Status: resolved
 Assignee: Claude subagent ticket-03
 Parent: [Make Roost simpler to work with day to day](../map.md)
 Blocked by: 01, 10
@@ -14,3 +14,7 @@ Implement the table and `--full` from [design: roost ls](../design.md#roost-ls):
 ## Comments
 
 - 2026-10-06 (Claude subagent ticket-03): Implemented on branch `ticket/03-ls-table`. `ls` table columns Profile, Kind, Token (`✓`/`–`/`?`), Launchers (`ready` or worst required condition; `not_required` when none required); `--full` adds Login (`yes`/`no`), Auth, Claude dir (`—` not probed, `?` failed/unreported). Summary `○ N profiles · M upstream · hidden: Path[, …]`; `Table::width` hides columns from the right to fit `platform::stdout_width()` (terminal only; piped output keeps every column). `--full` prepares probes under the lock, drops the Store, then runs `launch::probe_all` in parallel threads; failures leave probe fields null with a `NAME: …` warning, exit 0. JSON: `data.project` and ProfileRecord `sets`/`last_used`/`selected`/`most_recent` are spec-shaped placeholders (`null`, `[]`, `false`) in `Store::profiles()` for 04/05 to fill; `probe` is null unless `--full`. For 04/05: add the marker via `.marker(...)` and Sets/Last used via `.column(...)` between Launchers and the `if full` block in `table::profiles`; append the `@`/`^` legend to the summary text. Not resolved: awaiting review.
+
+## Answer
+
+2026-10-06: Merged into `workflow-ux` at af9ca47. `ls` renders Profile/Kind/Token/Launchers with a summary line, terminal-width column hiding and color only on a terminal; `--full` adds Login/Auth/Claude dir from parallel bounded probes run after the lock is released. JSON carries every spec key, with placeholders for tickets 04 and 05.
