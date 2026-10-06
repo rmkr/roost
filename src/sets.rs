@@ -165,8 +165,7 @@ fn subscribed<'a>(sets: &'a SetsFile, registration_id: &str) -> Vec<&'a Item> {
         .collect()
 }
 
-/// Subscribed plugin IDs of a registration, deduplicated (injection, ticket 07).
-#[allow(dead_code, reason = "consumed by plugin injection (ticket 07)")]
+/// Subscribed plugin IDs of a registration, deduplicated (plugin injection).
 pub fn plugin_items(sets: &SetsFile, registration_id: &str) -> Vec<String> {
     let mut ids: Vec<String> = subscribed(sets, registration_id)
         .into_iter()
@@ -178,15 +177,14 @@ pub fn plugin_items(sets: &SetsFile, registration_id: &str) -> Vec<String> {
     ids
 }
 
-/// Whether a plugin ID is installed in the plugin store. The store arrives with
-/// ticket 07; until then nothing is installed.
-fn plugin_installed(_store: &Store, _id: &str) -> Result<bool> {
-    Ok(false)
+/// Whether a plugin ID is installed in the plugin store.
+fn plugin_installed(store: &Store, id: &str) -> Result<bool> {
+    crate::plugins::installed(store, id)
 }
 
 /// Conflicts a registration's subscriptions would have: link paths produced by two
 /// different targets (owned only), or one plugin name from two marketplaces.
-fn conflicts(sets: &SetsFile, registration: &Registration) -> Vec<String> {
+pub(crate) fn conflicts(sets: &SetsFile, registration: &Registration) -> Vec<String> {
     let items = subscribed(sets, &registration.registration_id);
     let mut found = vec![];
     if registration.kind == Kind::Owned {

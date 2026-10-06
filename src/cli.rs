@@ -118,6 +118,12 @@ pub enum Action {
         foreground: bool,
         name: String,
     },
+    /// Manage the shared plugin store and its plugins
+    #[command(disable_help_subcommand = true)]
+    Plugin {
+        #[command(subcommand)]
+        action: PluginAction,
+    },
     #[command(skip)]
     Version,
     #[command(skip)]
@@ -178,6 +184,57 @@ pub enum SetAction {
     },
 }
 
+/// `roost plugin ...` subcommands.
+#[derive(Subcommand, Debug)]
+pub enum PluginAction {
+    /// List store plugins known to Roost, their sets and the auto-update setting
+    List {
+        #[arg(long)]
+        json: bool,
+    },
+    /// Manage marketplaces known to the plugin store
+    #[command(disable_help_subcommand = true)]
+    Marketplace {
+        #[command(subcommand)]
+        action: MarketplaceAction,
+    },
+    /// Install a plugin into the store and add it to sets
+    Add {
+        #[arg(value_name = "PLUGIN[@MARKETPLACE]")]
+        plugin: String,
+        /// Add the plugin to this set (repeatable)
+        #[arg(long = "set", value_name = "SET", conflicts_with = "no_set")]
+        sets: Vec<String>,
+        /// Install without adding the plugin to any set
+        #[arg(long)]
+        no_set: bool,
+    },
+    /// Update one store plugin, or all of them
+    Update {
+        #[arg(value_name = "PLUGIN")]
+        plugin: Option<String>,
+    },
+    /// Turn the daily launch-time plugin update on or off
+    AutoUpdate {
+        #[arg(long, conflicts_with = "off", required_unless_present = "off")]
+        on: bool,
+        #[arg(long)]
+        off: bool,
+    },
+    /// Remove a plugin from every set, then uninstall it from the store
+    Remove {
+        #[arg(value_name = "PLUGIN")]
+        plugin: String,
+    },
+}
+
+/// `roost plugin marketplace ...` subcommands.
+#[derive(Subcommand, Debug)]
+pub enum MarketplaceAction {
+    /// Add a marketplace to the plugin store (passed to Claude unchanged)
+    Add { source: String },
+}
+
 /// Exactly one set item.
 #[derive(Args, Debug)]
 #[group(required = true, multiple = false)]
@@ -208,6 +265,9 @@ impl Action {
                 | Self::Doctor { json: true }
                 | Self::Set {
                     action: SetAction::List { json: true }
+                }
+                | Self::Plugin {
+                    action: PluginAction::List { json: true }
                 }
         )
     }

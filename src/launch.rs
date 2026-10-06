@@ -208,10 +208,6 @@ impl ProfileEnv {
         }
     }
     /// True for owned/upstream registrations; false for default aliases.
-    #[allow(
-        dead_code,
-        reason = "shared scaffold for plugin injection (07) and Desktop (09)"
-    )]
     pub fn is_isolated(&self) -> bool {
         self.isolated
     }
@@ -234,7 +230,6 @@ impl ProfileEnv {
     /// Sets `name` to the caller's nonempty inherited value followed by `paths`,
     /// joined with the platform path-list separator (for CLAUDE_CODE_PLUGIN_DIRS).
     /// No-op for aliases or an empty list.
-    #[allow(dead_code, reason = "shared scaffold for plugin injection (07)")]
     pub fn append_paths(&mut self, name: &'static str, paths: &[PathBuf]) -> Result<()> {
         if !self.isolated || paths.is_empty() {
             return Ok(());
@@ -492,7 +487,7 @@ fn capture(
             if Instant::now() >= deadline {
                 return Err(Error::new(
                     code,
-                    "Claude probe exceeded its 10-second deadline",
+                    "Claude probe exceeded its deadline",
                 ));
             }
             // Fairly service both pipes; neither stream waits for EOF on the other.
@@ -547,6 +542,16 @@ fn capture(
 
 pub(crate) fn bounded_probe(command: Command, code: &'static str) -> Result<(Vec<u8>, ExitStatus)> {
     let probe = capture(command, code, PROBE_TIMEOUT, PROBE_LIMIT)?;
+    Ok((probe.stdout, probe.exit))
+}
+
+/// A captured probe with its own deadline (plugin auto-update); 1 MiB per stream.
+pub(crate) fn deadline_probe(
+    command: Command,
+    code: &'static str,
+    timeout: Duration,
+) -> Result<(Vec<u8>, ExitStatus)> {
+    let probe = capture(command, code, timeout, PROBE_LIMIT)?;
     Ok((probe.stdout, probe.exit))
 }
 

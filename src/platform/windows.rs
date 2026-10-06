@@ -121,6 +121,9 @@ pub fn token_input(_: bool) -> Result<String> {
 pub fn stdout_width() -> Option<usize> {
     None
 }
+pub fn prompt_line(_: &str) -> Result<String> {
+    Err(unavailable())
+}
 pub fn confirm(_: &str, _: bool) -> Result<()> {
     Err(unavailable())
 }

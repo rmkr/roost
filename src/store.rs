@@ -22,6 +22,7 @@ const LOCK: &str = ".roost-lock";
 const LIMIT: usize = 4 * 1024 * 1024;
 
 mod desktop;
+mod plugin_store;
 pub mod side;
 
 #[derive(Clone, Copy, Debug, Serialize, Deserialize, PartialEq, Eq)]
@@ -95,6 +96,7 @@ enum Operation {
     TokenSet,
     TokenClear,
     DesktopCreate,
+    StoreCreate,
 }
 #[derive(Clone, Copy, Debug, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
@@ -114,6 +116,7 @@ enum Role {
     Marker,
     StagingDirectory,
     DesktopData,
+    Store,
 }
 #[derive(Clone, Copy, Debug, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
@@ -1280,6 +1283,7 @@ impl Store {
                 Ok(entry.is_file && entry.nlink == 1)
             }
             Role::DesktopData => self.desktop_matches(&parent, name, &entry, artifact.action),
+            Role::Store => self.store_matches(&parent, name, &entry),
             Role::Marker => {
                 let marker: ProfileMarker = read_record(&parent, name)?;
                 Ok(entry.is_file
@@ -1460,7 +1464,8 @@ impl Store {
             || (self.registry.generation != j.prior_generation
                 && self.registry.generation != j.next_generation)
             || j.registration_id.as_ref().is_some_and(|id| !valid_id(id))
-            || (j.operation != Operation::Initialize && j.registration_id.is_none())
+            || (!matches!(j.operation, Operation::Initialize | Operation::StoreCreate)
+                && j.registration_id.is_none())
         {
             return Err(recovery("Invalid operation journal header or generation"));
         }
@@ -1498,6 +1503,7 @@ impl Store {
             }
             Operation::DesktopCreate => registration
                 .is_some_and(|r| r.kind != Kind::DefaultAlias && r.state == State::Active),
+            Operation::StoreCreate => j.registration_id.is_none(),
         };
         if !mapping_valid {
             return Err(recovery(
@@ -1552,6 +1558,7 @@ impl Store {
                     Operation::Purge | Operation::Remove => a.action == Action::Delete,
                     _ => false,
                 },
+                Role::Store => j.operation == Operation::StoreCreate && a.action == Action::Create,
             };
             if !action_valid {
                 return Err(recovery("Artifact action conflicts with operation"));
@@ -1635,6 +1642,10 @@ impl Store {
                     self.validate_desktop_artifact(a, j.registration_id.as_ref())?;
                     None
                 }
+                Role::Store => {
+                    self.validate_store_artifact(a)?;
+                    None
+                }
             };
             if let Some(name) = name {
                 validate_name(&name).map_err(|_| recovery("Invalid profile name in journal"))?;
@@ -1672,7 +1683,7 @@ impl Store {
                             && s.launcher_form.is_none()
                             && s.registry_generation.is_some()
                     }
-                    Role::Token | Role::StagingDirectory | Role::DesktopData => {
+                    Role::Token | Role::StagingDirectory | Role::DesktopData | Role::Store => {
                         s.profile_id.is_none()
                             && s.launcher_binding.is_none()
                             && s.launcher_form.is_none()
@@ -1726,6 +1737,9 @@ impl Store {
         }
         if journal.operation == Operation::DesktopCreate {
             return self.recover_desktop_create();
+        }
+        if journal.operation == Operation::StoreCreate {
+            return self.recover_store_create();
         }
         let mut published = Vec::new();
         for (index, a) in journal.artifacts.iter().enumerate() {
@@ -1841,7 +1855,7 @@ impl Store {
                     self.commit(self.registry.clone(), &stage)
                 }
             }
-            Operation::Purge | Operation::DesktopCreate => unreachable!(),
+            Operation::Purge | Operation::DesktopCreate | Operation::StoreCreate => unreachable!(),
         }
     }
     fn rollback_refresh(&mut self) -> Result<()> {

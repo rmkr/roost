@@ -688,6 +688,21 @@ pub fn confirm(scope: &str, yes: bool) -> Result<()> {
     }
 }
 
+/// Shows `prompt` on the terminal and reads one line (at most 4 KiB) from it.
+/// No terminal is usage; Ctrl-C or EOF before any input is cancelled.
+pub fn prompt_line(prompt: &str) -> Result<String> {
+    let mut tty = terminal()?;
+    tty.write_all(prompt.as_bytes())
+        .map_err(|_| Error::new("io", "Cannot write terminal prompt"))?;
+    let bytes = bounded_input(tty.as_raw_fd(), true, 4096)?;
+    if bytes.is_empty() {
+        return Err(Error::cancelled());
+    }
+    String::from_utf8(bytes)
+        .map(|text| text.trim().to_owned())
+        .map_err(|_| Error::new("usage", "Terminal input is not valid UTF-8"))
+}
+
 mod path_setup;
 pub use path_setup::setup_path;
 

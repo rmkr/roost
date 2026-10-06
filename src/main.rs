@@ -2,6 +2,7 @@ mod cli;
 mod desktop;
 mod launch;
 mod platform;
+mod plugins;
 mod sets;
 mod store;
 mod table;
@@ -83,6 +84,9 @@ fn initial_data(action: &Action) -> Value {
         Action::Set {
             action: cli::SetAction::List { .. },
         } => json!({"sets":[]}),
+        Action::Plugin {
+            action: cli::PluginAction::List { .. },
+        } => json!({"auto_update":false,"last_auto_update":null,"plugins":[]}),
         Action::Doctor { .. } => {
             json!({"claude_path":null,"claude_version":null,"storage_directory":null,"launcher_directory":null,"path_member":null,"profiles":[],"findings":[]})
         }
@@ -526,6 +530,13 @@ fn dispatch(action: Action, data: &mut Value) -> Result<Outcome> {
             Ok(out)
         }
         Action::Set { action } => Ok(Outcome::lines(sets::command(action, data)?)),
+        Action::Plugin { action } => {
+            let (lines, warnings) = plugins::command(action, data)?;
+            Ok(Outcome {
+                warnings,
+                ..Outcome::lines(lines)
+            })
+        }
         Action::Token { name, stdin, clear } => {
             let root = platform::root()?;
             let selection = {
