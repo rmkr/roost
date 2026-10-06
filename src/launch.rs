@@ -700,6 +700,32 @@ fn recognized_status(
         exit_code: if logged_in { 0 } else { 3 },
     })
 }
+/// Runs independent status probes in parallel (each under the usual bounds),
+/// keeping each job's key and passing preparation failures through unchanged.
+/// Callers must have released the Store.
+pub fn probe_all<K: Send>(
+    jobs: Vec<(K, Result<(Command, Registration)>)>,
+) -> Vec<(K, Result<Status>)> {
+    std::thread::scope(|scope| {
+        let handles: Vec<_> = jobs
+            .into_iter()
+            .map(|(key, job)| {
+                scope.spawn(move || {
+                    let result = job.and_then(|(command, reg)| status(command, &reg));
+                    (key, result)
+                })
+            })
+            .collect();
+        handles
+            .into_iter()
+            .map(|handle| {
+                handle
+                    .join()
+                    .unwrap_or_else(|panic| std::panic::resume_unwind(panic))
+            })
+            .collect()
+    })
+}
 pub fn status(mut command: Command, registration: &Registration) -> Result<Status> {
     version_at(command.get_program())?;
     command.args(["auth", "status"]);

@@ -189,9 +189,9 @@ pub fn stdout_color() -> bool {
 }
 
 /// The human `list` table over ProfileRecord values. Later columns append here.
-pub fn profiles(records: &[Value], color: bool) -> Vec<String> {
+pub fn profiles(records: &[Value], full: bool, color: bool) -> Vec<String> {
     let upstream = records.iter().filter(|r| r["kind"] == "upstream").count();
-    Table::new()
+    let mut table = Table::new()
         .column("Profile", |r: &Value| {
             Cell::new(r["name"].as_str().unwrap_or("?"), Style::Bold)
         })
@@ -212,7 +212,23 @@ pub fn profiles(records: &[Value], color: bool) -> Vec<String> {
                 _ => Style::Red,
             };
             Cell::new(condition, style)
-        })
+        });
+    if full {
+        table = table
+            .column("Login", |r: &Value| {
+                probe_cell(r, |p| match p["reported_logged_in"].as_bool()? {
+                    true => Some(Cell::new("yes", Style::Green)),
+                    false => Some(Cell::new("no", Style::Yellow)),
+                })
+            })
+            .column("Auth", |r: &Value| {
+                probe_cell(r, |p| p["auth_method"].as_str().map(Cell::plain))
+            })
+            .column("Claude dir", |r: &Value| {
+                probe_cell(r, |p| p["config_directory"].as_str().map(Cell::plain))
+            });
+    }
+    table
         .hidden("Path")
         .summary(format!(
             "○ {} profile{} · {upstream} upstream",
@@ -220,6 +236,15 @@ pub fn profiles(records: &[Value], color: bool) -> Vec<String> {
             if records.len() == 1 { "" } else { "s" }
         ))
         .render(records, color)
+}
+
+/// A probed cell: `—` when the row is not probed (aliases, retained records),
+/// `?` when the probe failed or did not report the field.
+fn probe_cell(record: &Value, field: impl Fn(&Value) -> Option<Cell>) -> Cell {
+    match &record["probe"] {
+        Value::Null => Cell::new("—", Style::Dim),
+        probe => field(probe).unwrap_or_else(|| Cell::new("?", Style::Yellow)),
+    }
 }
 
 /// `ready` when every required launcher is ready, else the worst condition

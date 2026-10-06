@@ -234,6 +234,104 @@ fn json_list_records_carry_every_spec_key_without_probes_by_default() {
 }
 
 #[test]
+fn full_list_probes_isolated_active_rows_only() {
+    let f = Fixture::new();
+    f.add("Work");
+    f.add("Gone");
+    f.ok(&["remove", "Gone"]);
+    f.ok(&["add", "personal", "--link-default"]);
+    let work = f.root.join("profiles/Work");
+    let out = f.ok(&["list", "--full", "--retained", "--json"]);
+    assert!(
+        !String::from_utf8_lossy(&out.stdout).contains("fake-secret"),
+        "raw status leaked"
+    );
+    let value = parsed(&out);
+    let profiles = &value["data"]["profiles"];
+    assert_eq!(profiles[0]["name"], "Gone");
+    assert_eq!(profiles[0]["probe"], Value::Null);
+    assert_eq!(profiles[1]["name"], "personal");
+    assert_eq!(profiles[1]["probe"], Value::Null);
+    assert_eq!(
+        profiles[2]["probe"],
+        json!({"reported_logged_in":true,"auth_method":"claude.ai","config_directory":work.to_str().unwrap()})
+    );
+    assert_eq!(value["warnings"], json!([]));
+
+    let text = String::from_utf8(f.ok(&["ls", "--full"]).stdout).unwrap();
+    assert_eq!(
+        text.lines().collect::<Vec<_>>(),
+        [
+            "Profile   Kind           Token  Launchers  Login  Auth       Claude dir",
+            "personal  default_alias  –      ready      —      —          —",
+            &format!(
+                "Work      owned          –      ready      yes    claude.ai  {}",
+                work.display()
+            ),
+            "",
+            "○ 2 profiles · 0 upstream · hidden: Path",
+        ]
+    );
+}
+
+#[test]
+fn full_list_probe_failure_is_unknown_with_a_safe_warning() {
+    let f = Fixture::new();
+    f.add("Work");
+    let out = f
+        .command()
+        .args(["list", "--full", "--json"])
+        .env("FAKE_CLAUDE_MODE", "unknown")
+        .output()
+        .unwrap();
+    assert_eq!(out.status.code(), Some(0));
+    assert!(!String::from_utf8_lossy(&out.stdout).contains("fake-secret"));
+    let value = parsed(&out);
+    assert_eq!(
+        value["data"]["profiles"][0]["probe"],
+        json!({"reported_logged_in":null,"auth_method":null,"config_directory":null})
+    );
+    let warnings = value["warnings"].as_array().unwrap();
+    assert_eq!(warnings.len(), 1);
+    assert!(warnings[0].as_str().unwrap().contains("Work"), "{warnings:?}");
+
+    let out = f
+        .command()
+        .args(["ls", "--full"])
+        .env("FAKE_CLAUDE_MODE", "logout")
+        .output()
+        .unwrap();
+    assert_eq!(out.status.code(), Some(0));
+    let text = String::from_utf8(out.stdout).unwrap();
+    assert_eq!(
+        text.lines().nth(1).unwrap().split_whitespace().collect::<Vec<_>>()[4..6],
+        ["no", "none"]
+    );
+    let out = f
+        .command()
+        .args(["ls", "--full"])
+        .env("FAKE_CLAUDE_MODE", "malformed")
+        .output()
+        .unwrap();
+    assert_eq!(out.status.code(), Some(0));
+    let text = String::from_utf8(out.stdout).unwrap();
+    assert_eq!(
+        text.lines().nth(1).unwrap().split_whitespace().collect::<Vec<_>>()[4..],
+        ["?", "?", "?"]
+    );
+    let stderr = String::from_utf8(out.stderr).unwrap();
+    assert!(stderr.starts_with("warning: "), "{stderr}");
+    assert!(!stderr.contains("garbage"), "{stderr}");
+}
+
+#[test]
+fn full_is_accepted_only_by_list() {
+    let f = Fixture::new();
+    assert_eq!(f.run(&["status", "x", "--full"]).status.code(), Some(2));
+    assert_eq!(f.run(&["doctor", "--full"]).status.code(), Some(2));
+}
+
+#[test]
 fn lifecycle_retains_tokens_and_requires_explicit_reuse() {
     let f = Fixture::new();
     f.add("Work");

@@ -42,6 +42,9 @@ pub enum Action {
     List {
         #[arg(long)]
         retained: bool,
+        /// Add bounded status probes (login, auth method, Claude directory)
+        #[arg(long)]
+        full: bool,
         #[arg(long)]
         json: bool,
     },
