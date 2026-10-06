@@ -1,7 +1,7 @@
 # Make Roost simpler to work with day to day
 
 Labels: workflow-ux
-Status: open
+Status: resolved
 
 ## Destination
 
@@ -39,6 +39,7 @@ Roost remembers which profile each project uses, shows profiles in a readable ta
 - [Close a profile's Desktop from the picker or `--close`](issues/19-desktop-close.md): graceful, PID-verified close; no force-kill.
 - [Share agents, commands and output-styles through sets](issues/20-share-agents-commands-styles.md): three more linked item kinds.
 - [Share settings fragments by writing owned profiles' settings.json](issues/21-shared-settings.md): hooks, status line and output style shared through sets; Desktop sees them.
+- [Move the user's hooks and status line into core](issues/22-migrate-settings.md): 10 hooks and the status line shared via `core`, verified with `/hooks`; style files shared, style choice per profile.
 - [Investigate injected plugin behavior](issues/06-injected-plugin-behavior.md): injection works as ADR 0001 assumes (`name@inline`, per-profile opt-out, config and data per profile); inject `installPath` from the store's `installed_plugins.json` at every launch; no claude.ai org marketplaces in the store; ADR accepted.
 
 ## Not yet specified
