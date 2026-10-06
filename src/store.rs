@@ -185,8 +185,12 @@ pub enum OpenMode {
     Read,
     Mutate,
     RetryPurge,
-    /// Launch preparation: like Read (no recovery, no journaled mutation), but may
-    /// replace side files (`state.json`, `sets.json`) while no intent is pending.
+    /// Launch preparation: like Read (never recovers), but may replace side files
+    /// (`state.json`, `sets.json`) while no intent is pending. Its one journaled
+    /// mutation is `desktop_create`: the first `roost desktop` launch of a
+    /// registration creates its Desktop data folder (spec: first-use creation at
+    /// launch), through the same pending-intent and root checks as Mutate. No other
+    /// journaled operation is allowed, and a Launch open never creates a root.
     Launch,
 }
 impl OpenMode {
