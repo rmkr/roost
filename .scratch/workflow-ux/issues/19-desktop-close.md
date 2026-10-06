@@ -2,7 +2,7 @@
 
 Type: task
 Labels: workflow-ux
-Status: claimed
+Status: resolved
 Assignee: Claude subagent ticket-18-19
 Parent: [Make Roost simpler to work with day to day](../map.md)
 Blocked by: 18
@@ -20,3 +20,7 @@ User decisions 2026-10-06 (Q63, Q64):
 ## Comments
 
 - 2026-10-06 (Claude subagent ticket-18-19): Implemented on branch `ticket/18-19-marker-desktop-close` (commits 967de5f, 2a90d0b). `roost desktop --close NAME` (clap: requires NAME, conflicts with --foreground/--link/--unlink/--replace/--yes → usage). Lock chosen: own Roost folder, or the conventional folder for a linked registration or default alias. No live lock → success "Claude Desktop is not running for NAME". Otherwise (store dropped first) `pidfd_open(PID)` pins the process, then verification: `/proc/PID/exe` == canonical resolved `claude-desktop`, OR the resolved program is a `#!` script whose canonical interpreter == `/proc/PID/exe` and the kernel-inserted script argument in `/proc/PID/cmdline` (argv[1], or argv[2] with a shebang argument) canonicalizes to the program. This second form is exactly how the kernel runs a script, so the Python fake is verified honestly; the real `/usr/bin/claude-desktop` is a symlink to the ELF `/usr/lib/claude-desktop/claude-desktop`, matched by the first form. Failure → `ownership` ("…names process PID, which is not Claude Desktop…; nothing was signalled"). SIGTERM via `pidfd_send_signal` only; poll the pidfd up to 10 s → "Closed Claude Desktop for NAME"; timeout → `desktop_running` "still running after 10 seconds…", never SIGKILL. Picker: `platform::pick_with(title, hint, header, rows, initial, actions)` returns `Picked::{Chosen, Action(key,row)}`; `pick` wraps it unchanged for switch/bare (letters other than k/j/q still ignored). `select::choose_with(.., Some(Actions{hint, keys, initial}), ..)` returns `Choice::{Chosen, Action}`; `choose` unchanged for callers. Desktop picker loops: on `x` it re-reads the store (Read), revalidates the listed registration, closes or reports, prints the outcome above the list and re-shows on the same row. Hint is on the title line like other pickers: `(↑/↓, Enter launch, x close, Esc cancel)`. Spec Desktop section (picker + new Closing bullet) and A18 amended. Tests: fake handles SIGTERM (removes lock, exits), `FAKE_DESKTOP_TERM=ignore`, `FAKE_DESKTOP_SECONDS`; `pty_session` gained `WAIT:TEXT` steps. Not resolved: awaiting review.
+
+## Answer
+
+2026-10-06: Merged into `workflow-ux` (2a90d0b) and installed. `x` in the Desktop picker and `roost desktop --close NAME` send SIGTERM only to a pidfd-pinned PID verified as the PATH `claude-desktop` (binary via `/proc/PID/exe`, or a script via its interpreter's cmdline), wait up to 10 seconds, and never force-kill. The key hint sits on the picker title line like the other pickers; a failed PID check reports `ownership` and a timeout `desktop_running`.

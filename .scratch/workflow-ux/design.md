@@ -22,10 +22,10 @@ Worktrunk-style table, colored on a terminal and plain when piped; `--json` unch
 ```
   Profile   Kind      Token  Launchers  Sets          Last used
 @ personal  owned     ✓      ready      core,writing  2m
-^ work      owned     ✓      ready      core          3d
+  work      owned     ✓      ready      core          3d
   ccm-old   upstream  –      ready      —             never
 
-○ 3 profiles · 1 upstream · @ selected here · ^ last used · hidden: Path
+○ 3 profiles · 1 upstream · @ selected here · hidden: Path
 ```
 
 - Default `ls` stays metadata-only and fast.
