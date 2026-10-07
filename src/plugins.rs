@@ -914,6 +914,9 @@ pub fn command(action: PluginAction, data: &mut Value) -> Result<(Vec<String>, V
                 vec![],
             ))
         }
+        PluginAction::Marketplace {
+            action: MarketplaceAction::Remove { name },
+        } => remove_marketplace(&root, &name),
         PluginAction::Add {
             plugin,
             sets: named,
@@ -1300,6 +1303,43 @@ fn update(root: &Path, plugin: Option<&str>) -> Result<(Vec<String>, Vec<String>
             "Updated {}; profiles pick it up at their next launch",
             ids.join(", ")
         )],
+        warnings,
+    ))
+}
+
+/// Refuses while a set still names a plugin from the marketplace; Claude's
+/// remove may also uninstall the marketplace's plugins, so the record is refreshed.
+fn remove_marketplace(root: &Path, name: &str) -> Result<(Vec<String>, Vec<String>)> {
+    if !valid_part(name) {
+        return Err(Error::new("usage", format!("Invalid marketplace {name}")));
+    }
+    let mut used: Vec<String> = Store::open(root, true, OpenMode::Mutate)?
+        .read_sets()?
+        .sets
+        .iter()
+        .flat_map(|s| &s.items)
+        .filter(|i| {
+            i.kind == ItemKind::Plugin && i.value.split_once('@').map(|(_, m)| m) == Some(name)
+        })
+        .map(|i| i.value.clone())
+        .collect();
+    used.sort();
+    used.dedup();
+    if let Some(first) = used.first() {
+        return Err(Error::new(
+            "plugin_store",
+            format!("Sets still use plugins from {name}: {}", used.join(", ")),
+        )
+        .next(format!("Remove them first: roost plugin remove {first}")));
+    }
+    let session = Session::open(root)?;
+    session.run(
+        &["plugin", "marketplace", "remove", name],
+        &format!("roost plugin marketplace remove {name}"),
+    )?;
+    let warnings = session.refresh(Duration::from_secs(10))?.1;
+    Ok((
+        vec![format!("Removed marketplace {name} from the plugin store")],
         warnings,
     ))
 }
