@@ -12,3 +12,4 @@ status: accepted
 - Roost's own commands win a name clash: `doctor`, `plugin`, `update` and `rm` stay Roost's (`roost rm work` removes a profile, not a background session). Claude's versions are reachable with `--`.
 - `install`, `gateway` and `purge` are left out: `install` acts on the shared installation, `gateway` is niche, and `purge` is too easily confused with `roost remove --purge`.
 - A profile name is never accepted as the first word (`roost personal agents`); `roost run personal agents` and the generated `personal` launcher cover that.
+- These commands finish without showing a session, so Roost names the profile on stderr (`roost: using profile NAME`). A wrong selection would otherwise act silently, for example `roost auth logout` in the wrong repository.

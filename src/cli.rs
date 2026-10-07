@@ -428,7 +428,7 @@ fn parse_from(args: Vec<OsString>) -> std::result::Result<Action, clap::Error> {
 
 /// Claude subcommands `roost` forwards to the selected profile as if after `--`;
 /// why a fixed list, and which names are left out, is in docs/adr/0004.
-const CLAUDE_SUBCOMMANDS: [&str; 12] = [
+pub const CLAUDE_SUBCOMMANDS: [&str; 12] = [
     "agents",
     "attach",
     "auth",
