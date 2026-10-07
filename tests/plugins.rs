@@ -262,6 +262,32 @@ fn add_installs_records_and_injects_into_subscribed_profiles() {
         parsed(&out)["env"]["CLAUDE_CODE_PLUGIN_DIRS"],
         format!("/inherited/one:{}", s(&expected))
     );
+    // A launch nested in an earlier one replaces that launch's store entries.
+    let nested = |name: &str| {
+        let out = f
+            .command()
+            .env(
+                "CLAUDE_CODE_PLUGIN_DIRS",
+                format!(
+                    "/inherited/one:{}:{}",
+                    s(&f.cache("lint@tools", "v0")),
+                    s(&expected)
+                ),
+            )
+            .args(["run", name])
+            .output()
+            .unwrap();
+        parsed(&out)["env"]["CLAUDE_CODE_PLUGIN_DIRS"].clone()
+    };
+    assert_eq!(nested("Work"), format!("/inherited/one:{}", s(&expected)));
+    assert_eq!(nested("Other"), "/inherited/one");
+    let out = f
+        .command()
+        .env("CLAUDE_CODE_PLUGIN_DIRS", s(&expected))
+        .args(["run", "Other"])
+        .output()
+        .unwrap();
+    assert!(parsed(&out)["env"].get("CLAUDE_CODE_PLUGIN_DIRS").is_none());
     // The bound launcher injects too.
     let out = f.with_env(f.root.join("bin/roost-Work")).output().unwrap();
     assert_eq!(parsed(&out)["env"]["CLAUDE_CODE_PLUGIN_DIRS"], s(&expected));

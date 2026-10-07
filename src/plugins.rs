@@ -22,7 +22,7 @@ use crate::{
     sets,
     store::{
         Kind, OpenMode, Registration, State, Store,
-        side::{Item, ItemKind, SetsFile},
+        side::{Item, ItemKind, PLUGIN_STORE, SetsFile},
     },
     table::{Cell, Style, Table},
 };
@@ -575,6 +575,8 @@ fn prune(store: &Directory, record: &Record) -> Vec<String> {
 /// gets updated versions). Nothing here stops the launch; warnings go to stderr.
 pub struct LaunchPlugins {
     store: Option<Directory>,
+    /// `<root>/plugin-store`: inherited plugin dirs under it are an outer launch's.
+    owned: PathBuf,
     root_id: String,
     wanted: Vec<String>,
     update: bool,
@@ -587,6 +589,7 @@ pub struct LaunchPlugins {
 pub fn claim(store: &Store, registration: &Registration, env: &ProfileEnv) -> LaunchPlugins {
     let mut plugins = LaunchPlugins {
         store: None,
+        owned: store.root.join(PLUGIN_STORE),
         root_id: store.root_id.clone(),
         wanted: vec![],
         update: false,
@@ -632,8 +635,17 @@ impl LaunchPlugins {
         {
             warnings.extend(auto_update(directory, &self.root_id));
         }
-        if !self.wanted.is_empty() {
-            warnings.extend(inject(self.store.as_ref(), &self.root_id, self.wanted, env));
+        let paths = match self.wanted.is_empty() {
+            true => vec![],
+            false => inject(
+                self.store.as_ref(),
+                &self.root_id,
+                self.wanted,
+                &mut warnings,
+            ),
+        };
+        if let Err(error) = env.append_paths(PLUGIN_DIRS, &self.owned, &paths) {
+            warnings.push(format!("Skipped store plugins: {}", error.message));
         }
         for warning in warnings {
             eprintln!("warning: {warning}");
@@ -641,23 +653,24 @@ impl LaunchPlugins {
     }
 }
 
-/// Sets `CLAUDE_CODE_PLUGIN_DIRS` for the dependency closure of the `wanted`
-/// subscribed store plugins. Missing, orphaned or unsafe directories and duplicate
-/// manifest names are skipped with warnings; an unreadable record skips injection.
+/// The store directories for `CLAUDE_CODE_PLUGIN_DIRS`: the dependency closure of
+/// the `wanted` subscribed store plugins. Missing, orphaned or unsafe directories
+/// and duplicate manifest names are skipped with warnings; an unreadable record
+/// skips injection.
 fn inject(
     directory: Option<&Directory>,
     root_id: &str,
     wanted: Vec<String>,
-    env: &mut ProfileEnv,
-) -> Vec<String> {
-    let mut warnings = vec![];
+    warnings: &mut Vec<String>,
+) -> Vec<PathBuf> {
     let record = match directory.map(|d| read_record_in(d, root_id)).transpose() {
         Ok(record) => record.unwrap_or_else(|| Record::empty(root_id)),
         Err(error) => {
-            return vec![format!(
+            warnings.push(format!(
                 "Skipped store plugins: {}; launching without them",
                 error.message
-            )];
+            ));
+            return vec![];
         }
     };
     // Dependency closure, subscribed plugins first.
@@ -714,10 +727,7 @@ fn inject(
             )),
         }
     }
-    if let Err(error) = env.append_paths(PLUGIN_DIRS, &paths) {
-        warnings.push(format!("Skipped store plugins: {}", error.message));
-    }
-    warnings
+    paths
 }
 
 /// Under the held root lock, with auto-update on: when the daily update is due,
