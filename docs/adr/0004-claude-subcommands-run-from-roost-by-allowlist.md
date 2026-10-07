@@ -2,9 +2,9 @@
 status: accepted
 ---
 
-# Claude subcommands pass through by a fixed allowlist
+# Claude subcommands run from roost by a fixed allowlist
 
-`roost agents …` and the other subcommands in `PASSTHROUGH` (`src/cli.rs`) mean exactly `roost -- agents …`: they launch this project's selected profile, or open the picker when none is selected, with a full launch's side effects. Only a fixed list passes through. Forwarding every word Roost doesn't know was rejected because Claude reads an unknown word as a prompt, so a typo such as `roost lsit` would start an interactive session instead of failing.
+`roost agents …` and the other subcommands in `CLAUDE_SUBCOMMANDS` (`src/cli.rs`) mean exactly `roost -- agents …`: they launch this project's selected profile, or open the picker when none is selected, with a full launch's side effects. Only a fixed list is forwarded. Forwarding every word Roost doesn't know was rejected because Claude reads an unknown word as a prompt, so a typo such as `roost lsit` would start an interactive session instead of failing.
 
 ## Consequences
 

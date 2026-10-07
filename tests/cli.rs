@@ -1144,6 +1144,19 @@ fn switch_selects_per_project_and_bare_roost_launches_it() {
         probe["env"]["CLAUDE_CONFIG_DIR"],
         json!(f.root.join("profiles/Work").to_str().unwrap())
     );
+    // An allowlisted Claude subcommand launches the selection the same way.
+    let probe = launched(
+        &f.command()
+            .current_dir(&project)
+            .args(["agents", "--json"])
+            .output()
+            .unwrap(),
+    );
+    assert_eq!(probe["arguments"], json!(["agents", "--json"]));
+    assert_eq!(
+        probe["env"]["CLAUDE_CONFIG_DIR"],
+        json!(f.root.join("profiles/Work").to_str().unwrap())
+    );
     // Another directory has no selection and no terminal: usage, never a picker.
     let other = f.command().current_dir(&other).output().unwrap();
     assert_eq!(other.status.code(), Some(2));
