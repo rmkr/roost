@@ -1018,8 +1018,8 @@ fn read_ready(
     let mut readable: libc::fd_set = unsafe { std::mem::zeroed() };
     unsafe { libc::FD_SET(descriptor, &mut readable) };
     let mut wait = libc::timeval {
-        tv_sec: (timeout / 1000).into(),
-        tv_usec: ((timeout % 1000) * 1000).into(),
+        tv_sec: (timeout / 1000) as libc::time_t,
+        tv_usec: ((timeout % 1000) * 1000) as libc::suseconds_t,
     };
     let ready = unsafe {
         libc::select(
