@@ -16,6 +16,7 @@ Shared plugins are installed once into a Roost-owned plugin store by delegating 
 
 - Injected plugins appear as `name@inline` and Claude does not auto-update them; updates are `roost plugin update`, or an opt-in launch-time update at most once per day that warns and launches on failure.
 - The store has no account. Verified: marketplace add and install from GitHub succeed with no Claude credentials, using the user's own git credentials. Marketplaces hosted on claude.ai (organization libraries) cannot be added to the store: they need a signed-in claude.ai session (verified 2026-10-06); those plugins stay per account as `@synced`.
+- A launch keeps a caller's inherited `CLAUDE_CODE_PLUGIN_DIRS` entries first, except entries inside its own plugin store: those are an outer launch's injection (a launch from inside a Roost session), so they are replaced by this profile's store directories, and the variable is removed if nothing is left. This amends the archived spec's "caller's inherited value" rule (2026-10-07).
 - Requires Claude 2.1.280 or later; Roost's minimum supported version is raised to match.
 - Skills, by contrast, are linked per item into owned profiles from directories the user manages, because Claude documents symlinked skill directories and does not rewrite them.
 
