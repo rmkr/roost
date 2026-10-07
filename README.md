@@ -52,6 +52,7 @@ Each project remembers its selected profile. Inside a git repository the project
 ```sh
 roost                    # launch this project's selected profile
 roost -- --continue      # same, passing arguments to Claude
+roost agents             # same as roost -- agents
 roost switch             # pick a profile, remember it here, launch it
 roost switch work        # select work here and launch it
 roost switch --no-launch work
@@ -59,6 +60,8 @@ roost switch --forget
 ```
 
 Bare `roost` opens an arrow-key picker when the project has no selection, or its selected profile was removed. Up/Down or k/j move, Enter chooses, and Ctrl-C, Esc or `q` cancel (exit 130). The choice is remembered. Without a terminal there is no picker: bare `roost` fails and names `roost switch NAME` and `roost run NAME`. `roost run NAME` launches without changing the selection. A default alias can be selected too.
+
+These Claude subcommands can skip the `--`: `agents`, `attach`, `auth`, `auto-mode`, `import`, `kill`, `logs`, `mcp`, `respawn`, `setup-token`, `stop` and `ultrareview`, so `roost agents` runs `claude agents` with the selected profile, or picks one first. Claude's `doctor`, `plugin`, `update` and `rm` share a name with Roost commands and stay Roost's; reach them with `roost -- doctor` or `roost run NAME rm ID`.
 
 ## Listing profiles
 
