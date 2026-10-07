@@ -375,6 +375,8 @@ while time.monotonic()<deadline:
     except OSError:break
     if not chunk:break
     out+=chunk
+else:
+    os.kill(pid,9);raise RuntimeError('PTY deadline exceeded: '+out.decode(errors='replace'))
 _,status=os.waitpid(pid,0)
 print(json.dumps({'exit':os.waitstatus_to_exitcode(status),'output':out.decode(errors='replace')}))
 "#;
