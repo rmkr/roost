@@ -140,17 +140,18 @@ fn auth_conflicts(mut lookup: impl FnMut(&str) -> Option<OsString>) -> Vec<&'sta
 /// until `apply`/`command` consumes it.
 pub struct ProfileEnv {
     isolated: bool,
-    vars: Vec<(&'static str, OsString)>,
+    /// `None` removes an inherited variable.
+    vars: Vec<(&'static str, Option<OsString>)>,
 }
 impl ProfileEnv {
     fn isolated(directory: &Path, token: Option<String>) -> Self {
         let mut vars = vec![
-            ("CLAUDE_CONFIG_DIR", directory.as_os_str().to_owned()),
-            ("DISABLE_AUTOUPDATER", OsString::from("1")),
-            ("FORCE_AUTOUPDATE_PLUGINS", OsString::from("1")),
+            ("CLAUDE_CONFIG_DIR", Some(directory.as_os_str().to_owned())),
+            ("DISABLE_AUTOUPDATER", Some(OsString::from("1"))),
+            ("FORCE_AUTOUPDATE_PLUGINS", Some(OsString::from("1"))),
         ];
         if let Some(value) = token {
-            vars.push(("CLAUDE_CODE_OAUTH_TOKEN", OsString::from(value)));
+            vars.push(("CLAUDE_CODE_OAUTH_TOKEN", Some(OsString::from(value))));
         }
         Self {
             isolated: true,
@@ -167,44 +168,49 @@ impl ProfileEnv {
     pub fn is_isolated(&self) -> bool {
         self.isolated
     }
-    /// Sets (or overrides) one variable on an isolated launch; ignored for aliases,
-    /// whose caller environment always passes through unchanged.
-    pub fn set(&mut self, name: &'static str, value: impl Into<OsString>) {
-        if !self.isolated {
-            return;
-        }
-        let value = value.into();
-        match self.vars.iter_mut().find(|(key, _)| *key == name) {
-            Some(slot) => slot.1 = value,
-            None => self.vars.push((name, value)),
-        }
-    }
     /// Sets `name` to the caller's nonempty inherited value followed by `paths`,
     /// joined with the platform path-list separator (for CLAUDE_CODE_PLUGIN_DIRS).
-    /// No-op for aliases or an empty list.
-    pub fn append_paths(&mut self, name: &'static str, paths: &[PathBuf]) -> Result<()> {
-        if !self.isolated || paths.is_empty() {
+    /// Inherited entries under `owned` (an outer launch's injection from the same
+    /// store, recomputed here) are dropped, removing the variable if nothing is
+    /// left. No-op for aliases, or when there is nothing to drop or add.
+    pub fn append_paths(
+        &mut self,
+        name: &'static str,
+        owned: &Path,
+        paths: &[PathBuf],
+    ) -> Result<()> {
+        let inherited: Vec<PathBuf> = env::var_os(name)
+            .filter(|value| !value.is_empty())
+            .iter()
+            .flat_map(env::split_paths)
+            .collect();
+        if !self.isolated || paths.is_empty() && !inherited.iter().any(|p| p.starts_with(owned)) {
             return Ok(());
         }
-        let value = path_list(env::var_os(name), paths)?;
-        self.set(name, value);
+        let value = path_list(inherited, owned, paths)?;
+        self.vars
+            .push((name, Some(value).filter(|value| !value.is_empty())));
         Ok(())
     }
     /// A command for `program` with this environment applied, consuming any token
     /// value.
     pub fn command(self, program: PathBuf) -> Command {
         let mut command = Command::new(program);
-        command.envs(self.vars);
+        for (name, value) in self.vars {
+            match value {
+                Some(value) => command.env(name, value),
+                None => command.env_remove(name),
+            };
+        }
         command
     }
 }
 
-fn path_list(inherited: Option<OsString>, paths: &[PathBuf]) -> Result<OsString> {
+fn path_list(inherited: Vec<PathBuf>, owned: &Path, paths: &[PathBuf]) -> Result<OsString> {
     env::join_paths(
         inherited
-            .filter(|value| !value.is_empty())
             .into_iter()
-            .map(PathBuf::from)
+            .filter(|path| !path.starts_with(owned))
             .chain(paths.iter().cloned()),
     )
     .map_err(|_| {
@@ -624,9 +630,12 @@ mod tests {
     fn isolated_profile_environment_applies_to_any_program_and_extends() {
         let mut env = ProfileEnv::isolated(Path::new("/profiles/Work"), Some("tok".into()));
         assert!(env.is_isolated());
-        env.set("EXTRA", "1");
-        env.append_paths("CLAUDE_CODE_PLUGIN_DIRS", &[PathBuf::from("/store/a")])
-            .unwrap();
+        env.append_paths(
+            "CLAUDE_CODE_PLUGIN_DIRS",
+            Path::new("/store"),
+            &[PathBuf::from("/store/a")],
+        )
+        .unwrap();
         let command = env.command(PathBuf::from("/usr/bin/claude-desktop"));
         assert_eq!(command.get_program(), "/usr/bin/claude-desktop");
         let mut vars = envs(&command);
@@ -635,7 +644,7 @@ mod tests {
         let plugin_dirs = env::join_paths(
             inherited
                 .iter()
-                .map(PathBuf::from)
+                .flat_map(env::split_paths)
                 .chain([PathBuf::from("/store/a")]),
         )
         .unwrap();
@@ -650,7 +659,6 @@ mod tests {
                 Some("/profiles/Work".to_owned()),
             ),
             ("DISABLE_AUTOUPDATER".to_owned(), Some("1".to_owned())),
-            ("EXTRA".to_owned(), Some("1".to_owned())),
             ("FORCE_AUTOUPDATE_PLUGINS".to_owned(), Some("1".to_owned())),
         ];
         expected.sort();
@@ -661,25 +669,34 @@ mod tests {
     fn pass_through_environment_sets_nothing() {
         let mut env = ProfileEnv::pass_through();
         assert!(!env.is_isolated());
-        env.append_paths("CLAUDE_CODE_PLUGIN_DIRS", &[PathBuf::from("/store/a")])
-            .unwrap();
+        env.append_paths(
+            "CLAUDE_CODE_PLUGIN_DIRS",
+            Path::new("/store"),
+            &[PathBuf::from("/store/a")],
+        )
+        .unwrap();
         assert!(envs(&env.command(PathBuf::from("/bin/claude"))).is_empty());
     }
 
     #[test]
-    fn path_lists_follow_a_nonempty_inherited_value() {
-        let paths = [PathBuf::from("/a"), PathBuf::from("/b")];
-        let sep = ":";
+    fn path_lists_follow_inherited_entries_outside_the_store() {
+        let owned = Path::new("/store");
+        let paths = [PathBuf::from("/store/a"), PathBuf::from("/store/b")];
+        let list = |inherited: &[&str], paths: &[PathBuf]| {
+            path_list(inherited.iter().map(PathBuf::from).collect(), owned, paths)
+        };
         assert_eq!(
-            path_list(Some("/x".into()), &paths).unwrap(),
-            OsString::from(format!("/x{sep}/a{sep}/b"))
+            list(&["/x"], &paths).unwrap(),
+            OsString::from("/x:/store/a:/store/b")
         );
+        assert_eq!(list(&[], &paths[..1]).unwrap(), OsString::from("/store/a"));
+        // An outer launch's injection is replaced, not kept beside the new one.
         assert_eq!(
-            path_list(Some("".into()), &paths).unwrap(),
-            OsString::from(format!("/a{sep}/b"))
+            list(&["/x", "/store/a", "/store/old", "/storeroom"], &paths).unwrap(),
+            OsString::from("/x:/storeroom:/store/a:/store/b")
         );
-        assert_eq!(path_list(None, &paths[..1]).unwrap(), OsString::from("/a"));
-        assert!(path_list(None, &[PathBuf::from(format!("/a{sep}b"))]).is_err());
+        assert_eq!(list(&["/store/old"], &[]).unwrap(), OsString::new());
+        assert!(list(&[], &[PathBuf::from("/store/a:b")]).is_err());
     }
 
     #[test]
