@@ -168,18 +168,6 @@ impl ProfileEnv {
     pub fn is_isolated(&self) -> bool {
         self.isolated
     }
-    /// Sets (or overrides, or with `None` removes) one variable on an isolated
-    /// launch; ignored for aliases, whose caller environment always passes through
-    /// unchanged.
-    fn put(&mut self, name: &'static str, value: Option<OsString>) {
-        if !self.isolated {
-            return;
-        }
-        match self.vars.iter_mut().find(|(key, _)| *key == name) {
-            Some(slot) => slot.1 = value,
-            None => self.vars.push((name, value)),
-        }
-    }
     /// Sets `name` to the caller's nonempty inherited value followed by `paths`,
     /// joined with the platform path-list separator (for CLAUDE_CODE_PLUGIN_DIRS).
     /// Inherited entries under `owned` (an outer launch's injection from the same
@@ -200,7 +188,8 @@ impl ProfileEnv {
             return Ok(());
         }
         let value = path_list(inherited, owned, paths)?;
-        self.put(name, Some(value).filter(|value| !value.is_empty()));
+        self.vars
+            .push((name, Some(value).filter(|value| !value.is_empty())));
         Ok(())
     }
     /// A command for `program` with this environment applied, consuming any token
@@ -641,7 +630,6 @@ mod tests {
     fn isolated_profile_environment_applies_to_any_program_and_extends() {
         let mut env = ProfileEnv::isolated(Path::new("/profiles/Work"), Some("tok".into()));
         assert!(env.is_isolated());
-        env.put("EXTRA", Some("1".into()));
         env.append_paths(
             "CLAUDE_CODE_PLUGIN_DIRS",
             Path::new("/store"),
@@ -671,7 +659,6 @@ mod tests {
                 Some("/profiles/Work".to_owned()),
             ),
             ("DISABLE_AUTOUPDATER".to_owned(), Some("1".to_owned())),
-            ("EXTRA".to_owned(), Some("1".to_owned())),
             ("FORCE_AUTOUPDATE_PLUGINS".to_owned(), Some("1".to_owned())),
         ];
         expected.sort();
