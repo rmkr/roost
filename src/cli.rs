@@ -271,6 +271,8 @@ pub enum PluginAction {
 pub enum MarketplaceAction {
     /// Add a marketplace to the plugin store (passed to Claude unchanged)
     Add { source: String },
+    /// Remove a marketplace from the plugin store (refused while a set uses its plugins)
+    Remove { name: String },
 }
 
 /// Exactly one set item.

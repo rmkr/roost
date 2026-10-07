@@ -59,6 +59,11 @@ def resolve(x):
 if sub[:2]==['marketplace','add']:
     if sub[2] not in catalog:sys.exit(1)
     st['marketplaces'].append(sub[2]);save();print('Added marketplace '+sub[2]);sys.exit(0)
+if sub[:2]==['marketplace','remove']:
+    if sub[2] not in st['marketplaces']:sys.exit(1)
+    st['marketplaces'].remove(sub[2])
+    for pid in [p for p in st['installed'] if p.split('@')[1]==sub[2]]:shutil.rmtree(path_for(pid,st['installed'].pop(pid)))
+    save();sys.exit(0)
 if sub[0]=='install':
     pid=resolve(sub[1]);name,m=pid.split('@')
     if m not in st['marketplaces'] or name not in catalog.get(m,{}):sys.exit(1)
@@ -523,6 +528,48 @@ fn remove_drops_the_plugin_from_sets_before_uninstalling() {
         json!([])
     );
     f.fails(&["plugin", "remove", "lint"], "not_found");
+}
+
+#[test]
+fn marketplace_remove_refuses_while_sets_use_its_plugins() {
+    let f = with_lint();
+    f.ok(&["plugin", "marketplace", "add", "other"]);
+    f.ok(&["plugin", "add", "fmt2@other", "--no-set"]);
+    f.clear_calls();
+    let out = f.fails(
+        &["plugin", "marketplace", "remove", "tools"],
+        "plugin_store",
+    );
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(stderr.contains("lint@tools"), "{stderr}");
+    assert!(
+        stderr.contains("roost plugin remove lint@tools"),
+        "{stderr}"
+    );
+    assert!(f.plugin_calls().is_empty());
+    f.fails(&["plugin", "marketplace", "remove", "a/b"], "usage");
+    // Unused by any set: Claude removes it and its plugins, and the record follows.
+    f.ok(&["plugin", "marketplace", "remove", "other"]);
+    assert_eq!(
+        f.plugin_calls(),
+        vec!["plugin marketplace remove other", "plugin list --json"]
+    );
+    let call = &f.calls()[0];
+    assert_eq!(call["store_lock_held"], true);
+    assert_eq!(call["root_lock_held"], false);
+    assert!(!f.cache("fmt2@other", "v1").exists());
+    let ids: Vec<Value> = f.json(&["plugin", "list", "--json"])["data"]["plugins"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|p| p["id"].clone())
+        .collect();
+    assert_eq!(ids, vec![json!("lint@tools")]);
+    let out = f.fails(
+        &["plugin", "marketplace", "remove", "other"],
+        "plugin_store",
+    );
+    assert!(String::from_utf8_lossy(&out.stderr).contains("roost plugin marketplace remove other"));
 }
 
 #[test]
