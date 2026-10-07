@@ -459,8 +459,11 @@ pub fn claude_info() -> Result<(PathBuf, String)> {
     Ok((path, version))
 }
 
-pub fn execute(mut command: Command, arguments: &[OsString]) -> Result<i32> {
+pub fn execute(command: Command, arguments: &[OsString]) -> Result<i32> {
     version_at(command.get_program())?;
+    exec(command, arguments)
+}
+fn exec(mut command: Command, arguments: &[OsString]) -> Result<i32> {
     if platform::cancelled() {
         return Err(Error::cancelled());
     }
@@ -473,9 +476,10 @@ pub fn execute(mut command: Command, arguments: &[OsString]) -> Result<i32> {
     eprintln!("roost: io: Could not execute the selected Claude installation");
     std::process::exit(1);
 }
+/// No version floor: `claude update` is how an unsupported installation is fixed.
 pub fn update() -> Result<i32> {
     eprintln!("roost: updating the shared Claude installation");
-    execute(
+    exec(
         Command::new(resolve_program("claude")?),
         &[OsString::from("update")],
     )

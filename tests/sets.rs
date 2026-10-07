@@ -109,6 +109,8 @@ fn items_are_stored_absolute_and_add_or_drop_is_idempotent() {
         "cannot be used",
     );
     f.fails(&["set", "add", "core", "--skill", "skills/synced"], "usage");
+    // Case-insensitive file systems would alias Claude's own skills/synced.
+    f.fails(&["set", "add", "core", "--skill", "skills/Synced"], "usage");
     f.fails(
         &["set", "add", "core", "--skill", "skills/.hidden"],
         "usage",

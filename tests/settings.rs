@@ -587,6 +587,40 @@ fn rewrites_keep_number_text_exactly() {
     assert!(text.contains("18446744073709551616"), "{text}");
 }
 
+#[test]
+fn number_text_rewritten_by_claude_still_matches_the_records() {
+    let f = Fixture::new();
+    let dir = f.path.join("settings");
+    fs::create_dir(&dir).unwrap();
+    fs::write(
+        dir.join("a.json"),
+        r#"{"hooks":{"Stop":[{"hooks":[{"type":"command","command":"a","timeout":1E2}]}]},
+            "statusLine":{"type":"command","command":"line.sh","padding":0.0}}"#,
+    )
+    .unwrap();
+    f.ok(&["set", "create", "core", "--default"]);
+    f.ok(&["set", "add", "core", "--settings-from", s(&dir)]);
+    f.ok(&["add", "Work"]);
+    f.ok(&["run", "Work"]);
+    // Claude rewrites settings.json with JSON.stringify: 1E2 -> 100, 0.0 -> 0.
+    let text = f.settings_text("Work");
+    assert!(text.contains("1E2") && text.contains("0.0"), "{text}");
+    f.write_settings("Work", &text.replace("1E2", "100").replace("0.0", "0"));
+    let stderr = f.stderr_of(&["run", "Work"]);
+    assert!(stderr.is_empty(), "{stderr}");
+    let settings = f.settings("Work");
+    assert_eq!(
+        settings["hooks"]["Stop"][0]["hooks"]
+            .as_array()
+            .unwrap()
+            .len(),
+        1
+    );
+    f.ok(&["set", "unsubscribe", "Work", "core"]);
+    f.ok(&["run", "Work"]);
+    assert_eq!(f.settings("Work"), json!({}));
+}
+
 const FAKE_DESKTOP: &str = "#!/usr/bin/python3\nimport sys\nsys.exit(0)\n";
 
 #[test]

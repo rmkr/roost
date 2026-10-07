@@ -127,7 +127,7 @@ fn linkable(name: &str, select: Select) -> bool {
     !name.is_empty()
         && !name.starts_with('.')
         && !name.contains(['\r', '\n', '/', '\0'])
-        && name != SYNCED
+        && !name.eq_ignore_ascii_case(SYNCED)
         && (select == Select::Directories || name.ends_with(".md"))
 }
 

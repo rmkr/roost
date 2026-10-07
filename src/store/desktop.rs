@@ -508,6 +508,7 @@ mod tests {
         drop(store);
         let mut store = f.open(OpenMode::RetryPurge).unwrap();
         assert!(store.remove("Work", true).is_err());
+        assert!(!store.pending());
         assert!(folder.join("Preferences").exists());
         assert!(f.root.join("profiles/Work").exists());
     }

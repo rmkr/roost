@@ -161,6 +161,22 @@ fn help_version_and_usage_do_not_touch_storage() {
 }
 
 #[test]
+fn closed_stdout_reader_is_a_quiet_operational_failure() {
+    let f = Fixture::new();
+    for args in [&["help"][..], &["list", "--json"]] {
+        let (reader, writer) = std::io::pipe().unwrap();
+        drop(reader);
+        let out = f.command().args(args).stdout(writer).output().unwrap();
+        assert_eq!(out.status.code(), Some(1), "{args:?}");
+        assert!(
+            out.stderr.is_empty(),
+            "{args:?}: {}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+    }
+}
+
+#[test]
 fn human_list_is_a_plain_aligned_table_when_piped() {
     let f = Fixture::new();
     f.add("Work");
@@ -555,6 +571,65 @@ fn run_and_bound_launcher_preserve_opaque_tail_and_correct_root() {
 }
 
 #[test]
+fn launcher_refuses_a_stale_executable_root_or_registration_binding() {
+    let f = Fixture::new();
+    f.add("Work");
+    // `program` with only the fixture's environment, like f.command().
+    let like_fixture = |program: &Path| {
+        let mut command = Command::new(program);
+        command.env_clear().current_dir(&f.path);
+        for (key, value) in f.command().get_envs() {
+            command.env(key, value.unwrap());
+        }
+        command
+    };
+    let launcher = f.root.join("bin/roost-Work");
+    // A kept copy of the launcher still execs this Roost after another one rebinds.
+    let kept = f.path.join("kept-launcher");
+    fs::copy(&launcher, &kept).unwrap();
+    let other = f.path.join("other-roost");
+    fs::copy(env!("CARGO_BIN_EXE_roost"), &other).unwrap();
+    let out = like_fixture(&other)
+        .args(["reuse", "Work"])
+        .output()
+        .unwrap();
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let stale = like_fixture(&kept).output().unwrap();
+    assert_eq!(stale.status.code(), Some(1));
+    let stderr = String::from_utf8_lossy(&stale.stderr);
+    assert!(
+        stderr.contains("ownership: Launcher executable binding is stale\nNext: Run the selected Roost executable: roost reuse Work"),
+        "{stderr}"
+    );
+    f.ok(&["reuse", "Work"]);
+    assert!(like_fixture(&kept).output().unwrap().status.success());
+    assert!(like_fixture(&launcher).output().unwrap().status.success());
+    // Operands: executable, __roost_launch_v1, root, root ID, registration ID.
+    let text = fs::read_to_string(&kept).unwrap();
+    let root_id = text.split('\'').nth(7).unwrap();
+    let foreign = f.path.join("foreign-launcher");
+    fs::write(&foreign, text.replace(root_id, &"0".repeat(root_id.len()))).unwrap();
+    fs::set_permissions(&foreign, fs::Permissions::from_mode(0o700)).unwrap();
+    let mismatch = like_fixture(&foreign).output().unwrap();
+    assert_eq!(mismatch.status.code(), Some(1));
+    assert!(
+        String::from_utf8_lossy(&mismatch.stderr)
+            .contains("ownership: Launcher root identity does not match")
+    );
+    f.ok(&["remove", "Work", "--purge", "--yes"]);
+    let absent = like_fixture(&kept).output().unwrap();
+    assert_eq!(absent.status.code(), Some(1));
+    assert!(
+        String::from_utf8_lossy(&absent.stderr)
+            .contains("not_found: Launcher registration is absent")
+    );
+}
+
+#[test]
 fn default_alias_preserves_auth_and_update_environment() {
     let f = Fixture::new();
     f.ok(&["add", "default", "--link-default"]);
@@ -584,6 +659,15 @@ fn default_alias_preserves_auth_and_update_environment() {
     assert_eq!(probe["arguments"], json!(["update"]));
     assert_eq!(probe["env"]["CLAUDE_CONFIG_DIR"], "caller-context");
     assert_eq!(probe["env"]["DISABLE_AUTOUPDATER"], "caller");
+    // An unsupported installation can still update itself.
+    let out = f
+        .command()
+        .arg("update")
+        .env("FAKE_CLAUDE_VERSION", "2.1.279 (Claude Code)")
+        .output()
+        .unwrap();
+    assert!(out.status.success());
+    assert_eq!(parsed(&out)["arguments"], json!(["update"]));
     assert!(
         !f.run(&["remove", "default", "--purge", "--yes"])
             .status
@@ -1296,7 +1380,8 @@ fn desktop_refuses_a_running_profile_and_warns_about_other_instances() {
     std::os::unix::fs::symlink(format!("elsewhere-{}", std::process::id()), &lock).unwrap();
     f.ok(&["desktop", "--foreground", "Work"]);
 
-    // The conventional Desktop folder counts as another instance, for aliases too.
+    // The conventional Desktop folder counts as another instance; an alias, which
+    // uses that folder, is refused while it runs.
     let conventional = f.home.join(".config/Claude");
     fs::create_dir_all(&conventional).unwrap();
     std::os::unix::fs::symlink(&live, conventional.join("SingletonLock")).unwrap();
@@ -1305,6 +1390,11 @@ fn desktop_refuses_a_running_profile_and_warns_about_other_instances() {
         String::from_utf8_lossy(&out.stderr).contains("only one running Desktop can use Cowork")
     );
     f.ok(&["add", "personal", "--link-default"]);
+    let out = f.run(&["desktop", "--foreground", "personal"]);
+    assert!(
+        String::from_utf8_lossy(&out.stderr)
+            .contains("desktop_running: Claude Desktop is already running")
+    );
     fs::remove_file(conventional.join("SingletonLock")).unwrap();
     fs::remove_file(&lock).unwrap();
     std::os::unix::fs::symlink(&live, &lock).unwrap();
@@ -2311,6 +2401,14 @@ fn desktop_picker_falls_back_to_last_used_and_foreground_stays_attached() {
             f.desktop_folder("Work").display()
         )])
     );
+    // While plain Desktop runs, the alias row, which it would refuse, is running.
+    let conventional = f.home.join(".config/Claude");
+    fs::create_dir_all(&conventional).unwrap();
+    let live = format!("{}-{}", hostname(), std::process::id());
+    std::os::unix::fs::symlink(&live, conventional.join("SingletonLock")).unwrap();
+    let result = desktop_picker(&f, &[], &["\x1b"]);
+    let text = result["text"].as_str().unwrap();
+    assert!(picker_row(text, "personal").contains("running"), "{text}");
 }
 
 #[cfg(target_os = "linux")]

@@ -279,7 +279,24 @@ impl Hook {
     fn matches_record(&self, record: &HookRecord) -> bool {
         self.event == record.event
             && self.matcher == record.matcher
-            && self.handler.to_value() == record.handler
+            && same(&self.handler.to_value(), &record.handler)
+    }
+}
+
+/// Value equality with numbers compared by value, not text: Claude rewrites
+/// `1E2` or `30.0` as `100` or `30`, and records keep the fragment's spelling.
+fn same(a: &Value, b: &Value) -> bool {
+    match (a, b) {
+        (Value::Number(x), Value::Number(y)) => {
+            x == y || ((x.is_f64() || y.is_f64()) && x.as_f64() == y.as_f64())
+        }
+        (Value::Array(x), Value::Array(y)) => {
+            x.len() == y.len() && x.iter().zip(y).all(|(x, y)| same(x, y))
+        }
+        (Value::Object(x), Value::Object(y)) => {
+            x.len() == y.len() && x.iter().all(|(k, v)| y.get(k).is_some_and(|w| same(v, w)))
+        }
+        _ => a == b,
     }
 }
 
@@ -597,7 +614,7 @@ fn contains_hook(settings: &Json, hook: &Hook) -> bool {
     groups.iter().any(|group| {
         group_matcher(group) == Some(hook.matcher.as_deref())
             && matches!(group.get(HOOKS), Some(Json::Array(handlers))
-                if handlers.iter().any(|h| h.to_value() == wanted))
+                if handlers.iter().any(|h| same(&h.to_value(), &wanted)))
     })
 }
 
@@ -618,7 +635,10 @@ fn remove_hook(settings: &mut Json, record: &HookRecord) {
         let Some(Json::Array(handlers)) = group.get_mut(HOOKS) else {
             continue;
         };
-        if let Some(index) = handlers.iter().position(|h| h.to_value() == record.handler) {
+        if let Some(index) = handlers
+            .iter()
+            .position(|h| same(&h.to_value(), &record.handler))
+        {
             handlers.remove(index);
             removed = true;
             break;
@@ -724,10 +744,11 @@ fn apply_single(
     warnings: &mut Vec<String>,
 ) -> Option<Value> {
     let current = settings.get(key).map(Json::to_value);
+    let is_recorded = |value: &Value| recorded.is_some_and(|r| same(value, r));
     match desired {
         Single::Conflict => recorded.cloned(),
         Single::Absent => {
-            if recorded.is_some() && current.as_ref() == recorded {
+            if current.as_ref().is_some_and(is_recorded) {
                 settings.remove(key);
             }
             None
@@ -741,8 +762,8 @@ fn apply_single(
                 }
                 // Already the desired value: Roost's when it managed the key (also
                 // after a launch interrupted before recording its replacement).
-                Some(current) if *current == wanted => recorded.map(|_| wanted),
-                Some(current) if Some(current) == recorded => {
+                Some(current) if same(current, &wanted) => recorded.map(|_| wanted),
+                Some(current) if is_recorded(current) => {
                     settings.set(key, value.clone());
                     Some(wanted)
                 }
@@ -866,7 +887,9 @@ fn replace(profile: &Directory, before: &Snapshot, bytes: &[u8]) -> Result<FileI
         let _ = profile.remove(&temp, false);
         return Err(error);
     }
-    profile.sync()?;
+    // Replaced: a failed directory sync must not be reported as "not replaced",
+    // or the caller would drop the records of the entries now in the file.
+    let _ = profile.sync();
     Ok(identity)
 }
 

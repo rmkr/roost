@@ -12,6 +12,7 @@ mod table;
 use cli::Action;
 use serde_json::{Value, json};
 use std::{
+    io::{self, Write},
     path::{Path, PathBuf},
     process,
 };
@@ -98,10 +99,21 @@ fn initial_data(action: &Action) -> Value {
 
 fn print_json(data: Value, warnings: Vec<String>, error: Option<&Error>) {
     let error = error.map(|e| json!({"code":e.code,"message":e.message,"next_step":e.next_step}));
-    println!(
-        "{}",
-        json!({"schema_version":1,"data":data,"warnings":warnings,"error":error})
-    );
+    print_lines([json!({"schema_version":1,"data":data,"warnings":warnings,"error":error})]);
+}
+
+/// Writes result lines to stdout. A reader that went away (`roost ls | head`) is
+/// an operational failure, exit 1, reported quietly rather than as a panic.
+fn print_lines(lines: impl IntoIterator<Item = impl std::fmt::Display>) {
+    let mut stdout = io::stdout().lock();
+    for line in lines {
+        if let Err(error) = writeln!(stdout, "{line}") {
+            if error.kind() != io::ErrorKind::BrokenPipe {
+                human_error(&Error::new("io", "Cannot write output"));
+            }
+            process::exit(1);
+        }
+    }
 }
 
 fn main() {
@@ -129,11 +141,9 @@ fn main() {
             if json_mode {
                 print_json(data, output.warnings, output.error.as_ref());
             } else {
-                for line in output.lines {
-                    println!("{line}");
-                }
+                print_lines(output.lines);
                 for warning in output.warnings {
-                    eprintln!("warning: {warning}");
+                    let _ = writeln!(io::stderr(), "warning: {warning}");
                 }
                 if let Some(error) = output.error {
                     human_error(&error);
@@ -153,9 +163,10 @@ fn main() {
 }
 
 fn human_error(error: &Error) {
-    eprintln!("{}: {}", error.code, error.message);
+    let mut stderr = io::stderr();
+    let _ = writeln!(stderr, "{}: {}", error.code, error.message);
     if let Some(step) = &error.next_step {
-        eprintln!("Next: {step}");
+        let _ = writeln!(stderr, "Next: {step}");
     }
 }
 

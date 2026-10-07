@@ -173,7 +173,10 @@ fn picker_rows(store: &Store, records: &mut [Value]) -> (Vec<String>, usize) {
                     _ => "shared",
                 }
             }
-            _ if registration.kind == Kind::DefaultAlias => "plain",
+            _ if registration.kind == Kind::DefaultAlias => match conventional() {
+                "running" => "running",
+                _ => "plain",
+            },
             (_, Some((_, Some(target)))) if linux::live_lock(target, host.as_deref()) => {
                 "running"
             }
@@ -189,7 +192,7 @@ fn picker_rows(store: &Store, records: &mut [Value]) -> (Vec<String>, usize) {
             records,
             crate::table::Columns::Desktop,
             crate::table::color_for(&std::io::stderr()),
-            None,
+            platform::picker_width(),
         ),
         initial,
     )
@@ -217,16 +220,18 @@ fn start(mut store: Store, registration: Registration, foreground: bool) -> Resu
     let mut warnings = vec![];
     let command = if registration.kind == Kind::DefaultAlias {
         // Plain Desktop with the caller's environment: no folder, nothing recorded.
-        // When a profile borrows that folder, both share one running instance.
-        if let Ok(Some(holder)) = link_holder(&store)
-            && conventional_running(host.as_deref())
-        {
-            return Err(already_running(format!(
-                "Claude Desktop shared with {} is already running",
-                holder.name
-            )));
+        // A second start only focuses the running instance of that folder and exits,
+        // so refuse; a profile borrowing the folder shares that instance.
+        if conventional_running(host.as_deref()) {
+            return Err(already_running(match link_holder(&store) {
+                Ok(Some(holder)) => format!(
+                    "Claude Desktop shared with {} is already running",
+                    holder.name
+                ),
+                _ => "Claude Desktop is already running".to_owned(),
+            }));
         }
-        if roost_running(&store, None) || conventional_running(host.as_deref()) {
+        if roost_running(&store, None) {
             warnings.push(COWORK.to_owned());
         }
         drop(store);
@@ -541,13 +546,10 @@ fn conventional_folder() -> Option<PathBuf> {
     Some(config.join("Claude"))
 }
 
-/// The `SingletonLock` link of the conventional Desktop folder, if any.
+/// The `SingletonLock` link of the conventional Desktop folder, if any. Read-only,
+/// so symlinked ancestors (a stowed `~/.config`) are followed, as Electron does.
 fn conventional_lock() -> Option<PathBuf> {
-    platform::Directory::open(&conventional_folder()?, false)
-        .ok()?
-        .read_link("SingletonLock")
-        .ok()
-        .flatten()
+    std::fs::read_link(conventional_folder()?.join("SingletonLock")).ok()
 }
 
 /// Doctor: Desktop folders with a recorded launch but no Electron data. A linked
