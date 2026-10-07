@@ -3,7 +3,7 @@
 //! Selections and last-use times live in the manager's `state.json`, keyed by
 //! registration ID; nothing is ever written into upstream or default data.
 use crate::{
-    Error, Outcome, Result, launch, platform, sets,
+    Error, Outcome, Result, cli, launch, platform, sets,
     store::{
         Kind, OpenMode, Registration, State, Store,
         side::{Selection, StateFile, Timestamp},
@@ -245,6 +245,13 @@ pub fn launch_selected(allow_auth_env: bool, arguments: &[OsString]) -> Result<O
             (store, registration)
         }
     };
+    // A Claude subcommand finishes without showing a session, so name the profile it acts on.
+    if arguments
+        .first()
+        .is_some_and(|a| cli::CLAUDE_SUBCOMMANDS.iter().any(|c| a == *c))
+    {
+        eprintln!("roost: using profile {}", registration.name);
+    }
     start(store, &registration, allow_auth_env, arguments)
 }
 
