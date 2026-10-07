@@ -200,14 +200,17 @@ impl ProfileEnv {
 }
 
 fn path_list(inherited: Option<OsString>, paths: &[PathBuf]) -> Result<OsString> {
-    env::join_paths(
-        inherited
-            .filter(|value| !value.is_empty())
-            .into_iter()
-            .map(PathBuf::from)
-            .chain(paths.iter().cloned()),
-    )
-    .map_err(|_| {
+    // A nested launch inherits a list that may already hold these paths.
+    let mut list: Vec<PathBuf> = inherited
+        .filter(|value| !value.is_empty())
+        .map(|value| env::split_paths(&value).collect())
+        .unwrap_or_default();
+    for path in paths {
+        if !list.contains(path) {
+            list.push(path.clone());
+        }
+    }
+    env::join_paths(list).map_err(|_| {
         Error::new(
             "unsafe_path",
             "Path list entry contains the path-list separator",
@@ -635,7 +638,7 @@ mod tests {
         let plugin_dirs = env::join_paths(
             inherited
                 .iter()
-                .map(PathBuf::from)
+                .flat_map(env::split_paths)
                 .chain([PathBuf::from("/store/a")]),
         )
         .unwrap();
@@ -679,6 +682,10 @@ mod tests {
             OsString::from(format!("/a{sep}/b"))
         );
         assert_eq!(path_list(None, &paths[..1]).unwrap(), OsString::from("/a"));
+        assert_eq!(
+            path_list(Some(format!("/x{sep}/a").into()), &paths).unwrap(),
+            OsString::from(format!("/x{sep}/a{sep}/b"))
+        );
         assert!(path_list(None, &[PathBuf::from(format!("/a{sep}b"))]).is_err());
     }
 
