@@ -426,11 +426,9 @@ fn parse_from(args: Vec<OsString>) -> std::result::Result<Action, clap::Error> {
     Ok(cli.command.unwrap_or(Action::Help { command: None }))
 }
 
-/// Claude subcommands `roost` forwards to the selected profile as if after `--`.
-/// A fixed list: an unknown word would reach Claude as a prompt. Claude's `doctor`,
-/// `plugin`, `update` and `rm` stay Roost's; `install`, `gateway` and `purge` are
-/// left out as global or easily confused with Roost's own commands.
-const PASSTHROUGH: [&str; 12] = [
+/// Claude subcommands `roost` forwards to the selected profile as if after `--`;
+/// why a fixed list, and which names are left out, is in docs/adr/0004.
+const CLAUDE_SUBCOMMANDS: [&str; 12] = [
     "agents",
     "attach",
     "auth",
@@ -446,7 +444,7 @@ const PASSTHROUGH: [&str; 12] = [
 ];
 
 /// Bare `roost`: only an optional leading `--allow-auth-env`, then nothing, `--`
-/// and an opaque tail, or a `PASSTHROUGH` subcommand and its arguments. Anything
+/// and an opaque tail, or an allowlisted Claude subcommand and its arguments. Anything
 /// else is a command or switch for clap.
 fn parse_launch(args: &[OsString]) -> std::result::Result<Option<Action>, clap::Error> {
     let allow_auth_env = args.get(1).is_some_and(|v| v == "--allow-auth-env");
@@ -454,7 +452,7 @@ fn parse_launch(args: &[OsString]) -> std::result::Result<Option<Action>, clap::
     let arguments = match args.get(index) {
         None => vec![],
         Some(v) if v == "--" => args[index + 1..].to_vec(),
-        Some(v) if PASSTHROUGH.iter().any(|c| v == *c) => args[index..].to_vec(),
+        Some(v) if CLAUDE_SUBCOMMANDS.iter().any(|c| v == *c) => args[index..].to_vec(),
         Some(_) if allow_auth_env => {
             return Err(usage(
                 "--allow-auth-env launches the selected profile; pass other Claude arguments after --",
@@ -560,9 +558,9 @@ fn parse_switch(args: &[OsString]) -> std::result::Result<Action, clap::Error> {
 }
 
 pub fn help(command: Option<&str>) -> crate::Result<String> {
-    if let Some(name) = command.filter(|c| PASSTHROUGH.contains(c)) {
+    if let Some(name) = command.filter(|c| CLAUDE_SUBCOMMANDS.contains(c)) {
         return Ok(format!(
-            "{name} is a Claude subcommand: roost {name} runs it with this project's selected profile, and roost {name} --help shows Claude's help\n"
+            "{name} is a Claude subcommand: roost {name} runs it with this project's selected\nprofile (picker if none). roost run NAME {name} --help shows Claude's help for it.\n"
         ));
     }
     let app = Cli::command();
@@ -629,8 +627,24 @@ mod tests {
             assert_eq!(arguments, values[values.len() - 2..]);
         }
         // Roost keeps its own commands that share a name with Claude's.
-        assert!(matches!(parse(&["roost", "doctor"]), Action::Doctor { .. }));
+        for command in Cli::command().get_subcommands() {
+            for name in std::iter::once(command.get_name()).chain(command.get_all_aliases()) {
+                assert!(
+                    !CLAUDE_SUBCOMMANDS.contains(&name),
+                    "{name} is a Roost command"
+                );
+            }
+        }
         assert!(help(Some("agents")).unwrap().contains("Claude subcommand"));
+        // The help recipe lists exactly the allowlisted subcommands.
+        let (_, list) = RECIPES.split_once("(picker if none):").unwrap();
+        let (list, _) = list.split_once("roost run NAME").unwrap();
+        let mut listed: Vec<&str> = list
+            .split([',', ' ', '\n'])
+            .filter(|w| !w.is_empty() && *w != "roost")
+            .collect();
+        listed.sort();
+        assert_eq!(listed, CLAUDE_SUBCOMMANDS);
     }
     #[test]
     fn desktop_takes_an_optional_name_and_no_forwarded_tail() {
