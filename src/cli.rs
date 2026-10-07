@@ -4,7 +4,7 @@ use std::{
     path::PathBuf,
 };
 
-const RECIPES: &str = "First login:\n  roost add work\n  roost run work auth login\n  roost status work\n\nConcurrent sessions (separate terminals):\n  roost run work --name client-a\n  roost run work --name client-b\n  roost run work --resume client-a\n  roost run work --continue\n  roost run work --resume client-a --fork-session\n\nProfiles select configuration contexts, not proven account identities.\nDefault aliases pass through the caller environment.\nClear an owned manager token before relying on native browser login:\n  roost token work --clear\n";
+const RECIPES: &str = "First login:\n  roost add work\n  roost run work auth login\n  roost status work\n\nConcurrent sessions (separate terminals):\n  roost run work --name client-a\n  roost run work --name client-b\n  roost run work --resume client-a\n  roost run work --continue\n  roost run work --resume client-a --fork-session\n\nProfiles select configuration contexts, not proven account identities.\nDefault aliases pass through the caller environment.\nClear an owned manager token before relying on native browser login:\n  roost token work --clear\n\nClaude subcommands run with this project's selected profile (picker if none):\n  roost agents, attach, auth, auto-mode, import, kill, logs, mcp,\n  respawn, setup-token, stop, ultrareview\n  roost run NAME <subcommand> uses NAME instead\n";
 
 #[derive(Parser)]
 #[command(name="roost", about="Manage Claude profiles alongside your existing installation", disable_version_flag=true, disable_help_subcommand=true, after_help=RECIPES)]
@@ -426,17 +426,38 @@ fn parse_from(args: Vec<OsString>) -> std::result::Result<Action, clap::Error> {
     Ok(cli.command.unwrap_or(Action::Help { command: None }))
 }
 
-/// Bare `roost`: only an optional leading `--allow-auth-env`, then nothing or `--`
-/// and an opaque tail. Anything else is a command or switch for clap.
+/// Claude subcommands `roost` forwards to the selected profile as if after `--`.
+/// A fixed list: an unknown word would reach Claude as a prompt. Claude's `doctor`,
+/// `plugin`, `update` and `rm` stay Roost's; `install`, `gateway` and `purge` are
+/// left out as global or easily confused with Roost's own commands.
+const PASSTHROUGH: [&str; 12] = [
+    "agents",
+    "attach",
+    "auth",
+    "auto-mode",
+    "import",
+    "kill",
+    "logs",
+    "mcp",
+    "respawn",
+    "setup-token",
+    "stop",
+    "ultrareview",
+];
+
+/// Bare `roost`: only an optional leading `--allow-auth-env`, then nothing, `--`
+/// and an opaque tail, or a `PASSTHROUGH` subcommand and its arguments. Anything
+/// else is a command or switch for clap.
 fn parse_launch(args: &[OsString]) -> std::result::Result<Option<Action>, clap::Error> {
     let allow_auth_env = args.get(1).is_some_and(|v| v == "--allow-auth-env");
     let index = if allow_auth_env { 2 } else { 1 };
     let arguments = match args.get(index) {
         None => vec![],
         Some(v) if v == "--" => args[index + 1..].to_vec(),
+        Some(v) if PASSTHROUGH.iter().any(|c| v == *c) => args[index..].to_vec(),
         Some(_) if allow_auth_env => {
             return Err(usage(
-                "--allow-auth-env launches the selected profile; pass Claude arguments after --",
+                "--allow-auth-env launches the selected profile; pass other Claude arguments after --",
             ));
         }
         Some(_) => return Ok(None),
@@ -539,6 +560,11 @@ fn parse_switch(args: &[OsString]) -> std::result::Result<Action, clap::Error> {
 }
 
 pub fn help(command: Option<&str>) -> crate::Result<String> {
+    if let Some(name) = command.filter(|c| PASSTHROUGH.contains(c)) {
+        return Ok(format!(
+            "{name} is a Claude subcommand: roost {name} runs it with this project's selected profile, and roost {name} --help shows Claude's help\n"
+        ));
+    }
     let app = Cli::command();
     let mut selected = match command {
         None => app,
@@ -585,6 +611,26 @@ mod tests {
         };
         assert!(allow_auth_env);
         assert_eq!(arguments, vec!["--", "--help", "--allow-auth-env", ""]);
+    }
+    #[test]
+    fn claude_subcommands_launch_the_selected_profile() {
+        for (values, auth) in [
+            (&["roost", "agents", "--json"][..], false),
+            (&["roost", "--allow-auth-env", "mcp", "list"][..], true),
+        ] {
+            let Action::Launch {
+                allow_auth_env,
+                arguments,
+            } = parse(values)
+            else {
+                panic!("{values:?}")
+            };
+            assert_eq!(allow_auth_env, auth);
+            assert_eq!(arguments, values[values.len() - 2..]);
+        }
+        // Roost keeps its own commands that share a name with Claude's.
+        assert!(matches!(parse(&["roost", "doctor"]), Action::Doctor { .. }));
+        assert!(help(Some("agents")).unwrap().contains("Claude subcommand"));
     }
     #[test]
     fn desktop_takes_an_optional_name_and_no_forwarded_tail() {
