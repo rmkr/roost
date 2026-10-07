@@ -704,7 +704,8 @@ fn daily_auto_update_runs_once_per_window_and_never_blocks_the_launch() {
     let stderr = String::from_utf8_lossy(&out.stderr);
     assert!(stderr.contains("Plugin auto-update stopped"), "{stderr}");
     assert!(parsed(&out)["arguments"] == json!([]));
-    // A hanging update is stopped after 8 seconds; the launch proceeds.
+    // A hanging update is stopped within the 8-second deadline, early enough to
+    // leave the record refresh its share; the launch proceeds.
     set_auto_update_at(&f, 1);
     let started = std::time::Instant::now();
     let out = f
@@ -716,7 +717,7 @@ fn daily_auto_update_runs_once_per_window_and_never_blocks_the_launch() {
     let elapsed = started.elapsed();
     assert!(out.status.success());
     assert!(
-        elapsed >= std::time::Duration::from_secs(7)
+        elapsed >= std::time::Duration::from_secs(5)
             && elapsed < std::time::Duration::from_secs(20),
         "{elapsed:?}"
     );
@@ -767,6 +768,47 @@ fn auto_update_skips_silently_while_a_store_command_holds_the_store_lock() {
     assert!(!f.plugin_calls().iter().any(|c| c.contains("update")));
     busy.kill().unwrap();
     busy.wait().unwrap();
+}
+
+#[test]
+fn a_failed_auto_update_still_records_the_plugins_already_updated() {
+    let f = with_lint();
+    f.ok(&["plugin", "add", "core@tools", "--set", "dev"]);
+    f.ok(&["plugin", "auto-update", "--on"]);
+    // core@tools updates first (to v2, orphaning v1), then lint@tools fails.
+    let out = f
+        .command()
+        .env("FAKE_PLUGIN_FAIL", "update lint@tools")
+        .args(["run", "Work"])
+        .output()
+        .unwrap();
+    assert!(out.status.success());
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(stderr.contains("Plugin auto-update stopped"), "{stderr}");
+    assert!(!stderr.contains("orphaned"), "{stderr}");
+    let dirs = f.injected("Work").unwrap();
+    assert!(dirs.contains(s(&f.cache("core@tools", "v2"))), "{dirs}");
+    assert!(dirs.contains(s(&f.cache("lint@tools", "v1"))), "{dirs}");
+}
+
+#[test]
+fn update_and_remove_rebuild_an_unreadable_store_record() {
+    let f = with_lint();
+    let record = f.store().join(".roost-store-plugins.json");
+    fs::write(&record, "not json").unwrap();
+    f.ok(&["plugin", "update"]);
+    assert_eq!(
+        f.injected("Work").as_deref(),
+        Some(s(&f.cache("lint@tools", "v2")))
+    );
+    fs::write(&record, "not json").unwrap();
+    let out = f.ok(&["plugin", "remove", "lint"]);
+    assert!(String::from_utf8_lossy(&out.stderr).contains("record unavailable"));
+    assert!(!f.cache("lint@tools", "v2").exists());
+    assert_eq!(
+        f.json(&["plugin", "list", "--json"])["data"]["plugins"],
+        json!([])
+    );
 }
 
 #[test]

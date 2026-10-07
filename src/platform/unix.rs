@@ -637,10 +637,9 @@ impl Directory {
         Ok(file)
     }
 
+    /// Never checks cancellation: a journal write must finish once its staged
+    /// object exists; callers honor cancellation at step boundaries.
     pub fn write_new(&self, name: &str, bytes: &[u8], mode: u32) -> Result<FileIdentity> {
-        if cancelled() {
-            return Err(Error::cancelled());
-        }
         let mut file = self.create_file(name, mode)?;
         file.write_all(bytes)
             .map_err(|e| Error::io("write private file", &self.path.join(name), e))?;
@@ -827,6 +826,15 @@ fn terminal() -> Result<File> {
 }
 
 fn bounded_input(descriptor: libc::c_int, terminal: bool, limit: usize) -> Result<Vec<u8>> {
+    // Oversized terminal input discards the rest of the pending line, so the
+    // shell does not run it after Roost exits.
+    let overflow = || {
+        if terminal {
+            let fd = unsafe { BorrowedFd::borrow_raw(descriptor) };
+            let _ = rustix::termios::tcflush(fd, rustix::termios::QueueSelector::IFlush);
+        }
+        Error::new("invalid_token", "Input exceeds supported size")
+    };
     let mut bytes = Vec::new();
     loop {
         if cancelled() {
@@ -846,7 +854,7 @@ fn bounded_input(descriptor: libc::c_int, terminal: bool, limit: usize) -> Resul
                 if *byte == b'\n' || *byte == b'\r' {
                     bytes.push(*byte);
                     if bytes.len() > limit {
-                        return Err(Error::new("invalid_token", "Input exceeds supported size"));
+                        return Err(overflow());
                     }
                     return Ok(bytes);
                 }
@@ -860,7 +868,7 @@ fn bounded_input(descriptor: libc::c_int, terminal: bool, limit: usize) -> Resul
             bytes.extend_from_slice(&chunk);
         }
         if bytes.len() > limit {
-            return Err(Error::new("invalid_token", "Input exceeds supported size"));
+            return Err(overflow());
         }
         if terminal && bytes.contains(&b'\n') {
             break;
@@ -899,12 +907,22 @@ pub fn token_input(stdin: bool) -> Result<String> {
 /// Column count of the terminal on stdout; None when stdout is not a terminal or
 /// reports no size.
 pub fn stdout_width() -> Option<usize> {
-    use std::io::IsTerminal;
-    let stdout = std::io::stdout();
-    if !stdout.is_terminal() {
+    terminal_width(std::io::stdout())
+}
+
+/// Column count of the terminal on stderr, where the pickers draw, less their
+/// two-column `> ` prefix; None like `stdout_width`.
+pub fn picker_width() -> Option<usize> {
+    terminal_width(std::io::stderr())
+        .map(|width| width.saturating_sub(2))
+        .filter(|&width| width > 0)
+}
+
+fn terminal_width(stream: impl std::io::IsTerminal + std::os::fd::AsFd) -> Option<usize> {
+    if !stream.is_terminal() {
         return None;
     }
-    rustix::termios::tcgetwinsize(&stdout)
+    rustix::termios::tcgetwinsize(&stream)
         .ok()
         .map(|size| usize::from(size.ws_col))
         .filter(|&width| width > 0)
@@ -921,7 +939,11 @@ pub fn confirm(scope: &str, yes: bool) -> Result<()> {
     let mut tty = terminal()?;
     tty.write_all(b"Continue? [y/N] ")
         .map_err(|_| Error::new("io", "Cannot write confirmation prompt"))?;
-    let bytes = bounded_input(tty.as_raw_fd(), true, 128)?;
+    // An oversized answer is not yes.
+    let bytes = match bounded_input(tty.as_raw_fd(), true, 128) {
+        Err(error) if error.code == "invalid_token" => return Err(Error::cancelled()),
+        bytes => bytes?,
+    };
     let response = std::str::from_utf8(&bytes).unwrap_or("").trim();
     if response.eq_ignore_ascii_case("y") || response.eq_ignore_ascii_case("yes") {
         Ok(())
@@ -1391,6 +1413,32 @@ mod tests {
             drop(reader);
             write.join().unwrap();
         }
+    }
+
+    #[test]
+    fn oversized_terminal_line_is_discarded() {
+        use std::ffi::CStr;
+        use std::os::fd::FromRawFd;
+        use std::os::unix::fs::OpenOptionsExt;
+        let master = unsafe { libc::posix_openpt(libc::O_RDWR | libc::O_NOCTTY) };
+        assert!(master >= 0);
+        let mut master = unsafe { File::from_raw_fd(master) };
+        assert_eq!(unsafe { libc::grantpt(master.as_raw_fd()) }, 0);
+        assert_eq!(unsafe { libc::unlockpt(master.as_raw_fd()) }, 0);
+        let name = unsafe { CStr::from_ptr(libc::ptsname(master.as_raw_fd())) };
+        let slave = std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .custom_flags(libc::O_NOCTTY)
+            .open(name.to_str().unwrap())
+            .unwrap();
+        let mut line = vec![b'y'; 200];
+        line.extend_from_slice(b"\necho leaked\n");
+        master.write_all(&line).unwrap();
+        let result = bounded_input(slave.as_raw_fd(), true, 128);
+        assert_eq!(result.unwrap_err().code, "invalid_token");
+        // The rest of the line and the next one never reach the shell.
+        assert!(read_ready(slave.as_raw_fd(), 200, 512).unwrap().is_none());
     }
     #[test]
     fn anchored_files_and_no_link_traversal() {

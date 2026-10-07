@@ -210,9 +210,14 @@ fn apply_file(target: &Path, launcher: &Path, fish: bool) -> Result<()> {
         let metadata = file
             .metadata()
             .map_err(|e| Error::io("inspect startup file", target, e))?;
-        if metadata.uid() != rustix::process::geteuid().as_raw()
-            || file_identity(&file)? != entry.identity
-            || metadata.mode() & 0o022 != 0
+        // Group write is allowed only for the user's private group (Q80).
+        if !user_private_directory(
+            metadata.uid(),
+            metadata.gid(),
+            metadata.mode(),
+            rustix::process::geteuid().as_raw(),
+            system_private_group,
+        ) || file_identity(&file)? != entry.identity
         {
             return Err(Error::new(
                 "ownership",
@@ -222,7 +227,8 @@ fn apply_file(target: &Path, launcher: &Path, fish: bool) -> Result<()> {
         let bytes = parent
             .read(name, false, 4 * 1048576)?
             .ok_or_else(|| Error::new("ownership", "Startup file disappeared"))?;
-        (bytes, Some(metadata.permissions()))
+        let group = (metadata.mode() & 0o020 != 0).then_some(metadata.gid());
+        (bytes, Some((metadata.permissions(), group)))
     } else {
         (Vec::new(), None)
     };
@@ -235,7 +241,12 @@ fn apply_file(target: &Path, launcher: &Path, fish: bool) -> Result<()> {
     let result = (|| {
         file.write_all(&replacement)
             .map_err(|e| Error::io("write startup stage", target, e))?;
-        if let Some(ref permissions) = permissions {
+        if let Some((ref permissions, group)) = permissions {
+            // The stage may get another group; group write must stay with the private group.
+            if group.is_some() {
+                std::os::unix::fs::fchown(&file, None, group)
+                    .map_err(|e| Error::io("preserve startup group", target, e))?;
+            }
             file.set_permissions(permissions.clone())
                 .map_err(|e| Error::io("preserve startup permissions", target, e))?;
         }
@@ -253,7 +264,7 @@ fn apply_file(target: &Path, launcher: &Path, fish: bool) -> Result<()> {
                 "Startup target changed before publication",
             ));
         }
-        if let Some(ref permissions) = permissions {
+        if let Some((ref permissions, _)) = permissions {
             let current = parent.open_file(name, false, false)?;
             let metadata = current
                 .metadata()
@@ -402,6 +413,35 @@ mod tests {
         std::os::unix::fs::symlink(&target, path.join(".profile")).unwrap();
         assert!(apply_file(&path.join(".profile"), Path::new("/tmp/bin"), false).is_err());
         assert_eq!(fixture.entries().unwrap(), [".bashrc", ".profile"]);
+        std::fs::remove_dir_all(path).unwrap();
+    }
+    #[test]
+    fn startup_file_may_be_group_writable_only_by_the_private_group() {
+        use std::os::unix::fs::PermissionsExt;
+        let path = std::env::temp_dir().canonicalize().unwrap().join(format!(
+            "roost-path-{}",
+            super::super::super::random_id().unwrap()
+        ));
+        Directory::create(&path).unwrap();
+        let target = path.join(".zshrc");
+        std::fs::write(&target, b"# existing config\n").unwrap();
+        std::fs::set_permissions(&target, std::fs::Permissions::from_mode(0o646)).unwrap();
+        assert!(apply_file(&target, Path::new("/tmp/bin"), false).is_err());
+        // umask 002 under user private groups: accepted only when this host gives the
+        // user a private group (passwd/group dependent) and the file carries it.
+        let private = system_private_group();
+        if let Some(gid) = private {
+            std::os::unix::fs::chown(&target, None, Some(gid)).unwrap();
+        }
+        std::fs::set_permissions(&target, std::fs::Permissions::from_mode(0o664)).unwrap();
+        assert_eq!(
+            apply_file(&target, Path::new("/tmp/bin"), false).is_ok(),
+            private.is_some()
+        );
+        if let Some(gid) = private {
+            let metadata = std::fs::metadata(&target).unwrap();
+            assert_eq!((metadata.mode() & 0o777, metadata.gid()), (0o664, gid));
+        }
         std::fs::remove_dir_all(path).unwrap();
     }
     #[test]

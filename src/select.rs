@@ -281,7 +281,7 @@ fn pick(store: Store, root: &Path, key: &Path) -> Result<(Store, Registration, R
             records,
             table::Columns::Basic,
             table::color_for(&std::io::stderr()),
-            None,
+            platform::picker_width(),
         );
         let initial = records
             .iter()

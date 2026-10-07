@@ -47,6 +47,7 @@ const LOCK_WAIT: Duration = Duration::from_secs(10);
 const RECORD_LIMIT: usize = 4 * 1024 * 1024;
 const MANIFEST_LIMIT: usize = 1024 * 1024;
 const AUTO_UPDATE_DEADLINE: Duration = Duration::from_secs(8);
+const REFRESH_RESERVE: Duration = Duration::from_secs(2);
 const AUTO_UPDATE_INTERVAL: u64 = 24 * 60 * 60;
 /// Claude's documented grace period for orphaned plugin versions.
 const ORPHAN_AGE_MS: u128 = 14 * 24 * 60 * 60 * 1000;
@@ -763,26 +764,33 @@ fn auto_update(directory: &Directory, root_id: &str) -> Vec<String> {
         }
         let claude = launch::resolve_program("claude")?;
         let deadline = Instant::now() + AUTO_UPDATE_DEADLINE;
-        let remaining = || {
-            deadline
+        // The updates stop early enough to leave the refresh its share of the deadline.
+        let updates_by = deadline - REFRESH_RESERVE;
+        let left = |until: Instant| {
+            until
                 .checked_duration_since(Instant::now())
                 .filter(|d| !d.is_zero())
                 .ok_or_else(|| Error::new("plugin_store", "it exceeded its 8-second deadline"))
         };
-        for plugin in &record.plugins {
+        let failed = record.plugins.iter().find_map(|plugin| {
             // Claude's CLI updates exactly one plugin per call.
             let mut command = store_command(&claude, &directory.path);
             command.args(["plugin", "update", &plugin.id]);
-            let (_, exit) = launch::probe(command, "plugin_store", remaining()?)
-                .map_err(|e| Error::new("plugin_store", e.message))?;
-            if !exit.success() {
-                return Err(Error::new(
+            match left(updates_by).and_then(|t| launch::probe(command, "plugin_store", t)) {
+                Ok((_, exit)) if exit.success() => None,
+                Ok(_) => Some(Error::new(
                     "plugin_store",
                     format!("claude plugin update {} failed", plugin.id),
-                ));
+                )),
+                Err(error) => Some(Error::new("plugin_store", error.message)),
             }
+        });
+        // Claude may have changed versions before failing; re-learn the paths either way.
+        let refreshed = left(deadline).and_then(|t| refresh(&claude, directory, root_id, t));
+        if let Some(error) = failed {
+            return Err(error);
         }
-        let (record, mut warnings) = refresh(&claude, directory, root_id, remaining()?)?;
+        let (record, mut warnings) = refreshed?;
         warnings.extend(prune(directory, &record));
         Ok(warnings)
     })();
@@ -1253,7 +1261,9 @@ fn update(root: &Path, plugin: Option<&str>) -> Result<(Vec<String>, Vec<String>
         parse_id(plugin)?;
     }
     let session = Session::open(root)?;
-    let record = read_record_in(&session.store, &session.root_id)?;
+    // An unreadable record is rebuilt from Claude's listing.
+    let record = read_record_in(&session.store, &session.root_id)
+        .or_else(|_| session.refresh(Duration::from_secs(10)).map(|(r, _)| r))?;
     let known: BTreeSet<String> = record.plugins.iter().map(|p| p.id.clone()).collect();
     let ids: Vec<String> = match plugin {
         Some(plugin) => {
@@ -1296,9 +1306,20 @@ fn update(root: &Path, plugin: Option<&str>) -> Result<(Vec<String>, Vec<String>
 
 fn remove(root: &Path, plugin: &str) -> Result<(Vec<String>, Vec<String>)> {
     parse_id(plugin)?;
+    let mut warnings = vec![];
     let (id, installed, root_id) = {
         let manager = Store::open(root, true, OpenMode::Mutate)?;
-        let record = read_record(&manager)?.map(|(_, r)| r);
+        // Like list: an unreadable record warns, and the store is checked below.
+        let (record, unreadable) = match read_record(&manager) {
+            Ok(found) => (found.map(|(_, r)| r), false),
+            Err(error) => {
+                warnings.push(format!(
+                    "Plugin store record unavailable: {}",
+                    error.message
+                ));
+                (None, true)
+            }
+        };
         let known = known_ids(record.as_ref(), &manager.read_sets()?);
         let id = resolve_store(&known, plugin)?;
         manager.update_sets(|sets| {
@@ -1308,29 +1329,28 @@ fn remove(root: &Path, plugin: &str) -> Result<(Vec<String>, Vec<String>)> {
             }
             Ok(())
         })?;
-        let installed = record.is_some_and(|r| r.get(&id).is_some());
+        let installed = unreadable || record.is_some_and(|r| r.get(&id).is_some());
         (id, installed, manager.root_id.clone())
     };
     let mut lines = vec![format!("Removed {id} from every set")];
     if !installed {
         lines.push(format!("{id} was not installed in the plugin store"));
-        return Ok((lines, vec![]));
+        return Ok((lines, warnings));
     }
     let session = Session::open(root)?;
     // Reacquired: the same root, and the plugin is still recorded in its store.
     same_root(&session.root_id, &root_id)?;
-    if read_record_in(&session.store, &session.root_id)?
-        .get(&id)
-        .is_none()
-    {
+    let record = read_record_in(&session.store, &session.root_id)
+        .or_else(|_| session.refresh(Duration::from_secs(10)).map(|(r, _)| r))?;
+    if record.get(&id).is_none() {
         lines.push(format!("{id} is no longer installed in the plugin store"));
-        return Ok((lines, vec![]));
+        return Ok((lines, warnings));
     }
     session.run(
         &["plugin", "uninstall", &id],
         &format!("roost plugin remove {id}"),
     )?;
-    let (_, warnings) = session.refresh(Duration::from_secs(10))?;
+    warnings.extend(session.refresh(Duration::from_secs(10))?.1);
     lines.push(format!(
         "Uninstalled {id} from the plugin store; profiles lose it at their next launch"
     ));

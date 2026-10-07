@@ -438,14 +438,24 @@ impl Store {
             if !create || !mode.journaled() {
                 return Err(err("ownership", "Storage has no Roost root marker"));
             }
+            // Besides an empty root, the empty private lock of an interrupted or
+            // concurrent first use is ours, and a concurrent first use may have
+            // written the marker meanwhile; the marker is re-checked under the lock.
             let entries = directory.entries()?;
-            if !entries.is_empty() {
+            if entries.is_empty() {
+                if let Err(error) = directory.write_new(LOCK, b"", 0o600)
+                    && directory.entry(LOCK)?.is_none()
+                {
+                    return Err(error);
+                }
+            } else if (entries != [LOCK] || directory.read(LOCK, true, 0).is_err())
+                && directory.entry(MARKER)?.is_none()
+            {
                 return Err(err(
                     "ownership",
                     "Nonempty storage without a root marker is foreign",
                 ));
             }
-            directory.write_new(LOCK, b"", 0o600)?;
         }
         let held_lock = lock(&directory)?;
         let lock_identity = platform::file_identity(&held_lock)?;
@@ -921,6 +931,7 @@ impl Store {
             ]
             .contains(&name.as_str())
                 && !side::admitted(&self.directory, &name)?
+                && !finder_metadata(&self.directory, &name)?
             {
                 return Err(recovery(format!(
                     "Unjournaled root residue at {}",
@@ -940,7 +951,7 @@ impl Store {
                             && a.destination == self.profiles_dir.path.join(&name)
                     })
                 });
-            if !known {
+            if !known && !finder_metadata(&self.profiles_dir, &name)? {
                 return Err(recovery(format!(
                     "Unmanaged profile residue at {}",
                     self.profiles_dir.path.join(name).display()
@@ -2316,9 +2327,16 @@ impl Store {
                 }
             }
         } else {
-            self.validate(&r)?;
+            // Removal never touches a borrowed directory, so it need not still match.
+            if r.kind == Kind::Owned {
+                self.validate(&r)?;
+            }
             let (path, _) = launch::template(&self.root, &self.root_id, &r)?;
             let _ = self.launcher_state(&r, &path)?;
+            if purge {
+                // Refuse an unclaimable Desktop folder before the purge journal exists.
+                self.desktop_deletion(&r)?;
+            }
         }
         let scope = if purge {
             format!(
@@ -2568,6 +2586,15 @@ impl Store {
     }
 }
 
+/// macOS Finder's `.DS_Store`, written into any folder the user browses: a plain
+/// file Roost admits in its namespaces and never touches.
+fn finder_metadata(directory: &Directory, name: &str) -> Result<bool> {
+    Ok(name == ".DS_Store"
+        && directory
+            .entry(name)?
+            .is_some_and(|e| e.is_file && !e.is_link))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -2712,6 +2739,44 @@ mod tests {
             fs::metadata(&token).unwrap().permissions().mode() & 0o777,
             0o644
         );
+    }
+    #[test]
+    fn deleted_upstream_directory_does_not_block_unregistration() {
+        let fixture = Fixture::new();
+        let mut store = fixture.open();
+        let upstream = fixture.base.join("upstream/.ccm/profiles/Personal");
+        fs::create_dir_all(&upstream).unwrap();
+        store.register("Personal", &upstream).unwrap();
+        fs::remove_dir(&upstream).unwrap();
+        store.remove("personal", false).unwrap();
+        assert!(store.find("personal", true).is_err());
+    }
+    #[test]
+    fn finder_metadata_is_not_residue() {
+        let fixture = Fixture::new();
+        drop(fixture.open());
+        fs::write(fixture.root.join(".DS_Store"), b"").unwrap();
+        fs::write(fixture.root.join("profiles/.DS_Store"), b"").unwrap();
+        Store::open(&fixture.root, false, OpenMode::Read).unwrap();
+        fs::write(fixture.root.join("profiles/stray"), b"").unwrap();
+        assert!(Store::open(&fixture.root, false, OpenMode::Read).is_err());
+    }
+    #[test]
+    fn interrupted_first_use_lock_is_not_foreign() {
+        let seed = |fixture: &Fixture, bytes: &[u8]| {
+            fs::create_dir(&fixture.root).unwrap();
+            fs::set_permissions(&fixture.root, fs::Permissions::from_mode(0o700)).unwrap();
+            fs::write(fixture.root.join(LOCK), bytes).unwrap();
+            fs::set_permissions(fixture.root.join(LOCK), fs::Permissions::from_mode(0o600))
+                .unwrap();
+        };
+        let fixture = Fixture::new();
+        seed(&fixture, b"");
+        fixture.open();
+        assert!(fixture.root.join(MARKER).exists());
+        let other = Fixture::new();
+        seed(&other, b"x");
+        assert!(Store::open(&other.root, true, OpenMode::Mutate).is_err());
     }
     #[test]
     fn read_does_not_recover_and_uncommitted_add_rolls_back_exact_launcher() {
