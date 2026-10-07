@@ -1013,12 +1013,23 @@ fn read_ready(
     timeout: libc::c_int,
     max: usize,
 ) -> Result<Option<Vec<u8>>> {
-    let mut poll = libc::pollfd {
-        fd: descriptor,
-        events: libc::POLLIN,
-        revents: 0,
+    // select, not poll: macOS poll() rejects terminal devices (POLLNVAL), so the
+    // read below would block past a Ctrl-C or the lone-ESC timeout.
+    let mut readable: libc::fd_set = unsafe { std::mem::zeroed() };
+    unsafe { libc::FD_SET(descriptor, &mut readable) };
+    let mut wait = libc::timeval {
+        tv_sec: (timeout / 1000).into(),
+        tv_usec: ((timeout % 1000) * 1000).into(),
     };
-    let ready = unsafe { libc::poll(&mut poll, 1, timeout) };
+    let ready = unsafe {
+        libc::select(
+            descriptor + 1,
+            &mut readable,
+            std::ptr::null_mut(),
+            std::ptr::null_mut(),
+            &mut wait,
+        )
+    };
     if ready < 0 {
         if std::io::Error::last_os_error().kind() == std::io::ErrorKind::Interrupted {
             return Ok(None);
