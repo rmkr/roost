@@ -181,7 +181,7 @@ pub enum SetAction {
         #[arg(long)]
         json: bool,
     },
-    /// Create an empty set
+    /// Create an empty set; an existing set is kept as it is (--default still marks it)
     Create {
         set: String,
         /// Subscribe profiles created later with roost add

@@ -470,9 +470,17 @@ pub fn command(action: SetAction, data: &mut Value) -> Result<Vec<String>> {
         SetAction::List { .. } => unreachable!(),
         SetAction::Create { set, default } => {
             validate_set_name(&set)?;
+            // Re-running is a no-op (plus --default), so setup scripts can repeat it.
+            let mut existed = false;
             store.update_sets(|sets| {
-                if sets.sets.iter().any(|s| s.name.eq_ignore_ascii_case(&set)) {
-                    return Err(Error::new("collision", format!("Set {set} already exists")));
+                if let Some(found) = sets
+                    .sets
+                    .iter_mut()
+                    .find(|s| s.name.eq_ignore_ascii_case(&set))
+                {
+                    existed = true;
+                    found.default |= default;
+                    return Ok(());
                 }
                 sets.sets.push(SharedSet {
                     name: set.clone(),
@@ -482,7 +490,8 @@ pub fn command(action: SetAction, data: &mut Value) -> Result<Vec<String>> {
                 Ok(())
             })?;
             lines.push(format!(
-                "Created set {set}{}",
+                "{} set {set}{}",
+                if existed { "Kept existing" } else { "Created" },
                 if default { " (default)" } else { "" }
             ));
         }

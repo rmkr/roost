@@ -50,7 +50,8 @@ fn sets_are_created_marked_default_listed_and_deleted() {
     f.ok(&["add", "Work"]);
     f.ok(&["set", "create", "Core", "--default"]);
     f.ok(&["set", "create", "writing"]);
-    f.fails(&["set", "create", "core"], "collision");
+    // Re-creating keeps the set as it is, so setup scripts can repeat it.
+    f.ok(&["set", "create", "core"]);
     f.fails(&["set", "create", "bad name"], "usage");
     f.ok(&["set", "default", "writing"]);
     f.ok(&["set", "default", "CORE", "--off"]);
