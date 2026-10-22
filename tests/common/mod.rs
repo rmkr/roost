@@ -1,7 +1,8 @@
 //! The disposable fixture shared by the integration tests: a private temp directory
 //! holding fake executables in `bin/`, a fake `HOME` and a `ROOST_DIR` that does not
 //! exist yet. Commands run with a cleared environment and `PATH=bin:/usr/bin:/bin`,
-//! so the real Claude, account, credentials and startup files are never reached.
+//! and macOS Desktop is explicitly pinned to the fixture executable, so the real
+//! Claude, account, credentials and startup files are never reached.
 //! Each test crate adds its own constructor and helpers in an `impl Fixture` block.
 #![allow(dead_code, reason = "each test crate uses a different subset")]
 use serde_json::Value;
@@ -72,6 +73,9 @@ impl Fixture {
             .env("PATH", format!("{}:/usr/bin:/bin", self.bin.display()))
             .env("SHELL", "/bin/bash")
             .current_dir(&self.path);
+        // A missing fake must fail rather than discover the installed macOS app.
+        #[cfg(target_os = "macos")]
+        command.env("ROOST_DESKTOP_APP", self.bin.join("claude-desktop"));
         for (key, value) in &self.env {
             command.env(key, value);
         }

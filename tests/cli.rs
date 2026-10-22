@@ -1,6 +1,6 @@
 #![cfg(unix)]
-// The desktop helpers serve only the Linux-only desktop tests.
-#![cfg_attr(not(target_os = "linux"), allow(dead_code))]
+// Desktop integration tests use disposable fake apps on Linux and macOS.
+#![cfg_attr(not(any(target_os = "linux", target_os = "macos")), allow(dead_code))]
 mod common;
 use common::{Fixture, parsed, private};
 use serde_json::{Value, json};
@@ -38,10 +38,14 @@ sys.exit(int(os.environ.get('FAKE_CLAUDE_EXIT','0')))
 /// releases the lock and exits on SIGTERM, unless FAKE_DESKTOP_TERM=ignore; lingering
 /// lasts FAKE_DESKTOP_SECONDS (default 8).
 const FAKE_DESKTOP: &str = r#"#!/usr/bin/python3
-import json,os,signal,socket,sys,time
+import fcntl,json,os,signal,socket,sys,time
+def fd_path(fd):
+    if sys.platform!='darwin':return os.readlink('/proc/self/fd/%d'%fd)
+    try:return fcntl.fcntl(fd,50,bytes(1024)).split(b'\0',1)[0].decode()
+    except OSError:return 'pipe'
 args=sys.argv[1:]
 record={'arguments':args,'env':dict(os.environ),'session_leader':os.getsid(0)==os.getpid(),
-        'stdin':os.readlink('/proc/self/fd/0'),'stdout':os.readlink('/proc/self/fd/1'),'stderr':os.readlink('/proc/self/fd/2')}
+        'stdin':fd_path(0),'stdout':fd_path(1),'stderr':fd_path(2)}
 with open(os.environ['FAKE_DESKTOP_RECORD'],'a') as f:f.write(json.dumps(record)+'\n')
 data=[a.split('=',1)[1] for a in args if a.startswith('--user-data-dir=')]
 if data and not os.environ.get('FAKE_DESKTOP_IGNORE_DIR'):open(os.path.join(data[0],'Preferences'),'w').close()
@@ -49,7 +53,8 @@ print('chromium console noise');print('[ERROR] gpu noise',file=sys.stderr)
 if os.environ.get('FAKE_DESKTOP_MODE')=='long':
     # Like Electron: a SingletonLock link naming HOST-PID while running.
     # Without --user-data-dir: the conventional folder, when it exists.
-    folder=data[0] if data else os.path.join(os.environ.get('XDG_CONFIG_HOME') or os.path.join(os.environ['HOME'],'.config'),'Claude')
+    conventional=os.path.join(os.environ['HOME'],'Library','Application Support','Claude') if sys.platform=='darwin' else os.path.join(os.environ.get('XDG_CONFIG_HOME') or os.path.join(os.environ['HOME'],'.config'),'Claude')
+    folder=data[0] if data else conventional
     lock=os.path.join(folder,'SingletonLock') if os.path.isdir(folder) and os.environ.get('FAKE_DESKTOP_LOCK') else None
     def term(*_):
         try:
@@ -375,7 +380,7 @@ exe,root,binpath,home,no_color=sys.argv[1:]
 pid,fd=pty.fork()
 if pid==0:
     fcntl.ioctl(1,termios.TIOCSWINSZ,struct.pack('HHHH',24,40,0,0))
-    env={'ROOST_DIR':root,'HOME':home,'PATH':binpath+':/usr/bin:/bin'}
+    env={'ROOST_DIR':root,'HOME':home,'PATH':binpath+':/usr/bin:/bin','ROOST_DESKTOP_APP':os.path.join(binpath,'claude-desktop')}
     if no_color:env['NO_COLOR']=no_color
     os.execve(exe,[exe,'ls','--full'],env)
 data=b'';deadline=time.monotonic()+10
@@ -1202,7 +1207,7 @@ fn switch_selects_per_project_and_bare_roost_launches_it() {
     );
 }
 
-#[cfg(target_os = "linux")]
+#[cfg(any(target_os = "linux", target_os = "macos"))]
 #[test]
 fn desktop_gives_owned_and_upstream_profiles_their_own_data_folder() {
     let f = Fixture::new();
@@ -1271,7 +1276,7 @@ fn desktop_gives_owned_and_upstream_profiles_their_own_data_folder() {
     f.ok(&["list"]);
 }
 
-#[cfg(target_os = "linux")]
+#[cfg(any(target_os = "linux", target_os = "macos"))]
 #[test]
 fn desktop_default_alias_launches_plain_with_the_caller_environment() {
     let f = Fixture::new();
@@ -1297,7 +1302,7 @@ fn desktop_default_alias_launches_plain_with_the_caller_environment() {
     assert!(!f.root.join("state.json").exists());
 }
 
-#[cfg(target_os = "linux")]
+#[cfg(any(target_os = "linux", target_os = "macos"))]
 #[test]
 fn desktop_detaches_by_default_and_reports_an_early_exit() {
     let f = Fixture::new();
@@ -1352,13 +1357,16 @@ fn desktop_detaches_by_default_and_reports_an_early_exit() {
 }
 
 fn hostname() -> String {
-    fs::read_to_string("/proc/sys/kernel/hostname")
-        .unwrap()
-        .trim()
-        .to_owned()
+    let mut buffer = [0_u8; 256];
+    assert_eq!(
+        unsafe { libc::gethostname(buffer.as_mut_ptr().cast(), buffer.len()) },
+        0
+    );
+    let end = buffer.iter().position(|b| *b == 0).unwrap();
+    String::from_utf8(buffer[..end].to_vec()).unwrap()
 }
 
-#[cfg(target_os = "linux")]
+#[cfg(any(target_os = "linux", target_os = "macos"))]
 #[test]
 fn desktop_refuses_a_running_profile_and_warns_about_other_instances() {
     let f = Fixture::new();
@@ -1380,11 +1388,15 @@ fn desktop_refuses_a_running_profile_and_warns_about_other_instances() {
     // Another profile still launches, with the Cowork warning.
     let out = f.ok(&["desktop", "--foreground", "Other"]);
     assert!(
-        String::from_utf8_lossy(&out.stderr).contains("only one running Desktop can use Cowork")
+        String::from_utf8_lossy(&out.stderr).contains(if cfg!(target_os = "macos") {
+            "concurrent Cowork and computer use"
+        } else {
+            "only one running Desktop can use Cowork"
+        })
     );
 
     // A stale lock (dead PID or another host) is not running.
-    let mut child = Command::new("/bin/true").spawn().unwrap();
+    let mut child = Command::new("/usr/bin/true").spawn().unwrap();
     let dead = child.id();
     child.wait().unwrap();
     fs::remove_file(&lock).unwrap();
@@ -1397,12 +1409,16 @@ fn desktop_refuses_a_running_profile_and_warns_about_other_instances() {
 
     // The conventional Desktop folder counts as another instance; an alias, which
     // uses that folder, is refused while it runs.
-    let conventional = f.home.join(".config/Claude");
+    let conventional = conventional_desktop(&f);
     fs::create_dir_all(&conventional).unwrap();
     std::os::unix::fs::symlink(&live, conventional.join("SingletonLock")).unwrap();
     let out = f.ok(&["desktop", "--foreground", "Work"]);
     assert!(
-        String::from_utf8_lossy(&out.stderr).contains("only one running Desktop can use Cowork")
+        String::from_utf8_lossy(&out.stderr).contains(if cfg!(target_os = "macos") {
+            "concurrent Cowork and computer use"
+        } else {
+            "only one running Desktop can use Cowork"
+        })
     );
     f.ok(&["add", "personal", "--link-default"]);
     let out = f.run(&["desktop", "--foreground", "personal"]);
@@ -1415,11 +1431,15 @@ fn desktop_refuses_a_running_profile_and_warns_about_other_instances() {
     std::os::unix::fs::symlink(&live, &lock).unwrap();
     let out = f.ok(&["desktop", "--foreground", "personal"]);
     assert!(
-        String::from_utf8_lossy(&out.stderr).contains("only one running Desktop can use Cowork")
+        String::from_utf8_lossy(&out.stderr).contains(if cfg!(target_os = "macos") {
+            "concurrent Cowork and computer use"
+        } else {
+            "only one running Desktop can use Cowork"
+        })
     );
 }
 
-#[cfg(target_os = "linux")]
+#[cfg(any(target_os = "linux", target_os = "macos"))]
 #[test]
 fn purge_and_upstream_remove_refuse_while_that_desktop_runs() {
     let f = Fixture::new();
@@ -1477,6 +1497,7 @@ fn purge_and_upstream_remove_refuse_while_that_desktop_runs() {
 
 /// Starts NAME's Desktop detached through Roost with a live `SingletonLock` in
 /// `folder`, plus `env`, and returns the PID that lock names.
+#[cfg(target_os = "linux")]
 fn running_desktop(f: &Fixture, name: &str, folder: &Path, env: &[(&str, &str)]) -> i32 {
     let mut command = f.command();
     command
@@ -1495,6 +1516,7 @@ fn running_desktop(f: &Fixture, name: &str, folder: &Path, env: &[(&str, &str)])
     lock_pid(folder)
 }
 
+#[cfg(target_os = "linux")]
 fn lock_pid(folder: &Path) -> i32 {
     let target = fs::read_link(folder.join("SingletonLock")).unwrap();
     target
@@ -1508,6 +1530,7 @@ fn lock_pid(folder: &Path) -> i32 {
 }
 
 /// Whether `pid` is a process that has not exited (zombies count as exited).
+#[cfg(target_os = "linux")]
 fn alive(pid: i32) -> bool {
     fs::read_to_string(format!("/proc/{pid}/stat")).is_ok_and(|stat| {
         stat.rsplit_once(") ")
@@ -1623,7 +1646,7 @@ fn desktop_close_refuses_a_lock_naming_a_process_that_is_not_claude_desktop() {
     assert!(untouched, "the unrelated process was signalled");
 }
 
-#[cfg(target_os = "linux")]
+#[cfg(any(target_os = "linux", target_os = "macos"))]
 #[test]
 fn desktop_needs_the_app_on_path_and_an_active_profile() {
     let f = Fixture::new();
@@ -1649,7 +1672,7 @@ fn desktop_needs_the_app_on_path_and_an_active_profile() {
     assert!(String::from_utf8_lossy(&out.stderr).contains("not_found"));
 }
 
-#[cfg(target_os = "linux")]
+#[cfg(any(target_os = "linux", target_os = "macos"))]
 #[test]
 fn desktop_folder_follows_remove_purge_and_upstream_lifecycle() {
     let f = Fixture::new();
@@ -1724,7 +1747,7 @@ fn desktop_folder_follows_remove_purge_and_upstream_lifecycle() {
     );
 }
 
-#[cfg(target_os = "linux")]
+#[cfg(any(target_os = "linux", target_os = "macos"))]
 #[test]
 fn doctor_warns_when_desktop_ignored_its_data_folder() {
     let f = Fixture::new();
@@ -1751,7 +1774,7 @@ fn doctor_warns_when_desktop_ignored_its_data_folder() {
     assert!(!doctor.to_string().contains("desktop_data_not_isolated"));
 }
 
-#[cfg(target_os = "linux")]
+#[cfg(any(target_os = "linux", target_os = "macos"))]
 #[test]
 fn partial_desktop_deletion_keeps_the_journal_until_an_explicit_purge_retry() {
     let f = Fixture::new();
@@ -1777,7 +1800,7 @@ fn partial_desktop_deletion_keeps_the_journal_until_an_explicit_purge_retry() {
     assert!(!f.root.join("profiles/Work").exists());
 }
 
-#[cfg(target_os = "linux")]
+#[cfg(any(target_os = "linux", target_os = "macos"))]
 #[test]
 fn desktop_launch_reconciles_subscribed_skill_links() {
     let f = Fixture::new();
@@ -2071,7 +2094,7 @@ for cwd,args,keys in json.loads(cases):
     pid,fd=pty.fork()
     if pid==0:
         os.chdir(cwd)
-        env={'ROOST_DIR':root,'HOME':home,'PATH':binpath+':/usr/bin:/bin'}
+        env={'ROOST_DIR':root,'HOME':home,'PATH':binpath+':/usr/bin:/bin','ROOST_DESKTOP_APP':os.path.join(binpath,'claude-desktop')}
         env.update(json.loads(extra))
         os.execve(exe,[exe]+args,env)
     data=b'';queue=None;mark=0;deadline=time.monotonic()+20
@@ -2349,7 +2372,7 @@ fn picker_row(text: &str, name: &str) -> String {
         .to_owned()
 }
 
-#[cfg(target_os = "linux")]
+#[cfg(any(target_os = "linux", target_os = "macos"))]
 #[test]
 fn desktop_without_name_highlights_the_last_desktop_launch_and_launches_detached() {
     let f = Fixture::new();
@@ -2396,7 +2419,7 @@ fn desktop_without_name_highlights_the_last_desktop_launch_and_launches_detached
     assert_eq!(state["selections"], json!([]), "{state}");
 }
 
-#[cfg(target_os = "linux")]
+#[cfg(any(target_os = "linux", target_os = "macos"))]
 #[test]
 fn desktop_picker_falls_back_to_last_used_and_foreground_stays_attached() {
     let f = Fixture::new();
@@ -2417,7 +2440,7 @@ fn desktop_picker_falls_back_to_last_used_and_foreground_stays_attached() {
         )])
     );
     // While plain Desktop runs, the alias row, which it would refuse, is running.
-    let conventional = f.home.join(".config/Claude");
+    let conventional = conventional_desktop(&f);
     fs::create_dir_all(&conventional).unwrap();
     let live = format!("{}-{}", hostname(), std::process::id());
     std::os::unix::fs::symlink(&live, conventional.join("SingletonLock")).unwrap();
@@ -2426,7 +2449,7 @@ fn desktop_picker_falls_back_to_last_used_and_foreground_stays_attached() {
     assert!(picker_row(text, "personal").contains("running"), "{text}");
 }
 
-#[cfg(target_os = "linux")]
+#[cfg(any(target_os = "linux", target_os = "macos"))]
 #[test]
 fn desktop_picker_marks_and_refuses_a_running_profile_and_cancels_with_130() {
     let f = Fixture::new();
@@ -2531,7 +2554,7 @@ fn other_pickers_ignore_x_and_keep_their_footer() {
     );
 }
 
-#[cfg(target_os = "linux")]
+#[cfg(any(target_os = "linux", target_os = "macos"))]
 #[test]
 fn desktop_without_name_and_terminal_is_usage_naming_desktop_name() {
     let f = Fixture::new();
@@ -2547,10 +2570,17 @@ fn desktop_without_name_and_terminal_is_usage_naming_desktop_name() {
     assert!(!f.root.join("desktop").exists());
 }
 
-/// The fixture's conventional Desktop folder, signed in and with permissive modes
-/// Roost must never repair.
+fn conventional_desktop(f: &Fixture) -> PathBuf {
+    f.home.join(if cfg!(target_os = "macos") {
+        "Library/Application Support/Claude"
+    } else {
+        ".config/Claude"
+    })
+}
+
+/// A fake signed-in folder with permissive modes Roost must never repair.
 fn signed_in_desktop(f: &Fixture) -> PathBuf {
-    let conventional = f.home.join(".config/Claude");
+    let conventional = conventional_desktop(f);
     fs::create_dir_all(&conventional).unwrap();
     fs::write(conventional.join("Preferences"), "signed-in").unwrap();
     fs::set_permissions(&conventional, fs::Permissions::from_mode(0o755)).unwrap();
@@ -2561,7 +2591,7 @@ fn state_json(f: &Fixture) -> Value {
     serde_json::from_slice(&fs::read(f.root.join("state.json")).unwrap()).unwrap()
 }
 
-#[cfg(target_os = "linux")]
+#[cfg(any(target_os = "linux", target_os = "macos"))]
 #[test]
 fn linked_desktop_borrows_the_conventional_folder_in_place() {
     let f = Fixture::new();
@@ -2699,7 +2729,7 @@ fn detached_from_terminal(f: &Fixture, args: &[&str]) -> Output {
     command.output().unwrap()
 }
 
-#[cfg(target_os = "linux")]
+#[cfg(any(target_os = "linux", target_os = "macos"))]
 #[test]
 fn link_replaces_an_own_desktop_folder_only_after_confirmation() {
     let f = Fixture::new();
@@ -2743,7 +2773,7 @@ fn link_replaces_an_own_desktop_folder_only_after_confirmation() {
     f.ok(&["doctor"]);
 }
 
-#[cfg(target_os = "linux")]
+#[cfg(any(target_os = "linux", target_os = "macos"))]
 #[test]
 fn linked_desktop_shares_one_instance_with_the_alias_and_survives_removal() {
     let f = Fixture::new();
@@ -2798,7 +2828,7 @@ fn linked_desktop_shares_one_instance_with_the_alias_and_survives_removal() {
     assert!(upstream.exists());
 }
 
-#[cfg(target_os = "linux")]
+#[cfg(any(target_os = "linux", target_os = "macos"))]
 #[test]
 fn desktop_picker_shows_the_borrowed_folder_for_the_linked_and_alias_rows() {
     let f = Fixture::new();
@@ -2827,4 +2857,109 @@ fn desktop_picker_shows_the_borrowed_folder_for_the_linked_and_alias_rows() {
     assert!(picker_row(text, "Work").contains("running"), "{text}");
     assert!(picker_row(text, "personal").contains("running"), "{text}");
     assert!(f.desktop_launches().is_empty());
+}
+
+#[cfg(target_os = "macos")]
+#[test]
+fn macos_discovers_the_user_app_bundle_and_passes_the_profile_environment() {
+    let f = Fixture::new();
+    f.add("Work");
+    let app = f.home.join("Applications/Claude.app");
+    let executable = app.join("Contents/MacOS/Claude");
+    fs::create_dir_all(executable.parent().unwrap()).unwrap();
+    fs::rename(f.bin.join("claude-desktop"), &executable).unwrap();
+    let out = f
+        .command()
+        .env_remove("ROOST_DESKTOP_APP")
+        .args(["desktop", "--foreground", "Work"])
+        .output()
+        .unwrap();
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let launch = &f.desktop_launches()[0];
+    assert_eq!(
+        launch["env"]["CLAUDE_CONFIG_DIR"],
+        f.root.join("profiles/Work").to_str().unwrap()
+    );
+    assert_eq!(
+        launch["arguments"],
+        json!([format!(
+            "--user-data-dir={}",
+            f.desktop_folder("Work").display()
+        )])
+    );
+    // An explicit app path containing spaces is passed as one executable path.
+    let relocated = f.path.join("Custom Apps/Claude.app");
+    fs::create_dir_all(relocated.parent().unwrap()).unwrap();
+    fs::rename(&app, &relocated).unwrap();
+    let out = f
+        .command()
+        .env("ROOST_DESKTOP_APP", &relocated)
+        .args(["desktop", "--foreground", "Work"])
+        .output()
+        .unwrap();
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert_eq!(f.desktop_launches()[1]["arguments"], launch["arguments"]);
+}
+
+#[cfg(target_os = "macos")]
+#[test]
+fn macos_rejects_invalid_app_overrides_without_creating_desktop_data() {
+    let f = Fixture::new();
+    f.add("Work");
+    for path in ["", "relative/Claude.app", "/nonexistent/Claude.app"] {
+        let out = f
+            .command()
+            .env("ROOST_DESKTOP_APP", path)
+            .args(["desktop", "Work"])
+            .output()
+            .unwrap();
+        assert!(!out.status.success());
+        assert!(String::from_utf8_lossy(&out.stderr).contains("claude_unavailable"));
+    }
+    assert!(f.desktop_launches().is_empty());
+    assert!(!f.root.join("desktop").exists());
+}
+
+#[cfg(target_os = "macos")]
+#[test]
+fn macos_links_the_application_support_folder_and_ignores_xdg_config_home() {
+    let f = Fixture::new();
+    f.add("Work");
+    let conventional = signed_in_desktop(&f);
+    let out = f
+        .command()
+        .env("XDG_CONFIG_HOME", f.path.join("xdg"))
+        .args(["desktop", "--link", "Work"])
+        .output()
+        .unwrap();
+    assert!(out.status.success());
+    assert!(String::from_utf8_lossy(&out.stdout).contains(conventional.to_str().unwrap()));
+    assert!(!f.path.join("xdg").exists());
+    assert_eq!(
+        fs::read_to_string(conventional.join("Preferences")).unwrap(),
+        "signed-in"
+    );
+}
+
+#[cfg(target_os = "macos")]
+#[test]
+fn macos_close_leaves_a_live_lock_process_alone_and_explains_manual_quit() {
+    let f = Fixture::new();
+    f.add("Work");
+    f.ok(&["desktop", "--foreground", "Work"]);
+    let lock = f.desktop_folder("Work").join("SingletonLock");
+    std::os::unix::fs::symlink(format!("{}-{}", hostname(), std::process::id()), lock).unwrap();
+    let out = f.fails(&["desktop", "--close", "Work"], "claude_unavailable");
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(stderr.contains("Linux-only"), "{stderr}");
+    assert!(stderr.contains("from its own window or menu"), "{stderr}");
+    assert_eq!(f.desktop_launches().len(), 1);
 }

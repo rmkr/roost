@@ -1,7 +1,7 @@
-//! `roost desktop NAME` (experimental, Linux only): Claude Desktop per profile through
+//! `roost desktop NAME` (experimental, Linux and macOS): Claude Desktop per profile through
 //! Electron's undocumented `--user-data-dir` ([ADR 0002]). Owned and upstream
 //! registrations get a Roost-owned data folder (their own Desktop sign-in) plus the
-//! profile's isolated environment; a default alias starts plain `claude-desktop`.
+//! profile's isolated environment; a default alias starts plain Desktop.
 //! One owned or upstream registration may instead borrow the conventional Desktop
 //! folder in place (`--link`); Roost never copies, moves, repairs or deletes it.
 //!
@@ -19,15 +19,70 @@ use std::{
     process::Command,
 };
 
+#[cfg(not(target_os = "macos"))]
 const COWORK: &str = "Another Claude Desktop is already running; only one running Desktop can use Cowork (the first to use it), and the other gets it back only after both are closed";
 
+#[cfg(target_os = "macos")]
+const COWORK: &str = "Another Claude Desktop is already running; concurrent Cowork and computer use across profiles have not been verified on macOS";
+
+/// Resolve the actual executable, bypassing Launch Services' existing-instance
+/// reuse so every profile receives its own arguments and environment. An explicit
+/// override never falls back to another installation when it is invalid.
+fn resolve_desktop() -> Result<PathBuf> {
+    if let Some(path) = std::env::var_os("ROOST_DESKTOP_APP") {
+        return desktop_executable(PathBuf::from(path));
+    }
+    #[cfg(target_os = "macos")]
+    {
+        let mut candidates = vec![];
+        if let Ok(home) = platform::home() {
+            candidates.push(home.join("Applications/Claude.app"));
+        }
+        candidates.push(PathBuf::from("/Applications/Claude.app"));
+        for candidate in candidates {
+            if let Ok(program) = desktop_executable(candidate) {
+                return Ok(program);
+            }
+        }
+        Err(Error::new("claude_unavailable", "Cannot find Claude.app in ~/Applications or /Applications")
+            .next("Install Claude Desktop, or set ROOST_DESKTOP_APP to its absolute .app or executable path"))
+    }
+    #[cfg(not(target_os = "macos"))]
+    launch::resolve_program("claude-desktop")
+}
+
+fn desktop_executable(path: PathBuf) -> Result<PathBuf> {
+    let executable = if path.extension().is_some_and(|ext| ext == "app") {
+        path.join("Contents/MacOS/Claude")
+    } else {
+        path
+    };
+    if executable.is_absolute()
+        && executable.is_file()
+        && rustix::fs::accessat(
+            rustix::fs::CWD,
+            &executable,
+            rustix::fs::Access::EXEC_OK,
+            rustix::fs::AtFlags::EACCESS,
+        )
+        .is_ok()
+    {
+        return Ok(executable);
+    }
+    Err(Error::new(
+        "claude_unavailable",
+        "ROOST_DESKTOP_APP must select an existing absolute executable or Claude.app",
+    )
+    .next("Set ROOST_DESKTOP_APP to the installed Claude Desktop .app or executable path"))
+}
+
 fn supported() -> Result<()> {
-    if cfg!(target_os = "linux") {
+    if cfg!(any(target_os = "linux", target_os = "macos")) {
         return Ok(());
     }
     Err(Error::new(
         "claude_unavailable",
-        "roost desktop is experimental and supported only on Linux",
+        "roost desktop is experimental and supported only on Linux and macOS",
     )
     .next("Start Claude Desktop directly on this platform"))
 }
@@ -67,8 +122,16 @@ fn picker(root: &Path, no_terminal: impl Fn() -> Error) -> Result<(Store, Regist
     loop {
         let store = crate::select::open_launch(root)?;
         let actions = Actions {
-            hint: "↑/↓, Enter launch, x close, Esc cancel",
-            keys: &['x'],
+            hint: if cfg!(target_os = "macos") {
+                "↑/↓, Enter launch, Esc cancel"
+            } else {
+                "↑/↓, Enter launch, x close, Esc cancel"
+            },
+            keys: if cfg!(target_os = "macos") {
+                &[]
+            } else {
+                &['x']
+            },
             initial,
         };
         match crate::select::choose_with(
@@ -125,14 +188,14 @@ fn link_holder(store: &Store) -> Result<Option<Registration>> {
 
 /// Whether the conventional Desktop folder holds a live `SingletonLock`.
 fn conventional_running(host: Option<&str>) -> bool {
-    conventional_lock().is_some_and(|target| linux::live_lock(&target, host))
+    conventional_lock().is_some_and(|target| native::live_lock(&target, host))
 }
 
 /// Annotates the picker records with their Desktop state and renders them; the
 /// initial row is the most recent Desktop launch, else the most recent launch.
 fn picker_rows(store: &Store, records: &mut [Value]) -> (Vec<String>, usize) {
     let _ = crate::select::annotate(store, records, None);
-    let host = linux::hostname();
+    let host = native::hostname();
     let locks = store.desktop_locks().unwrap_or_default();
     let holder = link_holder(store).ok().flatten();
     let conventional = || {
@@ -177,7 +240,7 @@ fn picker_rows(store: &Store, records: &mut [Value]) -> (Vec<String>, usize) {
                 "running" => "running",
                 _ => "plain",
             },
-            (_, Some((_, Some(target)))) if linux::live_lock(target, host.as_deref()) => {
+            (_, Some((_, Some(target)))) if native::live_lock(target, host.as_deref()) => {
                 "running"
             }
             (_, Some(_)) => "signed_in",
@@ -205,8 +268,8 @@ fn already_running(message: String) -> Error {
 
 fn start(mut store: Store, registration: Registration, foreground: bool) -> Result<i32> {
     let mut env = launch::profile_env(&store, &registration, false)?;
-    let program = launch::resolve_program("claude-desktop")?;
-    let host = linux::hostname();
+    let program = resolve_desktop()?;
+    let host = native::hostname();
     let roost_running = |store: &Store, own: Option<&str>| {
         store
             .desktop_locks()
@@ -214,7 +277,7 @@ fn start(mut store: Store, registration: Registration, foreground: bool) -> Resu
             .into_iter()
             .any(|(id, lock)| {
                 Some(id.as_str()) != own
-                    && lock.is_some_and(|target| linux::live_lock(&target, host.as_deref()))
+                    && lock.is_some_and(|target| native::live_lock(&target, host.as_deref()))
             })
     };
     let mut warnings = vec![];
@@ -270,7 +333,7 @@ fn start(mut store: Store, registration: Registration, foreground: bool) -> Resu
                 .into_iter()
                 .find(|(lock_id, _)| lock_id == id)
                 .and_then(|(_, lock)| lock);
-            if own.is_some_and(|target| linux::live_lock(&target, host.as_deref())) {
+            if own.is_some_and(|target| native::live_lock(&target, host.as_deref())) {
                 return Err(already_running(format!(
                     "this profile's Desktop is already running ({})",
                     registration.name
@@ -306,9 +369,9 @@ fn start(mut store: Store, registration: Registration, foreground: bool) -> Resu
         eprintln!("warning: {warning}");
     }
     if foreground {
-        linux::foreground(command)
+        native::foreground(command)
     } else {
-        linux::detached(command, &registration.name)
+        native::detached(command, &registration.name)
     }
 }
 
@@ -352,7 +415,7 @@ pub fn link(name: &str, replace: bool, yes: bool) -> Result<Vec<String>> {
             "unsafe_path",
             "Cannot locate the existing Claude Desktop data folder",
         )
-        .next("Set HOME or XDG_CONFIG_HOME to an absolute path, then repeat the command")
+        .next("Set HOME to an absolute path (or XDG_CONFIG_HOME on Linux), then repeat the command")
     })?;
     let root = platform::root()?;
     let open = || Store::open(&root, false, OpenMode::Mutate);
@@ -467,10 +530,10 @@ pub fn forget_removed(store: &Store, registration: &Registration) -> Vec<String>
 /// own, or the borrowed conventional one) holds a live `SingletonLock` (its Desktop is
 /// running and would keep writing there).
 pub fn refuse_if_running(store: &Store, registration: &Registration) -> Result<()> {
-    let host = linux::hostname();
+    let host = native::hostname();
     let own = store.desktop_locks()?.into_iter().any(|(id, lock)| {
         id == registration.registration_id
-            && lock.is_some_and(|target| linux::live_lock(&target, host.as_deref()))
+            && lock.is_some_and(|target| native::live_lock(&target, host.as_deref()))
     });
     let borrowed = || {
         link_holder(store)
@@ -505,7 +568,7 @@ pub fn close(name: &str) -> Result<Vec<String>> {
 /// Roost folder, or the conventional folder for a linked registration or a default
 /// alias. The lock is released before signalling and waiting.
 fn close_registration(store: Store, registration: &Registration) -> Result<String> {
-    let host = linux::hostname();
+    let host = native::hostname();
     let borrowed = registration.kind == Kind::DefaultAlias
         || link_holder(&store)?
             .is_some_and(|holder| holder.registration_id == registration.registration_id);
@@ -520,11 +583,11 @@ fn close_registration(store: Store, registration: &Registration) -> Result<Strin
     };
     drop(store);
     let not_running = || format!("Claude Desktop is not running for {}", registration.name);
-    let Some(target) = lock.filter(|target| linux::live_lock(target, host.as_deref())) else {
+    let Some(target) = lock.filter(|target| native::live_lock(target, host.as_deref())) else {
         return Ok(not_running());
     };
-    let program = launch::resolve_program("claude-desktop")?;
-    match linux::terminate(&target, host.as_deref(), &program, &registration.name)? {
+    let program = resolve_desktop()?;
+    match native::terminate(&target, host.as_deref(), &program, &registration.name)? {
         true => Ok(format!("Closed Claude Desktop for {}", registration.name)),
         false => Ok(not_running()),
     }
@@ -537,13 +600,21 @@ fn record_launch(state: &mut StateFile, id: &str) {
 }
 
 /// The conventional Desktop data folder from the caller's environment:
+/// `~/Library/Application Support/Claude` on macOS; on Linux,
 /// `$XDG_CONFIG_HOME/Claude` when that is absolute, else `~/.config/Claude`.
 fn conventional_folder() -> Option<PathBuf> {
-    let config = std::env::var_os("XDG_CONFIG_HOME")
-        .map(PathBuf::from)
-        .filter(|p| p.is_absolute())
-        .or_else(|| platform::home().ok().map(|home| home.join(".config")))?;
-    Some(config.join("Claude"))
+    #[cfg(target_os = "macos")]
+    return platform::home()
+        .ok()
+        .map(|home| home.join("Library/Application Support/Claude"));
+    #[cfg(not(target_os = "macos"))]
+    {
+        let config = std::env::var_os("XDG_CONFIG_HOME")
+            .map(PathBuf::from)
+            .filter(|p| p.is_absolute())
+            .or_else(|| platform::home().ok().map(|home| home.join(".config")))?;
+        Some(config.join("Claude"))
+    }
 }
 
 /// The `SingletonLock` link of the conventional Desktop folder, if any. Read-only,
@@ -587,8 +658,8 @@ pub fn findings(store: &Store) -> Vec<Value> {
         .collect()
 }
 
-#[cfg(target_os = "linux")]
-mod linux {
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+mod native {
     use super::*;
     use std::{
         os::unix::process::CommandExt,
@@ -610,6 +681,7 @@ mod linux {
     }
 
     /// How long `terminate` waits for Desktop to exit after SIGTERM.
+    #[cfg(target_os = "linux")]
     const CLOSE_WAIT: Duration = Duration::from_secs(10);
 
     /// The PID of Electron's `SingletonLock` link text `HOST-PID` when it names this
@@ -640,6 +712,7 @@ mod linux {
     /// executable is the script's interpreter and the argument the kernel inserts
     /// after the interpreter (and its optional shebang argument) is `program`. The
     /// second form is how a script launcher (and the test fake) runs.
+    #[cfg(target_os = "linux")]
     pub(super) fn runs_program(pid: libc::pid_t, program: &Path) -> bool {
         use std::io::Read;
         let canonical = |path: &Path| std::fs::canonicalize(path).ok();
@@ -690,6 +763,7 @@ mod linux {
     /// Sends SIGTERM to the process named by the live `SingletonLock` `target` once
     /// it is verified to be `program`, then waits up to 10 seconds for it to exit.
     /// `Ok(false)` when it had already gone. Never escalates beyond SIGTERM.
+    #[cfg(target_os = "linux")]
     pub fn terminate(
         target: &Path,
         host: Option<&str>,
@@ -763,6 +837,19 @@ mod linux {
         }
     }
 
+    // macOS has no pidfd equivalent here. Do not signal a bare PID from a
+    // potentially stale Electron lock, or quit every instance by bundle ID.
+    #[cfg(target_os = "macos")]
+    pub fn terminate(_: &Path, _: Option<&str>, _: &Path, name: &str) -> Result<bool> {
+        Err(Error::new(
+            "claude_unavailable",
+            "roost desktop --close is currently Linux-only",
+        )
+        .next(format!(
+            "Quit Claude Desktop for {name} from its own window or menu"
+        )))
+    }
+
     /// Replaces Roost with Desktop, inheriting stdio, for debugging.
     pub fn foreground(mut command: Command) -> Result<i32> {
         platform::restore_for_exec()?;
@@ -815,8 +902,8 @@ mod linux {
     }
 }
 
-#[cfg(not(target_os = "linux"))]
-mod linux {
+#[cfg(not(any(target_os = "linux", target_os = "macos")))]
+mod native {
     use super::*;
     pub fn hostname() -> Option<String> {
         None
@@ -830,18 +917,18 @@ mod linux {
     pub fn foreground(_: Command) -> Result<i32> {
         Err(Error::new(
             "claude_unavailable",
-            "roost desktop is supported only on Linux",
+            "roost desktop is supported only on Linux and macOS",
         ))
     }
     pub fn detached(_: Command, _: &str) -> Result<i32> {
         Err(Error::new(
             "claude_unavailable",
-            "roost desktop is supported only on Linux",
+            "roost desktop is supported only on Linux and macOS",
         ))
     }
 }
 
-#[cfg(all(test, target_os = "linux"))]
+#[cfg(all(test, any(target_os = "linux", target_os = "macos")))]
 mod tests {
     use super::*;
 
@@ -849,31 +936,35 @@ mod tests {
     fn singleton_lock_is_live_only_for_this_host_and_an_existing_process() {
         let host = Some("my-host");
         let me = std::process::id();
-        assert!(linux::live_lock(Path::new(&format!("my-host-{me}")), host));
-        assert!(!linux::live_lock(
+        assert!(native::live_lock(Path::new(&format!("my-host-{me}")), host));
+        assert!(!native::live_lock(
             Path::new(&format!("other-host-{me}")),
             host
         ));
-        assert!(!linux::live_lock(Path::new("my-host-0"), host));
-        assert!(!linux::live_lock(Path::new("my-host-x"), host));
-        assert!(!linux::live_lock(Path::new("garbage"), host));
-        assert!(!linux::live_lock(Path::new(&format!("my-host-{me}")), None));
-        let mut child = Command::new("/bin/true").spawn().unwrap();
+        assert!(!native::live_lock(Path::new("my-host-0"), host));
+        assert!(!native::live_lock(Path::new("my-host-x"), host));
+        assert!(!native::live_lock(Path::new("garbage"), host));
+        assert!(!native::live_lock(
+            Path::new(&format!("my-host-{me}")),
+            None
+        ));
+        let mut child = Command::new("/usr/bin/true").spawn().unwrap();
         let dead = child.id();
         child.wait().unwrap();
-        assert!(!linux::live_lock(
+        assert!(!native::live_lock(
             Path::new(&format!("my-host-{dead}")),
             host
         ));
     }
 
+    #[cfg(target_os = "linux")]
     #[test]
     fn a_process_runs_the_program_only_by_its_canonical_executable() {
         let me = std::process::id() as libc::pid_t;
         let exe = std::env::current_exe().unwrap();
-        assert!(linux::runs_program(me, &exe));
-        assert!(!linux::runs_program(me, Path::new("/bin/sleep")));
-        assert!(!linux::runs_program(
+        assert!(native::runs_program(me, &exe));
+        assert!(!native::runs_program(me, Path::new("/bin/sleep")));
+        assert!(!native::runs_program(
             me,
             Path::new("/nonexistent/claude-desktop")
         ));

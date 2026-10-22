@@ -666,7 +666,7 @@ fn every_launch_path_reconciles_settings_into_owned_profiles_only() {
         }),
     ];
     for (name, launch) in paths {
-        if name == "desktop" && !cfg!(target_os = "linux") {
+        if name == "desktop" && !cfg!(any(target_os = "linux", target_os = "macos")) {
             continue;
         }
         reset();
@@ -679,7 +679,7 @@ fn every_launch_path_reconciles_settings_into_owned_profiles_only() {
     f.ok(&["set", "subscribe", "up", "core"]);
     fs::write(upstream.join("settings.json"), "{}").unwrap();
     f.ok(&["run", "up"]);
-    if cfg!(target_os = "linux") {
+    if cfg!(any(target_os = "linux", target_os = "macos")) {
         f.ok(&["desktop", "--foreground", "up"]);
     }
     assert_eq!(
