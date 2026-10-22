@@ -4,7 +4,7 @@
 
 Roost is a Rust CLI for selecting Claude configuration profiles while keeping your existing Claude installation. It can create owned profiles, register upstream profiles at their unchanged paths, and launch native browser login and saved conversations. It also remembers which profile each project uses, shares skills, instructions, settings and plugins across profiles, and can start Claude Desktop per profile.
 
-This is a source-only development build. Local Linux automated tests and disposable Bash/Fish checks pass, and the automated tests pass on macOS (Apple silicon), where `roost desktop` is unavailable. Native Windows is unsupported and does not compile; on Windows, use a Linux Roost and Claude installation in WSL 2. Other architectures, WSL and real-account acceptance remain unverified. No prebuilt downloads or package publication are provided.
+This is a source-only development build. Local Linux automated tests and disposable Bash/Fish checks pass, and the automated tests cover macOS (Apple silicon), including experimental Desktop launches with disposable fake apps. Native Windows is unsupported and does not compile; on Windows, use a Linux Roost and Claude installation in WSL 2. Other architectures, WSL and real-account acceptance remain unverified. No prebuilt downloads or package publication are provided.
 
 Terms such as profile, account, owned, registered upstream, selected profile and shared set are defined in the [glossary](GLOSSARY.md).
 
@@ -153,26 +153,39 @@ roost plugin remove PLUGIN
 
 Marketplace and install use your own git credentials; marketplaces hosted on claude.ai (organization libraries) cannot be added to the store. `roost update` still only runs `claude update`.
 
-## Claude Desktop (experimental, Linux)
+## Claude Desktop (experimental, Linux and macOS)
 
 `roost desktop` starts Claude Desktop with a profile's configuration and its own Desktop data folder, so each profile has its own Desktop sign-in. It relies on Electron's undocumented `--user-data-dir`, which a Desktop update may break; `roost doctor` checks that the data actually landed in the profile's folder. See [ADR 0002](docs/adr/0002-desktop-per-profile-via-user-data-dir.md).
+
+On macOS, Roost starts the executable inside `~/Applications/Claude.app` or `/Applications/Claude.app` directly, so a new profile receives its own environment and data folder. It uses the installed, signed app without copying or modifying it. On Linux, `claude-desktop` must be on PATH. Set `ROOST_DESKTOP_APP` to an absolute executable path (or Claude.app path on macOS) to select another installation; an invalid override fails without falling back.
+
+To keep work and personal Desktop sign-ins separately:
+
+```sh
+roost add work
+roost add personal
+roost desktop work          # sign in to your work account in this window
+roost desktop personal      # sign in to your personal account in this window
+```
+
+Each profile reuses its own Desktop data folder on later launches. Desktop sign-in is separate from CLI sign-in. On macOS this is experimental. The initial multi-account workflow was reported working in manual use; automated tests use fake apps, and broader authentication callback and Keychain behavior still need acceptance testing. Concurrent Cowork and computer use across macOS profiles are unverified.
 
 ```sh
 roost desktop                  # picker, then launch
 roost desktop work             # launch work's Desktop, detached
 roost desktop --foreground work
-roost desktop --close work
+roost desktop --close work     # Linux only; on macOS quit from the app
 roost desktop --link work      # work borrows the existing Desktop folder
 roost desktop --link --replace work
 roost desktop --unlink work
 ```
 
 - Desktop starts detached; Roost waits up to 2 seconds for early failure, then exits. `--foreground` stays attached with Desktop's output, for debugging.
-- The picker shows each profile's Desktop state (`running`, `signed in`, `—`). In it, `x` closes the highlighted profile's running Desktop.
-- `--close` asks the profile's running Desktop to quit (SIGTERM, up to 10 seconds) after verifying the process; it never force-kills.
-- Launching a profile whose Desktop is already running is refused. Different profiles' Desktops can run at once, but only the first to use Cowork gets it; the other cannot use Cowork until both are closed. Roost warns when another Desktop is running.
-- `--link NAME` lets one owned or upstream profile use the existing, already signed-in folder (`~/.config/Claude`) in place. Roost never copies, moves or deletes it, and the default alias then shares the same instance. If NAME already has its own Roost Desktop folder, `--link --replace` deletes that folder after confirmation (`--yes` skips it).
-- The default alias starts plain `claude-desktop` with its usual folder.
+- The picker shows each profile's Desktop state (`running`, `signed in`, `—`). On Linux, `x` closes the highlighted profile's running Desktop.
+- On Linux, `--close` asks the profile's running Desktop to quit (SIGTERM, up to 10 seconds) after verifying the process; it never force-kills. On macOS, quit the profile's Desktop from its own window or menu; Roost does not signal bare PIDs from lock files or quit every instance by bundle ID.
+- Launching a profile whose Desktop is already running is refused. Different profiles' Desktops can run at once. On Linux, only the first to use Cowork gets it; the other cannot use Cowork until both are closed. Roost warns when another Desktop is running; on macOS, the warning notes the unverified concurrent Cowork and computer-use behavior.
+- `--link NAME` lets one owned or upstream profile use the existing, already signed-in folder (`~/Library/Application Support/Claude` on macOS; `$XDG_CONFIG_HOME/Claude` or `~/.config/Claude` on Linux) in place. Roost never copies, moves or deletes it, and the default alias then shares the same instance. If NAME already has its own Roost Desktop folder, `--link --replace` deletes that folder after confirmation (`--yes` skips it).
+- The default alias starts the installed Desktop with its usual folder.
 
 Desktop folders live in Roost's storage, not inside profiles. `remove` keeps an owned profile's folder; `remove --purge` deletes it; removing an upstream registration deletes its Roost Desktop folder after confirmation. A borrowed folder is never touched.
 

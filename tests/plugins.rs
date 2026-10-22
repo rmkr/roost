@@ -697,7 +697,7 @@ fn upstream_switch_bare_and_desktop_launches_inject_but_aliases_and_update_do_no
     let out = f.ok(&[]);
     assert_eq!(parsed(&out)["env"]["CLAUDE_CODE_PLUGIN_DIRS"], s(&expected));
     // Desktop gets the same environment.
-    #[cfg(target_os = "linux")]
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
     {
         f.ok(&["desktop", "--foreground", "Work"]);
         let record: Value = serde_json::from_str(

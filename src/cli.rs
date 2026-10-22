@@ -110,7 +110,7 @@ pub enum Action {
     },
     /// Show help for Roost or one manager command
     Help { command: Option<String> },
-    /// Experimental, Linux only: start Claude Desktop with this profile's own Desktop
+    /// Experimental, Linux and macOS: start Claude Desktop with this profile's own Desktop
     /// data folder (sign-in) and configuration; detached unless --foreground.
     /// Without NAME, choose the profile from a picker. --link NAME makes NAME's
     /// Desktop borrow the existing Claude Desktop data folder in place; --close NAME
@@ -119,7 +119,7 @@ pub enum Action {
         /// Stay attached with Desktop's console output, for debugging
         #[arg(long, conflicts_with_all = ["link", "unlink"])]
         foreground: bool,
-        /// Ask NAME's running Claude Desktop to quit (SIGTERM, waits up to 10 seconds)
+        /// Linux only: ask NAME's running Claude Desktop to quit (SIGTERM, waits up to 10 seconds)
         #[arg(long, requires = "name", conflicts_with_all = ["foreground", "link", "unlink", "replace", "yes"])]
         close: bool,
         /// Let NAME's Desktop use the existing Claude Desktop data folder in place
