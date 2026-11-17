@@ -2,7 +2,7 @@
 
 ![Roost: friendly birds sharing one perch, each with its own profile](docs/banner.png)
 
-Roost is a Rust CLI for selecting Claude configuration profiles while keeping your existing Claude installation. It can create owned profiles, register upstream profiles at their unchanged paths, and launch native browser login and saved conversations. It also remembers which profile each project uses, shares skills, instructions, settings and plugins across profiles, and can start Claude Desktop per profile.
+Roost manages profiles for Claude and Codex. It can give a T3 Code provider its own Codex home folder for a work account. For Claude, it can create profiles, register existing ones, remember which profile each project uses, share settings and plugins, and start Claude Desktop per profile.
 
 This is a source-only development build. Local Linux automated tests and disposable Bash/Fish checks pass, and the automated tests cover macOS (Apple silicon), including experimental Desktop launches with disposable fake apps. Native Windows is unsupported and does not compile; on Windows, use a Linux Roost and Claude installation in WSL 2. Other architectures, WSL and real-account acceptance remain unverified. No prebuilt downloads or package publication are provided.
 
@@ -21,9 +21,25 @@ roost doctor
 
 Keep Cargo's normal collision protection: do not force-overwrite an unrelated `roost` executable. Cargo owns its installation root/bin; Roost's profile storage and generated-launcher PATH are separate. Check which executable your shell resolves before use.
 
-Roost requires an existing supported Claude installation on PATH, with Claude Code 2.1.280 or later. Roost does not install Claude.
+For Codex profiles, install the Codex CLI. For Claude profiles, install Claude Code 2.1.280 or later on PATH.
 
-## First profile and login
+## Use a Codex work profile in T3 Code
+
+Create the profile and sign in with your work ChatGPT account. The last command prints the absolute path to the profile's home folder.
+
+```sh
+roost codex add work
+roost codex login work
+roost codex home work
+```
+
+1. In T3 Code, open **Settings → Providers**. Add a Codex provider or edit your work provider.
+2. Choose **Use existing CLI**. Paste the path from `roost codex home work` into **CODEX_HOME path**. Leave **Shadow home path** empty.
+3. Give the provider a name such as **ChatGPT - Work**. Enable it and select it when you start a new thread.
+
+The home path selects the profile. You can rename the provider in T3 Code and keep using the same account.
+
+## First Claude profile and login
 
 ```sh
 roost add work
