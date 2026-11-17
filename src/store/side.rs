@@ -373,6 +373,7 @@ impl Store {
         let name = match name {
             Reserved::PluginStore => PLUGIN_STORE,
             Reserved::Desktop => DESKTOP,
+            Reserved::Codex => CODEX,
         };
         if self.directory.entry(name)?.is_some() {
             return self.directory.child(name, true).map(Some);
@@ -386,7 +387,7 @@ impl Store {
         Ok(Some(created))
     }
 
-    fn side_ready(&self) -> Result<()> {
+    pub(super) fn side_ready(&self) -> Result<()> {
         if self.mode == OpenMode::Read {
             return Err(err(
                 "ownership",
@@ -492,11 +493,13 @@ pub const SETS: &str = "sets.json";
 pub const PLUGIN_STORE: &str = "plugin-store";
 /// Lazily created parent of per-registration Desktop folders (ticket 09).
 pub const DESKTOP: &str = "desktop";
+const CODEX: &str = "codex";
 /// A lazily created reserved root directory.
 #[derive(Clone, Copy)]
 pub enum Reserved {
     PluginStore,
     Desktop,
+    Codex,
 }
 const TEMP_PREFIX: &str = ".roost-state-";
 const TEMP_SUFFIX: &str = ".tmp";
@@ -512,7 +515,7 @@ fn is_temp(name: &str) -> bool {
 pub(super) fn admitted(root: &Directory, name: &str) -> Result<bool> {
     let directory = match name {
         STATE | SETS => false,
-        PLUGIN_STORE | DESKTOP => true,
+        PLUGIN_STORE | DESKTOP | CODEX => true,
         _ if is_temp(name) => false,
         _ => return Ok(false),
     };

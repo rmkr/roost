@@ -207,7 +207,7 @@ impl Store {
     /// `desktop_delete` operation (the caller confirmed it); registrations are
     /// unchanged. Returns whether a folder was deleted.
     pub fn delete_desktop_folder(&mut self, r: &Registration) -> Result<bool> {
-        self.writable(false)?;
+        self.writable()?;
         let Some(artifact) = self.desktop_deletion(r)? else {
             return Ok(false);
         };

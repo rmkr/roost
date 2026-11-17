@@ -9,7 +9,7 @@ mod settings;
 mod store;
 mod table;
 
-use cli::Action;
+use cli::{Action, CodexAction};
 use serde_json::{Value, json};
 use std::{
     io::{self, Write},
@@ -243,6 +243,7 @@ fn dispatch(action: Action, data: &mut Value) -> Result<Outcome> {
             apply,
         )?)),
         Action::Doctor { .. } => doctor(data),
+        Action::Codex { action } => codex(action),
         Action::Desktop {
             name: Some(name),
             close: true,
@@ -610,6 +611,34 @@ fn dispatch(action: Action, data: &mut Value) -> Result<Outcome> {
             Ok(Outcome::lines(messages))
         }
     }
+}
+
+fn codex(action: CodexAction) -> Result<Outcome> {
+    let root = platform::root()?;
+    let home = match action {
+        CodexAction::Add { name } => Store::open(&root, true, OpenMode::CodexAdd)?
+            .add_codex_home(&name.to_ascii_lowercase())?,
+        CodexAction::Home { name } => {
+            open(&root, OpenMode::Read)?.codex_home(&name.to_ascii_lowercase())?
+        }
+        CodexAction::Login { name } => {
+            let home = open(&root, OpenMode::Read)?.codex_home(&name.to_ascii_lowercase())?;
+            let mut command = process::Command::new(launch::resolve_program("codex")?);
+            command
+                .env("CODEX_HOME", home)
+                .env_remove("OPENAI_API_KEY")
+                .env_remove("CODEX_API_KEY")
+                .env_remove("CODEX_ACCESS_TOKEN")
+                // Login does not need the caller's project config.
+                .current_dir("/")
+                .args(["login", "-c", store::FILE_AUTH]);
+            return Ok(Outcome {
+                exit: launch::exec(command, &[], "Codex")?,
+                ..Outcome::quiet()
+            });
+        }
+    };
+    Ok(Outcome::lines(vec![home.display().to_string()]))
 }
 
 fn doctor(data: &mut Value) -> Result<Outcome> {

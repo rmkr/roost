@@ -142,6 +142,12 @@ pub enum Action {
         #[command(subcommand)]
         action: PluginAction,
     },
+    /// Manage named private Codex homes
+    #[command(disable_help_subcommand = true)]
+    Codex {
+        #[command(subcommand)]
+        action: CodexAction,
+    },
     #[command(skip)]
     Version,
     #[command(skip)]
@@ -171,6 +177,16 @@ pub enum Action {
         allow_auth_env: bool,
         arguments: Vec<OsString>,
     },
+}
+
+#[derive(Subcommand, Debug)]
+pub enum CodexAction {
+    /// Create a private Codex home with file-based credential storage
+    Add { name: String },
+    /// Print the absolute path of a Codex home for T3 Code or CODEX_HOME
+    Home { name: String },
+    /// Open Codex's native sign-in for this home
+    Login { name: String },
 }
 
 /// `roost set ...` subcommands.
@@ -351,6 +367,10 @@ impl Action {
             }
             | Self::Set {
                 action: SetAction::Subscribe { name, .. } | SetAction::Unsubscribe { name, .. },
+            }
+            | Self::Codex {
+                action:
+                    CodexAction::Add { name } | CodexAction::Home { name } | CodexAction::Login { name },
             }
             | Self::Switch {
                 name: Some(name), ..

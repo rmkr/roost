@@ -21,9 +21,11 @@ const JOURNAL: &str = ".roost-operation.json";
 const LOCK: &str = ".roost-lock";
 const LIMIT: usize = 4 * 1024 * 1024;
 
+mod codex;
 mod desktop;
 mod plugin_store;
 pub mod side;
+pub(crate) use codex::FILE_AUTH;
 
 #[derive(Clone, Copy, Debug, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
@@ -184,6 +186,8 @@ pub enum OpenMode {
     Read,
     Mutate,
     RetryPurge,
+    /// May initialize a root for Codex. Never recovers a Claude operation.
+    CodexAdd,
     /// Launch preparation: like Read (never recovers), but may replace side files
     /// (`state.json`, `sets.json`) while no intent is pending. Its one journaled
     /// mutation is `desktop_create`: the first `roost desktop` launch of a
@@ -423,6 +427,7 @@ impl Store {
 
     pub fn open(root: &Path, create: bool, mode: OpenMode) -> Result<Self> {
         let root = platform::absolute(root)?;
+        let can_initialize = mode.journaled() || mode == OpenMode::CodexAdd;
         let parent = Directory::open(
             root.parent()
                 .ok_or_else(|| err("unsafe_path", "Storage cannot be a filesystem root"))?,
@@ -431,11 +436,16 @@ impl Store {
         let name = file_name(&root)?;
         let directory = match parent.entry(name)? {
             Some(_) => parent.child(name, true)?,
-            None if create && mode.journaled() => parent.create_dir(name)?,
+            None if create && can_initialize => match parent.create_dir(name) {
+                Err(e) if e.code == "collision" && mode == OpenMode::CodexAdd => {
+                    parent.child(name, true)?
+                }
+                result => result?,
+            },
             None => return Err(err("not_found", "Roost storage is not initialized")),
         };
         if directory.entry(MARKER)?.is_none() {
-            if !create || !mode.journaled() {
+            if !create || !can_initialize {
                 return Err(err("ownership", "Storage has no Roost root marker"));
             }
             // Besides an empty root, the empty private lock of an interrupted or
@@ -484,7 +494,7 @@ impl Store {
             ));
         }
         let absent_registry = directory.entry(REGISTRY)?.is_none();
-        if absent_registry && !mode.journaled() {
+        if absent_registry && !can_initialize {
             return Err(recovery("Root marker exists without a committed registry"));
         }
         // Interrupted bootstrap is recognizable only by its exact private root marker,
@@ -572,7 +582,14 @@ impl Store {
             let stage = store.begin(Operation::Initialize, None)?;
             store.commit(store.registry.clone(), &stage)?;
         }
-        if mode == OpenMode::Mutate && store.pending() {
+        if store.pending()
+            && (mode == OpenMode::Mutate
+                || (mode == OpenMode::CodexAdd
+                    && store
+                        .intent
+                        .as_ref()
+                        .is_some_and(|j| j.operation == Operation::Initialize)))
+        {
             store.recover()?;
         }
         if mode == OpenMode::RetryPurge
@@ -897,16 +914,16 @@ impl Store {
         }
         Ok(())
     }
-    /// Refuses Read mode, and Launch mode unless `launch_allowed` (only the
-    /// journaled `desktop_create` runs while launching).
-    fn writable(&self, launch_allowed: bool) -> Result<()> {
-        if self.mode.journaled() || (launch_allowed && self.mode == OpenMode::Launch) {
+    fn writable(&self) -> Result<()> {
+        if self.mode.journaled() {
             return Ok(());
         }
         Err(err("ownership", "Read-only store cannot mutate"))
     }
-    fn journal_ready(&self, launch_allowed: bool) -> Result<()> {
-        self.writable(launch_allowed)?;
+    fn journal_ready(&self, allowed: bool) -> Result<()> {
+        if !allowed {
+            self.writable()?;
+        }
         self.check_root()?;
         if self.pending() {
             return Err(recovery(
@@ -994,7 +1011,11 @@ impl Store {
         self.directory.sync()
     }
     fn begin(&mut self, operation: Operation, id: Option<String>) -> Result<Directory> {
-        self.journal_ready(operation == Operation::DesktopCreate)?;
+        self.journal_ready(matches!(
+            (self.mode, operation),
+            (OpenMode::Launch, Operation::DesktopCreate)
+                | (OpenMode::CodexAdd, Operation::Initialize)
+        ))?;
         let operation_id = platform::random_id()?;
         let next_generation = self
             .registry
@@ -2361,7 +2382,7 @@ impl Store {
         Ok((scope, r))
     }
     pub fn remove(&mut self, name: &str, purge: bool) -> Result<Vec<String>> {
-        self.writable(false)?;
+        self.writable()?;
         let (_, r) = self.preflight_remove(name, purge)?;
         if !purge && r.state == State::Retained {
             return Ok(vec![
@@ -2654,6 +2675,22 @@ mod tests {
         store.intent.as_mut().unwrap().phase = Phase::Publishing;
         store.save_intent().unwrap();
     }
+
+    #[test]
+    fn codex_add_does_not_recover_a_pending_claude_operation() {
+        let f = Fixture::new();
+        let mut store = f.open();
+        prepared_alias(&mut store, "claude-work");
+        drop(store);
+        let journal = fs::read(f.root.join(JOURNAL)).unwrap();
+
+        let store = Store::open(&f.root, true, OpenMode::CodexAdd).unwrap();
+        assert!(store.pending());
+        assert_eq!(store.add_codex_home("work").unwrap_err().code, "ownership");
+        assert_eq!(fs::read(f.root.join(JOURNAL)).unwrap(), journal);
+        assert!(!f.root.join("codex").exists());
+    }
+
     #[test]
     fn exact_schema_rejects_missing_null_unknown_fields_and_names() {
         let r = alias("Work");

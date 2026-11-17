@@ -655,6 +655,36 @@ impl Directory {
             .map_err(|e| native_error("rename entry", &destination.path.join(new_name), e))
     }
 
+    pub(crate) fn publish_new_child(
+        &self,
+        name: &str,
+        child: &Directory,
+        new_name: &str,
+    ) -> Result<()> {
+        valid_name(new_name)?;
+        self.verify_namespace()?;
+        if self.entry(name)?.map(|entry| entry.identity) != Some(child.identity()?) {
+            return Err(Error::new("ownership", "Staged directory was replaced"));
+        }
+        #[cfg(any(target_os = "linux", target_vendor = "apple"))]
+        return fs::renameat_with(
+            &self.file,
+            name,
+            &self.file,
+            new_name,
+            fs::RenameFlags::NOREPLACE,
+        )
+        .map_err(|e| native_error("publish directory", &self.path.join(new_name), e));
+        #[cfg(not(any(target_os = "linux", target_vendor = "apple")))]
+        {
+            // The caller holds the root lock and this parent is private.
+            if self.entry(new_name)?.is_some() {
+                return Err(Error::new("collision", "Destination already exists"));
+            }
+            self.rename(name, self, new_name)
+        }
+    }
+
     pub fn remove(&self, name: &str, directory: bool) -> Result<()> {
         valid_name(name)?;
         fs::unlinkat(

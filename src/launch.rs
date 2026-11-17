@@ -278,8 +278,12 @@ pub fn resolve_program(name: &str) -> Result<PathBuf> {
 }
 
 fn resolve_in(name: &str, path: Option<OsString>) -> Result<PathBuf> {
-    let path = path
-        .ok_or_else(|| Error::new("claude_unavailable", format!("PATH does not select {name}")))?;
+    let code = if name == "codex" {
+        "codex_unavailable"
+    } else {
+        "claude_unavailable"
+    };
+    let path = path.ok_or_else(|| Error::new(code, format!("PATH does not select {name}")))?;
     for directory in env::split_paths(&path) {
         let candidate = platform::absolute(&directory.join(name))?;
         if let Ok(metadata) = candidate.metadata()
@@ -295,15 +299,15 @@ fn resolve_in(name: &str, path: Option<OsString>) -> Result<PathBuf> {
             return Ok(candidate);
         }
     }
-    Err(Error::new(
-        "claude_unavailable",
-        format!("No executable {name} was found on PATH"),
+    Err(
+        Error::new(code, format!("No executable {name} was found on PATH")).next(
+            if name == "claude" {
+                "Make the existing shared Claude installation available on PATH".to_owned()
+            } else {
+                format!("Make {name} available on PATH")
+            },
+        ),
     )
-    .next(if name == "claude" {
-        "Make the existing shared Claude installation available on PATH".to_owned()
-    } else {
-        format!("Make {name} available on PATH")
-    }))
 }
 
 fn nonblocking(pipe: &impl std::os::fd::AsRawFd) -> io::Result<()> {
@@ -467,9 +471,13 @@ pub fn claude_info() -> Result<(PathBuf, String)> {
 
 pub fn execute(command: Command, arguments: &[OsString]) -> Result<i32> {
     version_at(command.get_program())?;
-    exec(command, arguments)
+    exec(command, arguments, "Claude")
 }
-fn exec(mut command: Command, arguments: &[OsString]) -> Result<i32> {
+pub(crate) fn exec(
+    mut command: Command,
+    arguments: &[OsString],
+    installation: &str,
+) -> Result<i32> {
     if platform::cancelled() {
         return Err(Error::cancelled());
     }
@@ -479,7 +487,7 @@ fn exec(mut command: Command, arguments: &[OsString]) -> Result<i32> {
     let _ = command.exec();
     // A failed exec may already have changed process environment/stdio.
     // No returning to manager mutation/state reuse after this boundary.
-    eprintln!("roost: io: Could not execute the selected Claude installation");
+    eprintln!("roost: io: Could not execute the selected {installation} installation");
     std::process::exit(1);
 }
 /// No version floor: `claude update` is how an unsupported installation is fixed.
@@ -488,6 +496,7 @@ pub fn update() -> Result<i32> {
     exec(
         Command::new(resolve_program("claude")?),
         &[OsString::from("update")],
+        "Claude",
     )
 }
 
