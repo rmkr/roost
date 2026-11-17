@@ -136,11 +136,17 @@ pub enum Action {
         yes: bool,
         name: Option<String>,
     },
-    /// Manage the shared plugin store and its plugins
+    /// Install and manage plugins and portable skills
     #[command(disable_help_subcommand = true)]
     Plugin {
         #[command(subcommand)]
         action: PluginAction,
+    },
+    /// Register and list repositories for managed skill installs
+    #[command(disable_help_subcommand = true)]
+    Project {
+        #[command(subcommand)]
+        action: ProjectAction,
     },
     /// Manage named private Codex homes
     #[command(disable_help_subcommand = true)]
@@ -157,6 +163,8 @@ pub enum Action {
         registration_id: String,
         arguments: Vec<OsString>,
     },
+    #[command(name = "__managed-plugin-check", hide = true)]
+    ManagedPluginCheck { root: PathBuf, root_id: String },
     /// Select a profile for this project (NAME, or choose with a picker) and launch it; manager options precede NAME
     Switch {
         #[arg(long)]
@@ -242,8 +250,34 @@ pub enum SetAction {
 /// `roost plugin ...` subcommands.
 #[derive(Subcommand, Debug)]
 pub enum PluginAction {
-    /// List store plugins known to Roost, their sets and the auto-update setting
+    /// List shared store plugins or managed installs and their target status
     List {
+        #[arg(long)]
+        json: bool,
+        #[arg(long)]
+        managed: bool,
+    },
+    /// Install native plugins or portable skills for selected repositories or profiles
+    Install(InstallArgs),
+    /// Check managed installs for updates without changing installed files
+    Check {
+        source: Option<String>,
+        #[arg(long)]
+        json: bool,
+    },
+    /// Retry failed installs and apply rules to new eligible targets
+    Sync {
+        source: Option<String>,
+        #[arg(long)]
+        yes: bool,
+        #[arg(long)]
+        json: bool,
+    },
+    /// Remove a managed install and its unreferenced, Roost-owned artifacts
+    Uninstall {
+        source: String,
+        #[arg(long)]
+        yes: bool,
         #[arg(long)]
         json: bool,
     },
@@ -264,10 +298,16 @@ pub enum PluginAction {
         #[arg(long)]
         no_set: bool,
     },
-    /// Update one store plugin, or all of them
+    /// Update shared store plugins, or apply checked updates to managed installs
     Update {
         #[arg(value_name = "PLUGIN")]
         plugin: Option<String>,
+        #[arg(long)]
+        managed: bool,
+        #[arg(long, requires = "managed")]
+        yes: bool,
+        #[arg(long, requires = "managed")]
+        json: bool,
     },
     /// Turn the daily launch-time plugin update on or off
     AutoUpdate {
@@ -281,6 +321,76 @@ pub enum PluginAction {
         #[arg(value_name = "PLUGIN")]
         plugin: String,
     },
+}
+
+#[derive(Subcommand, Debug)]
+pub enum ProjectAction {
+    /// Register a repository checkout for managed skills
+    Add {
+        path: PathBuf,
+        #[arg(long)]
+        json: bool,
+    },
+    /// List registered repository checkouts
+    List {
+        #[arg(long)]
+        json: bool,
+    },
+}
+
+#[derive(
+    Clone,
+    Copy,
+    Debug,
+    PartialEq,
+    Eq,
+    PartialOrd,
+    Ord,
+    clap::ValueEnum,
+    serde::Serialize,
+    serde::Deserialize,
+)]
+#[serde(rename_all = "snake_case")]
+pub(crate) enum Agent {
+    Claude,
+    Codex,
+}
+
+#[derive(Args, Debug)]
+pub struct InstallArgs {
+    pub source: String,
+    /// Use the repository containing the current directory
+    #[arg(long, conflicts_with_all = ["repo", "all_repos"])]
+    pub here: bool,
+    /// Select a Git repository checkout (repeatable)
+    #[arg(long, conflicts_with = "all_repos")]
+    pub repo: Vec<PathBuf>,
+    /// Use all repositories, or all registered checkouts for portable skills
+    #[arg(long)]
+    pub all_repos: bool,
+    /// Select a Claude or Codex profile (repeatable)
+    #[arg(long, conflicts_with_all = ["all_profiles", "skills"])]
+    pub profile: Vec<String>,
+    /// Include all compatible profiles and profiles added later
+    #[arg(long, conflicts_with = "skills")]
+    pub all_profiles: bool,
+    /// Select a coding agent (repeatable)
+    #[arg(long)]
+    pub agent: Vec<Agent>,
+    /// Install portable skills into the checkout
+    #[arg(long, requires = "skill")]
+    pub skills: bool,
+    /// Select a skill by name (repeatable), or '*' for every skill
+    #[arg(long, requires = "skills")]
+    pub skill: Vec<String>,
+    /// Show the planned targets without writing files
+    #[arg(long)]
+    pub dry_run: bool,
+    /// Apply the resolved targets without a terminal confirmation
+    #[arg(long)]
+    pub yes: bool,
+    #[arg(long)]
+    pub json: bool,
 }
 
 /// `roost plugin marketplace ...` subcommands.
@@ -349,7 +459,16 @@ impl Action {
                     action: SetAction::List { json: true }
                 }
                 | Self::Plugin {
-                    action: PluginAction::List { json: true }
+                    action: PluginAction::List { json: true, .. }
+                        | PluginAction::Install(InstallArgs { json: true, .. })
+                        | PluginAction::Check { json: true, .. }
+                        | PluginAction::Sync { json: true, .. }
+                        | PluginAction::Update { json: true, .. }
+                        | PluginAction::Uninstall { json: true, .. }
+                }
+                | Self::Project {
+                    action: ProjectAction::Add { json: true, .. }
+                        | ProjectAction::List { json: true }
                 }
         )
     }

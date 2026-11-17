@@ -917,3 +917,86 @@ fn doctor_reports_store_plugins_shadowing_native_installs() {
     assert_eq!(probe["arguments"], json!(["plugin", "list", "--json"]));
     assert_eq!(probe["root_lock_held"], false);
 }
+
+#[test]
+fn managed_claude_plugin_matches_repository_and_profile_and_blocks_legacy_removal() {
+    let f = Fixture::new();
+    let included = f.path.join("included");
+    let excluded = f.path.join("excluded");
+    for path in [&included, &excluded] {
+        fs::create_dir(path).unwrap();
+        assert!(
+            Command::new("/usr/bin/git")
+                .env_clear()
+                .args(["init", "-q", s(path)])
+                .status()
+                .unwrap()
+                .success()
+        );
+    }
+    f.ok(&["add", "Work"]);
+    f.ok(&["add", "Personal"]);
+    f.ok(&["plugin", "marketplace", "add", "tools"]);
+    f.ok(&[
+        "plugin",
+        "install",
+        "claude:fmt@tools",
+        "--repo",
+        s(&included),
+        "--profile",
+        "claude:work",
+        "--yes",
+    ]);
+
+    for (profile, directory, active) in [
+        ("Work", &included, true),
+        ("Personal", &included, false),
+        ("Work", &excluded, false),
+    ] {
+        let output = f
+            .command()
+            .current_dir(directory)
+            .args(["run", profile])
+            .output()
+            .unwrap();
+        assert!(output.status.success());
+        let result = parsed(&output);
+        let injected = result["env"]["CLAUDE_CODE_PLUGIN_DIRS"].as_str();
+        if active {
+            let paths = injected.expect("managed plugin injection");
+            assert!(paths.contains(s(&f.cache("fmt@tools", "v1"))));
+            assert!(paths.contains(s(&f.cache("core@tools", "v1"))));
+        } else {
+            assert!(injected.is_none(), "{profile}: {directory:?}");
+        }
+    }
+    f.ok(&["plugin", "remove", "fmt@tools"]);
+    f.ok(&["plugin", "remove", "core@tools"]);
+    assert!(f.cache("fmt@tools", "v1").exists());
+    assert!(f.cache("core@tools", "v1").exists());
+    assert!(
+        !f.run(&["plugin", "marketplace", "remove", "tools"])
+            .status
+            .success()
+    );
+    f.ok(&["plugin", "uninstall", "claude:fmt@tools", "--yes"]);
+    assert!(!f.cache("fmt@tools", "v1").exists());
+}
+
+#[test]
+fn standing_claude_rule_is_prepared_before_the_first_profile() {
+    let f = Fixture::new();
+    f.ok(&["plugin", "marketplace", "add", "tools"]);
+    f.ok(&[
+        "plugin",
+        "install",
+        "claude:lint@tools",
+        "--all-repos",
+        "--all-profiles",
+        "--yes",
+    ]);
+    assert!(f.cache("lint@tools", "v1").is_dir());
+    f.ok(&["add", "Work"]);
+    let paths = f.injected("Work").expect("managed plugin in first launch");
+    assert!(paths.contains(s(&f.cache("lint@tools", "v1"))));
+}

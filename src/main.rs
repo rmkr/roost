@@ -1,6 +1,9 @@
 mod cli;
 mod desktop;
 mod launch;
+mod managed;
+mod managed_native;
+mod managed_skills;
 mod platform;
 mod plugins;
 mod select;
@@ -88,7 +91,7 @@ fn initial_data(action: &Action) -> Value {
             action: cli::SetAction::List { .. },
         } => json!({"sets":[]}),
         Action::Plugin {
-            action: cli::PluginAction::List { .. },
+            action: cli::PluginAction::List { managed: false, .. },
         } => json!({"auto_update":false,"last_auto_update":null,"plugins":[]}),
         Action::Doctor { .. } => {
             json!({"claude_path":null,"claude_version":null,"storage_directory":null,"launcher_directory":null,"path_member":null,"profiles":[],"findings":[]})
@@ -550,7 +553,22 @@ fn dispatch(action: Action, data: &mut Value) -> Result<Outcome> {
             Ok(out)
         }
         Action::Set { action } => Ok(Outcome::lines(sets::command(action, data)?)),
+        Action::Project { action } => managed::project(action, data),
+        Action::ManagedPluginCheck { root, root_id } => managed::background_check(root, &root_id),
         Action::Plugin { action } => {
+            use cli::PluginAction;
+            if matches!(
+                action,
+                PluginAction::Install(_)
+                    | PluginAction::List { managed: true, .. }
+                    | PluginAction::Check { .. }
+                    | PluginAction::Sync { .. }
+                    | PluginAction::Uninstall { .. }
+                    | PluginAction::Update { managed: true, .. }
+            ) {
+                return managed::command(action, data);
+            }
+            let _managed_lock = managed::legacy_removal_lock(&action)?;
             let (lines, warnings) = plugins::command(action, data)?;
             Ok(Outcome {
                 warnings,

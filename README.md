@@ -175,6 +175,40 @@ If you also run plain `claude`, you can keep `~/.claude/CLAUDE.md` as a list of 
 
 ## Plugin store
 
+### Install for repositories and profiles
+
+Use `roost plugin install` to manage one source across compatible Roost profiles or a list of repositories.
+
+```sh
+# Native plugins in all compatible Roost profiles
+roost plugin install mattpocock/skills --all-repos --all-profiles
+
+# One native Claude plugin, visible when Work runs in this repository
+roost plugin install claude:mattpocock-skills@claude-plugins-official --here --profile claude:work
+
+# Project skills for Claude and Codex in two checkouts
+roost plugin install mattpocock/skills --skills --skill grill-me \
+  --repo ~/Code/roost --repo ~/Code/another-repo --agent claude --agent codex
+```
+
+Repeat `--repo`, `--profile`, `--agent`, or `--skill` to select multiple targets where supported. Use `--dry-run` to preview a rule. In scripts, pass explicit scope flags and `--yes` to apply. Managed commands support `--json`.
+
+Claude receives native plugins from the shared store when the repo and profile match a Roost CLI launch. Codex installs native plugins into the selected Roost Codex homes, so they are available across repos when using those homes, including from T3. To target a repo subset for Codex, use portable skills. Portable skills require Bun and write to the selected checkouts' skill directories and `skills-lock.json`.
+
+| Command | Purpose |
+| --- | --- |
+| `roost project add PATH` | Register a Git checkout for future installs. All-repo skills rules include newly registered checkouts on sync. |
+| `roost project list` | List registered checkouts. Register each linked worktree that should receive its own skill files. |
+| `roost plugin list --managed` | Show each rule's scope and its installed, pending, failed, or update status. |
+| `roost plugin sync` | Retry pending or failed targets and enroll new eligible Codex homes or checkouts. Portable skills use the saved revision. Native Codex targets stay pending if the provider cannot reproduce the selected revision. |
+| `roost plugin check` | Check managed sources for updates and cache the results. |
+| `roost plugin update --managed [SOURCE]` | Review and apply a checked update to existing targets. |
+| `roost plugin uninstall SOURCE` | Remove managed rules and artifacts that Roost installed and still owns. Use a rule ID from `plugin list --managed` to remove one scope. |
+
+Roost CLI launches can check for updates in the background and offer a cached update at a later terminal launch. A check reports local skill edits as conflicts. Provider-native updates may also occur when running the provider directly.
+
+### Share Claude plugins through sets
+
 Shared plugins are installed once into a Roost-owned plugin store (`<root>/plugin-store/`, a Claude config directory with no account) using Claude's own installer, then injected into subscribed profiles at launch through `CLAUDE_CODE_PLUGIN_DIRS`. Nothing is written into the profiles. See [ADR 0001](docs/adr/0001-shared-plugins-injected-at-launch.md).
 
 ```sh

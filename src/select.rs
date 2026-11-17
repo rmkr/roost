@@ -219,7 +219,16 @@ impl Profile {
                 self.validate(&store)?;
                 let command = launch::codex_command(&home.path, allow_auth_env)?;
                 record_use(&store, &home.id, &home.name);
+                let root = store.root.clone();
+                let root_id = store.root_id.clone();
                 drop(store);
+                crate::managed::on_launch(
+                    &root,
+                    &root_id,
+                    crate::cli::Agent::Codex,
+                    &home.id,
+                    arguments,
+                );
                 Ok(Outcome {
                     exit: launch::exec(command, arguments, "Codex")?,
                     ..Outcome::quiet()
@@ -266,12 +275,24 @@ pub(crate) fn start(
 ) -> Result<Outcome> {
     let mut env = launch::profile_env(&store, registration, allow_auth_env)?;
     let program = launch::resolve_program("claude")?;
-    let plugins = crate::plugins::claim(&store, registration, &env);
+    let extra = crate::managed::claude_for_launch(&store, registration);
+    let plugins = crate::plugins::claim_with(&store, registration, &env, extra);
     if registration.kind != Kind::DefaultAlias {
         record_use(&store, &registration.registration_id, &registration.name);
     }
     sets::reconcile_at_launch(&store, registration);
+    let root = store.root.clone();
+    let root_id = store.root_id.clone();
     drop(store);
+    if registration.kind != Kind::DefaultAlias {
+        crate::managed::on_launch(
+            &root,
+            &root_id,
+            crate::cli::Agent::Claude,
+            &registration.registration_id,
+            arguments,
+        );
+    }
     plugins.finish(&mut env);
     Ok(Outcome {
         exit: launch::execute(env.command(program), arguments)?,
