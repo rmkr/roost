@@ -12,9 +12,9 @@ const FILE_AUTH: &str = "cli_auth_credentials_store = \"file\"";
 const FAKE_CODEX: &str = r#"#!/bin/sh
 set -eu
 [ "$#" -eq 3 ]
-[ "$1" = login ]
-[ "$2" = -c ]
-[ "$3" = 'cli_auth_credentials_store = "file"' ]
+[ "$1" = -c ]
+[ "$2" = 'cli_auth_credentials_store = "file"' ]
+[ "$3" = login ]
 [ "$PWD" = / ]
 [ -z "${OPENAI_API_KEY+x}${CODEX_API_KEY+x}${CODEX_ACCESS_TOKEN+x}" ]
 [ "$CODEX_HOME" = "$ROOST_DIR/codex/work" ]

@@ -62,21 +62,22 @@ Run's manager options precede the profile name. Arguments after NAME belong to C
 
 ## A profile per project
 
-Each project remembers its selected profile. Inside a git repository the project is the repository, so all its worktrees share one selection; elsewhere it is the current directory.
+Each project remembers its selected Claude or Codex profile. Inside a git repository the project is the repository, so all its worktrees share one selection; elsewhere it is the current directory.
 
 ```sh
 roost                    # launch this project's selected profile
-roost -- --continue      # same, passing arguments to Claude
+roost -- --help          # pass --help to the selected CLI
 roost agents             # same as roost -- agents
 roost switch             # pick a profile, remember it here, launch it
-roost switch work        # select work here and launch it
+roost switch codex:work  # select the work Codex profile here and launch it
+roost run claude:work     # launch the work Claude profile once
 roost switch --no-launch work
 roost switch --forget
 ```
 
-Bare `roost` opens an arrow-key picker when the project has no selection, or its selected profile was removed. Up/Down or k/j move, Enter chooses, and Ctrl-C, Esc or `q` cancel (exit 130). The choice is remembered. Without a terminal there is no picker: bare `roost` fails and names `roost switch NAME` and `roost run NAME`. `roost run NAME` launches without changing the selection. A default alias can be selected too.
+Bare `roost` opens an arrow-key picker when the project has no selection, or its selected profile was removed. Up/Down or k/j move, Enter chooses, and Ctrl-C, Esc or `q` cancel (exit 130). The choice is remembered. Without a terminal there is no picker: bare `roost` fails and names `roost switch NAME` and `roost run NAME`. `roost run NAME` launches without changing the selection. The picker labels each provider. For named commands, use `codex:NAME` or `claude:NAME` when both providers have the same profile name. An unqualified name prefers an active Claude profile. A selected Codex profile opens in the current directory using its Roost home and file-based sign-in. Roost clears inherited `OPENAI_API_KEY`, `CODEX_API_KEY`, and `CODEX_ACCESS_TOKEN` for that launch unless you pass `--allow-auth-env`.
 
-These Claude subcommands can skip the `--`: `agents`, `attach`, `auth`, `auto-mode`, `import`, `kill`, `logs`, `mcp`, `respawn`, `setup-token`, `stop` and `ultrareview`, so `roost agents` runs `claude agents` with the selected profile, or picks one first, and names that profile on stderr. Claude's `doctor`, `plugin`, `update` and `rm` share a name with Roost commands and stay Roost's; reach them with `roost -- doctor` or `roost run NAME rm ID`.
+When using a Claude profile, these subcommands can skip the `--`: `agents`, `attach`, `auth`, `auto-mode`, `import`, `kill`, `logs`, `mcp`, `respawn`, `setup-token`, `stop` and `ultrareview`, so `roost agents` runs `claude agents` with the selected profile, or picks one first, and names that profile on stderr. Claude's `doctor`, `plugin`, `update` and `rm` share a name with Roost commands and stay Roost's; reach them with `roost -- doctor` or `roost run NAME rm ID`.
 
 ## Listing profiles
 

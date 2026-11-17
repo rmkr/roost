@@ -2160,6 +2160,93 @@ print(json.dumps(results))
 }
 
 #[test]
+fn codex_picker_remembers_the_home_and_switches_between_providers() {
+    let f = Fixture::with_fakes("codex-picker", &[("codex", FAKE), ("claude", FAKE)]);
+    f.ok(&["codex", "add", "work"]);
+    let app = repo(&f, "client");
+    let in_project = |args: &[&str]| f.command().current_dir(&app).args(args).output().unwrap();
+
+    // Codex-only installs can pick a home before a Claude registration exists.
+    let picked = pty_session(&f, &[("NO_COLOR", "1")], &[(&app, &[], &["\r"])]);
+    assert_eq!(picked[0]["exit"], 0, "{picked}");
+    assert!(picked[0]["text"].as_str().unwrap().contains("Codex"));
+    let again = launched(&in_project(&["--", "resume", "--last"]));
+    assert_eq!(again["env"]["CODEX_HOME"], json!(f.root.join("codex/work")));
+    assert_eq!(again["cwd"], json!(app));
+    assert!(
+        again["arguments"]
+            .as_array()
+            .unwrap()
+            .ends_with(&[json!("resume"), json!("--last")])
+    );
+
+    f.add("work");
+    let mixed = pty_session(&f, &[("NO_COLOR", "1")], &[(&app, &["switch"], &["q"])]);
+    assert_eq!(mixed[0]["exit"], 130);
+    let text = mixed[0]["text"].as_str().unwrap();
+    assert!(text.contains("Claude") && text.contains("Codex"), "{text}");
+    let list = parsed(&in_project(&["ls", "--full", "--json"]));
+    let rows = list["data"]["profiles"].as_array().unwrap();
+    assert_eq!(rows.len(), 2);
+    let codex = rows.iter().find(|r| r["provider"] == "codex").unwrap();
+    assert_eq!(codex["selected"], true);
+    assert!(codex["last_used"].is_number());
+    assert!(codex["probe"].is_null());
+
+    // Unqualified duplicate names retain the existing Claude command binding.
+    let once = launched(&in_project(&["run", "work"]));
+    assert_eq!(
+        once["env"]["CLAUDE_CONFIG_DIR"],
+        json!(f.root.join("profiles/work"))
+    );
+    assert_eq!(
+        launched(&in_project(&[]))["env"]["CODEX_HOME"],
+        again["env"]["CODEX_HOME"]
+    );
+    assert!(
+        in_project(&["switch", "--no-launch", "claude:work"])
+            .status
+            .success()
+    );
+    assert_eq!(
+        launched(&in_project(&[]))["env"]["CLAUDE_CONFIG_DIR"],
+        once["env"]["CLAUDE_CONFIG_DIR"]
+    );
+    assert!(
+        in_project(&["switch", "--no-launch", "codex:WORK"])
+            .status
+            .success()
+    );
+    assert_eq!(
+        launched(&in_project(&[]))["env"]["CODEX_HOME"],
+        again["env"]["CODEX_HOME"]
+    );
+    assert!(in_project(&["switch", "--forget"]).status.success());
+    assert_eq!(in_project(&[]).status.code(), Some(2));
+}
+
+#[test]
+fn codex_run_overrides_inherited_home_and_skips_unsafe_homes() {
+    let f = Fixture::with_fakes("codex-run", &[("codex", FAKE)])
+        .with_var("CODEX_HOME", "/incoming/home")
+        .with_var("OPENAI_API_KEY", "fixture-key");
+    f.ok(&["codex", "add", "personal"]);
+    let run = launched(&f.ok(&["run", "personal", "--", "resume"]));
+    assert_eq!(
+        run["env"]["CODEX_HOME"],
+        json!(f.root.join("codex/personal"))
+    );
+    assert!(run["env"].get("OPENAI_API_KEY").is_none());
+    f.ok(&["switch", "--no-launch", "personal"]);
+    let parent = f.root.join("codex");
+    fs::rename(parent.join("personal"), parent.join("moved")).unwrap();
+    std::os::unix::fs::symlink(parent.join("moved"), parent.join("personal")).unwrap();
+    assert!(!f.run(&[]).status.success());
+    let listed = parsed(&f.ok(&["list", "--json"]));
+    assert_eq!(listed["data"]["profiles"], json!([]));
+}
+
+#[test]
 fn picker_highlights_last_used_moves_with_keys_and_remembers_the_choice() {
     let f = Fixture::new();
     f.add("Work");

@@ -224,6 +224,7 @@ pub fn profiles(
     width: Option<usize>,
 ) -> Vec<String> {
     let upstream = records.iter().filter(|r| r["kind"] == "upstream").count();
+    let has_codex = records.iter().any(|r| r["provider"] == "codex");
     let now = crate::platform::unix_seconds();
     let mut table = Table::new()
         .marker(|r: &Value| {
@@ -233,18 +234,33 @@ pub fn profiles(
                 Cell::plain(" ")
             }
         })
-        .column("Profile", |r: &Value| {
-            Cell::new(r["name"].as_str().unwrap_or("?"), Style::Bold)
+        .column("Profile", move |r: &Value| {
+            let name = r["name"].as_str().unwrap_or("?");
+            let label = if has_codex {
+                let provider = if r["provider"] == "codex" {
+                    "Codex"
+                } else {
+                    "Claude"
+                };
+                format!("{provider} · {name}")
+            } else {
+                name.to_owned()
+            };
+            Cell::new(label, Style::Bold)
         })
         .column("Kind", |r: &Value| {
             Cell::plain(r["kind"].as_str().unwrap_or("?"))
         })
         .column("Token", |r: &Value| match r["token_present"].as_bool() {
+            _ if r["provider"] == "codex" => Cell::new("—", Style::Dim),
             Some(true) => Cell::new("✓", Style::Green),
             Some(false) => Cell::new("–", Style::Dim),
             None => Cell::new("?", Style::Yellow),
         })
         .column("Launchers", |r: &Value| {
+            if r["provider"] == "codex" {
+                return Cell::new("—", Style::Dim);
+            }
             let condition = launcher_summary(&r["launchers"]);
             let style = match condition {
                 "ready" => Style::Green,

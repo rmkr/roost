@@ -371,9 +371,15 @@ impl Action {
             | Self::Codex {
                 action:
                     CodexAction::Add { name } | CodexAction::Home { name } | CodexAction::Login { name },
-            }
-            => Some(name),
-            Self::Run { name, .. } | Self::Switch { name: Some(name), .. } => Some(name.strip_prefix("codex:").or_else(|| name.strip_prefix("claude:")).unwrap_or(name)),
+            } => Some(name),
+            Self::Run { name, .. }
+            | Self::Switch {
+                name: Some(name), ..
+            } => Some(
+                name.strip_prefix("codex:")
+                    .or_else(|| name.strip_prefix("claude:"))
+                    .unwrap_or(name),
+            ),
             _ => None,
         }
     }
@@ -638,7 +644,8 @@ mod tests {
         ] {
             let Action::Launch {
                 allow_auth_env,
-                arguments, ..
+                arguments,
+                ..
             } = parse(values)
             else {
                 panic!("{values:?}")

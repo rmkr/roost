@@ -230,12 +230,20 @@ impl SideFile for StateFile {
         (self.schema_version, &self.root_id)
     }
     fn check(&self) -> Result<()> {
-        if self.selections.iter().map(|s| &s.registration_id)
+        if self
+            .selections
+            .iter()
+            .map(|s| &s.registration_id)
             .chain(self.last_used.iter().map(|t| &t.registration_id))
-            .any(|id| !valid_id(id) && super::codex_selection_name(id).is_none()) {
+            .any(|id| !valid_id(id) && super::codex_selection_name(id).is_none())
+        {
             return Err(invalid(STATE));
         }
-        ids(STATE, self.links.iter().map(|l| &l.registration_id)
+        ids(
+            STATE,
+            self.links
+                .iter()
+                .map(|l| &l.registration_id)
                 .chain(self.desktop_launched.iter().map(|t| &t.registration_id))
                 .chain(self.desktop_links.iter().map(|l| &l.registration_id))
                 .chain(self.settings.iter().map(|s| &s.registration_id)),

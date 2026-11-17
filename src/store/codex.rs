@@ -28,7 +28,10 @@ pub(crate) struct CodexHome {
 pub(crate) fn codex_selection_name(id: &str) -> Option<&str> {
     let (name, identity) = id.strip_prefix("codex:")?.split_once(':')?;
     let (device, inode) = identity.split_once(':')?;
-    (super::validate_name(name).is_ok() && device.parse::<u64>().is_ok() && inode.parse::<u64>().is_ok()).then_some(name)
+    (super::validate_name(name).is_ok()
+        && device.parse::<u64>().is_ok()
+        && inode.parse::<u64>().is_ok())
+    .then_some(name)
 }
 
 impl Store {
@@ -98,7 +101,11 @@ impl Store {
         self.check_root()?;
         home.verify_namespace()?;
         let FileIdentity::Unix { device, inode } = marker.directory_identity;
-        Ok(CodexHome { name: name.into(), path: home.path, id: format!("codex:{name}:{device}:{inode}") })
+        Ok(CodexHome {
+            name: name.into(),
+            path: home.path,
+            id: format!("codex:{name}:{device}:{inode}"),
+        })
     }
 
     pub(crate) fn codex_home(&self, name: &str) -> Result<PathBuf> {
@@ -106,10 +113,14 @@ impl Store {
     }
 
     pub(crate) fn codex_profiles(&self) -> Result<Vec<CodexHome>> {
-        let Some(parent) = self.reserved_dir(Reserved::Codex, false)? else { return Ok(vec![]) };
+        let Some(parent) = self.reserved_dir(Reserved::Codex, false)? else {
+            return Ok(vec![]);
+        };
         let mut homes = Vec::new();
         for name in parent.entries()? {
-            if super::validate_name(&name).is_err() || name != name.to_ascii_lowercase() { continue; }
+            if super::validate_name(&name).is_err() || name != name.to_ascii_lowercase() {
+                continue;
+            }
             match self.codex_profile(&name) {
                 Ok(home) => homes.push(home),
                 Err(e) => eprintln!("warning: Skipping Codex home {name}: {}", e.message),

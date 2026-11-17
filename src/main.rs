@@ -194,6 +194,9 @@ fn probe_jobs(store: &Store, profiles: &[Value]) -> Vec<ProbeJob> {
         .iter()
         .enumerate()
         .filter_map(|(index, record)| {
+            if record["provider"] == "codex" {
+                return None;
+            }
             let reg = store.registry.registrations.iter().find(|r| {
                 r.state == State::Active
                     && r.kind != Kind::DefaultAlias
@@ -278,6 +281,7 @@ fn dispatch(action: Action, data: &mut Value) -> Result<Outcome> {
             let (project, mut warnings) = select::list_project();
             if let Some(store) = &store {
                 warnings.extend(sets::annotate(store, &mut profiles));
+                select::append_codex_profiles(store, &mut profiles)?;
                 warnings.extend(select::annotate(store, &mut profiles, project.as_deref()));
             }
             if store.as_ref().is_some_and(Store::pending) {
@@ -628,7 +632,7 @@ fn codex(action: CodexAction) -> Result<Outcome> {
             command
                 // Login does not need the caller's project config.
                 .current_dir("/")
-                .args(["login", "-c", store::FILE_AUTH]);
+                .arg("login");
             return Ok(Outcome {
                 exit: launch::exec(command, &[], "Codex")?,
                 ..Outcome::quiet()

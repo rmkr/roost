@@ -471,7 +471,9 @@ pub fn claude_info() -> Result<(PathBuf, String)> {
 
 pub(crate) fn codex_command(home: &Path, allow_auth_env: bool) -> Result<Command> {
     let mut command = Command::new(resolve_program("codex")?);
-    command.env("CODEX_HOME", home);
+    command
+        .env("CODEX_HOME", home)
+        .args(["-c", crate::store::FILE_AUTH]);
     if !allow_auth_env {
         for key in ["OPENAI_API_KEY", "CODEX_API_KEY", "CODEX_ACCESS_TOKEN"] {
             command.env_remove(key);
