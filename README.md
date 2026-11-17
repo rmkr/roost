@@ -16,12 +16,11 @@ Use Rust/Cargo 1.97.0 and the native C linker/toolchain. From a selected tested 
 cargo test --locked
 cargo install --path . --locked --bin roost
 roost --version
-roost doctor
 ```
 
 Keep Cargo's normal collision protection: do not force-overwrite an unrelated `roost` executable. Cargo owns its installation root/bin; Roost's profile storage and generated-launcher PATH are separate. Check which executable your shell resolves before use.
 
-For Codex profiles, install the Codex CLI. For Claude profiles, install Claude Code 2.1.280 or later on PATH.
+For Codex profiles, install the Codex CLI. For Claude profiles, install Claude Code 2.1.280 or later on PATH and run `roost doctor` to check the installation.
 
 ## Use a Codex work profile in T3 Code
 
