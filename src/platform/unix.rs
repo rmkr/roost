@@ -457,19 +457,28 @@ impl Directory {
     }
 
     pub fn entries(&self) -> Result<Vec<String>> {
+        self.matching_entries(|name| {
+            let name =
+                name.ok_or_else(|| Error::new("unsafe_path", "Directory entry is not Unicode"))?;
+            valid_name(name)?;
+            Ok(true)
+        })
+    }
+
+    pub(crate) fn matching_entries(
+        &self,
+        include: impl Fn(Option<&str>) -> Result<bool>,
+    ) -> Result<Vec<String>> {
         let directory = fs::Dir::read_from(&self.file)
             .map_err(|e| native_error("read directory", &self.path, e))?;
         let mut names = Vec::new();
         for entry in directory {
             let entry = entry.map_err(|e| native_error("read directory entry", &self.path, e))?;
-            let name = entry
-                .file_name()
-                .to_str()
-                .map_err(|_| Error::new("unsafe_path", "Directory entry is not Unicode"))?;
-            if name == "." || name == ".." {
+            let name = entry.file_name().to_str().ok();
+            if matches!(name, Some("." | "..")) || !include(name)? {
                 continue;
             }
-            valid_name(name)?;
+            let Some(name) = name else { continue };
             names.push(name.to_owned());
         }
         names.sort();
@@ -655,16 +664,16 @@ impl Directory {
             .map_err(|e| native_error("rename entry", &destination.path.join(new_name), e))
     }
 
-    pub(crate) fn publish_new_child(
+    pub(crate) fn publish_new_entry(
         &self,
         name: &str,
-        child: &Directory,
+        identity: FileIdentity,
         new_name: &str,
     ) -> Result<()> {
         valid_name(new_name)?;
         self.verify_namespace()?;
-        if self.entry(name)?.map(|entry| entry.identity) != Some(child.identity()?) {
-            return Err(Error::new("ownership", "Staged directory was replaced"));
+        if self.entry(name)?.map(|entry| entry.identity) != Some(identity) {
+            return Err(Error::new("ownership", "Staged entry was replaced"));
         }
         #[cfg(any(target_os = "linux", target_vendor = "apple"))]
         return fs::renameat_with(
@@ -674,7 +683,7 @@ impl Directory {
             new_name,
             fs::RenameFlags::NOREPLACE,
         )
-        .map_err(|e| native_error("publish directory", &self.path.join(new_name), e));
+        .map_err(|e| native_error("publish entry", &self.path.join(new_name), e));
         #[cfg(not(any(target_os = "linux", target_vendor = "apple")))]
         {
             // The caller holds the root lock and this parent is private.

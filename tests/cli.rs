@@ -2242,8 +2242,68 @@ fn codex_run_overrides_inherited_home_and_skips_unsafe_homes() {
     fs::rename(parent.join("personal"), parent.join("moved")).unwrap();
     std::os::unix::fs::symlink(parent.join("moved"), parent.join("personal")).unwrap();
     assert!(!f.run(&[]).status.success());
-    let listed = parsed(&f.ok(&["list", "--json"]));
+    let output = f.ok(&["list", "--json"]);
+    assert!(output.stderr.is_empty());
+    let listed = parsed(&output);
     assert_eq!(listed["data"]["profiles"], json!([]));
+    assert_eq!(listed["warnings"].as_array().unwrap().len(), 2);
+}
+
+#[test]
+fn legacy_codex_home_gets_a_stable_selection_on_first_use() {
+    let f = Fixture::with_fakes("codex-generation", &[("codex", FAKE)]);
+    f.ok(&["codex", "add", "work"]);
+    let generation = f.root.join("codex/work/.roost-codex-generation");
+    fs::remove_file(&generation).unwrap();
+    f.ok(&["ls"]);
+    assert!(!generation.exists());
+    f.ok(&["switch", "--no-launch", "codex:work"]);
+    let bound = fs::read(&generation).unwrap();
+    f.ok(&[]);
+    assert_eq!(fs::read(&generation).unwrap(), bound);
+    // At the same physical directory identity, another generation must not
+    // inherit the selection or recorded launch time.
+    f.ok(&["codex", "add", "other"]);
+    fs::copy(
+        f.root.join("codex/other/.roost-codex-generation"),
+        &generation,
+    )
+    .unwrap();
+    assert_eq!(f.run(&[]).status.code(), Some(2));
+    let list = f.json(&["list", "--json"]);
+    let work = &list["data"]["profiles"][1];
+    assert_eq!(work["name"], "work");
+    assert_eq!(work["selected"], false);
+    assert!(work["last_used"].is_null());
+}
+
+#[test]
+fn mixed_inventory_sorts_valid_names_and_ignores_unusable_filenames() {
+    use std::os::unix::ffi::OsStrExt;
+    let f = Fixture::new();
+    f.add("Zulu");
+    f.ok(&["codex", "add", "alpha"]);
+    let filenames: &[&[u8]] = &[
+        b"bad\nname",
+        #[cfg(target_os = "linux")]
+        b"bad\xff",
+    ];
+    for bytes in filenames {
+        fs::write(
+            f.root
+                .join("codex")
+                .join(std::ffi::OsStr::from_bytes(bytes)),
+            [],
+        )
+        .unwrap();
+    }
+    let list = f.json(&["list", "--json"]);
+    let rows = list["data"]["profiles"].as_array().unwrap();
+    assert_eq!(rows[0]["name"], "alpha");
+    assert_eq!(rows[1]["name"], "Zulu");
+    let picker = pty_session(&f, &[], &[(&f.path, &[], &["q"])]);
+    let text = picker[0]["text"].as_str().unwrap();
+    assert!(text.find("alpha").unwrap() < text.find("Zulu").unwrap());
 }
 
 #[test]

@@ -4,6 +4,7 @@ use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
 
 const MARKER: &str = ".roost-codex.json";
+const GENERATION: &str = ".roost-codex-generation";
 const CONFIG: &str = "config.toml";
 pub(crate) const FILE_AUTH: &str = "cli_auth_credentials_store = \"file\"";
 
@@ -23,10 +24,12 @@ pub(crate) struct CodexHome {
     pub id: String,
 }
 
-/// Older homes have no registration UUID. Bind selections to the same name and
-/// directory identity as their existing ownership marker.
+/// Recognize old filesystem-only IDs as stale selections when reading state.
 pub(crate) fn codex_selection_name(id: &str) -> Option<&str> {
     let (name, identity) = id.strip_prefix("codex:")?.split_once(':')?;
+    if super::valid_id(identity) {
+        return super::validate_name(name).ok().map(|()| name);
+    }
     let (device, inode) = identity.split_once(':')?;
     (super::validate_name(name).is_ok()
         && device.parse::<u64>().is_ok()
@@ -61,8 +64,9 @@ impl Store {
         let staged = parent.create_dir(&staged_name)?;
         staged.write_new(CONFIG, format!("{FILE_AUTH}\n").as_bytes(), 0o600)?;
         staged.write_new(MARKER, &encode(&self.codex_marker(name, &staged)?)?, 0o600)?;
+        staged.write_new(GENERATION, platform::random_id()?.as_bytes(), 0o600)?;
         staged.sync()?;
-        parent.publish_new_child(&staged_name, &staged, name)?;
+        parent.publish_new_entry(&staged_name, staged.identity()?, name)?;
         parent.sync()?;
         Ok(parent.path.join(name))
     }
@@ -100,11 +104,29 @@ impl Store {
         }
         self.check_root()?;
         home.verify_namespace()?;
-        let FileIdentity::Unix { device, inode } = marker.directory_identity;
+        let generation = match home.read(GENERATION, true, 32)? {
+            Some(bytes) => String::from_utf8(bytes)
+                .ok()
+                .filter(|id| super::valid_id(id))
+                .ok_or_else(|| err("ownership", "Invalid Codex home generation"))?,
+            None if self.mode == super::OpenMode::Launch && !self.pending() => {
+                self.side_ready()?;
+                let generation = platform::random_id()?;
+                let temp = format!(".roost-tmp-{generation}");
+                let identity = home.write_new(&temp, generation.as_bytes(), 0o600)?;
+                home.publish_new_entry(&temp, identity, GENERATION)?;
+                home.sync()?;
+                generation
+            }
+            // Read-only discovery of a pre-picker home. No saved selection can
+            // refer to this value. Launch binds the verified home before picking.
+            None => "unbound".into(),
+        };
+        home.verify_namespace()?;
         Ok(CodexHome {
             name: name.into(),
             path: home.path,
-            id: format!("codex:{name}:{device}:{inode}"),
+            id: format!("codex:{name}:{generation}"),
         })
     }
 
@@ -112,18 +134,19 @@ impl Store {
         Ok(self.codex_profile(name)?.path)
     }
 
-    pub(crate) fn codex_profiles(&self) -> Result<Vec<CodexHome>> {
+    pub(crate) fn codex_profiles(&self, warnings: &mut Vec<String>) -> Result<Vec<CodexHome>> {
         let Some(parent) = self.reserved_dir(Reserved::Codex, false)? else {
             return Ok(vec![]);
         };
         let mut homes = Vec::new();
-        for name in parent.entries()? {
-            if super::validate_name(&name).is_err() || name != name.to_ascii_lowercase() {
-                continue;
-            }
+        for name in parent.matching_entries(|entry| {
+            Ok(entry.is_some_and(|name| {
+                super::validate_name(name).is_ok() && name == name.to_ascii_lowercase()
+            }))
+        })? {
             match self.codex_profile(&name) {
                 Ok(home) => homes.push(home),
-                Err(e) => eprintln!("warning: Skipping Codex home {name}: {}", e.message),
+                Err(e) => warnings.push(format!("Skipping Codex home {name}: {}", e.message)),
             }
         }
         Ok(homes)

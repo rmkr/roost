@@ -140,7 +140,7 @@ pub(crate) fn stamp(list: &mut Vec<Timestamp>, id: &str, at: u64) {
 pub(crate) fn open_launch(root: &Path) -> Result<Store> {
     Store::open(root, false, OpenMode::Launch).map_err(|e| {
         if e.code == "not_found" && e.next_step.is_none() {
-            e.next("Create a profile with roost add NAME")
+            e.next("Create a profile with roost add NAME (Claude) or roost codex add NAME (Codex)")
         } else {
             e
         }
@@ -465,9 +465,24 @@ fn codex_record(home: &CodexHome) -> Value {
     })
 }
 
-pub(crate) fn append_codex_profiles(store: &Store, records: &mut Vec<Value>) -> Result<()> {
-    records.extend(store.codex_profiles()?.iter().map(codex_record));
-    Ok(())
+pub(crate) fn append_codex_profiles(
+    store: &Store,
+    records: &mut Vec<Value>,
+) -> Result<Vec<String>> {
+    let mut warnings = Vec::new();
+    let homes = store.codex_profiles(&mut warnings)?;
+    if !homes.is_empty() {
+        records.extend(homes.iter().map(codex_record));
+        records.sort_by_cached_key(|r| {
+            let name = r["name"].as_str().unwrap_or_default();
+            (
+                name.to_ascii_lowercase(),
+                name.to_owned(),
+                r["provider"] == "codex",
+            )
+        });
+    }
+    Ok(warnings)
 }
 
 /// The shared picker flow: with an active registration and a terminal (else
@@ -486,11 +501,17 @@ pub(crate) fn choose_with(
     let mut records = store.profiles(false)?;
     let _ = sets::annotate(&store, &mut records);
     if matches!(picker, Picker::Project { claude_only: false }) {
-        append_codex_profiles(&store, &mut records)?;
+        for warning in append_codex_profiles(&store, &mut records)? {
+            eprintln!("warning: {warning}");
+        }
     }
     if records.is_empty() {
-        return Err(Error::new("not_found", "No active profiles to choose from")
-            .next("Create a profile with roost add NAME"));
+        let hint = if matches!(picker, Picker::Project { claude_only: false }) {
+            "Create a profile with roost add NAME (Claude) or roost codex add NAME (Codex)"
+        } else {
+            "Create a Claude profile with roost add NAME"
+        };
+        return Err(Error::new("not_found", "No active profiles to choose from").next(hint));
     }
     if !terminal() {
         return Err(no_terminal());
