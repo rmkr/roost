@@ -6,8 +6,7 @@ use crate::{
 };
 use serde::{Deserialize, Serialize};
 use std::{
-    collections::BTreeSet,
-    ffi::OsStr,
+    collections::{BTreeMap, BTreeSet},
     path::{Path, PathBuf},
     process::Command,
     time::Duration,
@@ -206,13 +205,15 @@ impl Target {
     }
 }
 
-#[derive(Clone, Debug, Serialize, Deserialize)]
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
 pub(super) enum Artifact {
     Native {
         id: String,
         revision: String,
         owned: bool,
+        #[serde(default)]
+        provenance: Option<String>,
     },
     Skills {
         receipt: crate::managed_skills::Receipt,
@@ -254,13 +255,15 @@ pub(super) fn identifier(value: &str) -> bool {
             .all(|b| b.is_ascii_alphanumeric() || b"._-".contains(&b))
 }
 
-#[derive(Clone, Debug, Default, Serialize, Deserialize)]
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub(super) struct Entry {
     pub installed: Option<Artifact>,
     pub failure: Option<String>,
     #[serde(default)]
     pub observed_revision: Option<String>,
+    #[serde(default)]
+    pub local_conflict: Option<String>,
     pub candidate: Option<String>,
     pub check_failure: Option<String>,
     pub deferred: Option<String>,
@@ -282,11 +285,25 @@ pub(super) struct Rule {
     pub skills: Vec<String>,
     pub all_repos: bool,
     pub repositories: Vec<Repository>,
+    #[serde(default)]
+    pub unresolved: Vec<UnresolvedRepo>,
     pub all_profiles: bool,
     pub profiles: Vec<Profile>,
     pub targets: Vec<TargetEntry>,
     pub skill_revision: Option<String>,
+    #[serde(default)]
+    pub codex_revision: Option<String>,
+    #[serde(default)]
+    pub native_ids: BTreeMap<Agent, String>,
     pub removing: bool,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(super) struct UnresolvedRepo {
+    pub path: PathBuf,
+    pub code: String,
+    pub reason: String,
 }
 
 impl Rule {
@@ -300,6 +317,11 @@ impl Rule {
             && self.skills == other.skills
             && self.all_repos == other.all_repos
             && self.repositories == other.repositories
+            && self
+                .unresolved
+                .iter()
+                .map(|repo| &repo.path)
+                .eq(other.unresolved.iter().map(|repo| &repo.path))
             && self.all_profiles == other.all_profiles
             && self.profiles == other.profiles
     }
@@ -329,7 +351,7 @@ impl Rule {
             || self.id.len() != 32
             || !self.id.bytes().all(|b| b.is_ascii_hexdigit())
             || self.skills.iter().any(|s| s != "*" && !identifier(s))
-            || (!self.all_repos && self.repositories.is_empty())
+            || (!self.all_repos && self.repositories.is_empty() && self.unresolved.is_empty())
             || (self.portable() && (self.all_profiles || !self.profiles.is_empty()))
             || (!self.portable() && !self.all_profiles && self.profiles.is_empty())
         {
@@ -337,6 +359,17 @@ impl Rule {
         }
         for repo in &self.repositories {
             repo.check()?;
+        }
+        for repo in &self.unresolved {
+            check_path(&repo.path)?;
+        }
+        for (agent, id) in &self.native_ids {
+            if self.portable()
+                || !self.agents.contains(agent)
+                || crate::managed_native::split_id(id).is_err()
+            {
+                return Err(invalid_state());
+            }
         }
         for (index, entry) in self.targets.iter().enumerate() {
             entry.target.check()?;
@@ -363,6 +396,8 @@ pub(super) struct Database {
     pub repositories: Vec<Repository>,
     pub rules: Vec<Rule>,
     pub last_background_check: Option<u64>,
+    #[serde(default)]
+    pub background_rotation: usize,
 }
 
 impl SideFile for Database {
@@ -375,6 +410,7 @@ impl SideFile for Database {
             repositories: vec![],
             rules: vec![],
             last_background_check: None,
+            background_rotation: 0,
         }
     }
 
@@ -395,6 +431,11 @@ impl SideFile for Database {
             rule.check()?;
             if !ids.insert(&rule.id) {
                 return Err(invalid_state());
+            }
+            for entry in &rule.targets {
+                if let Some(Artifact::Skills { receipt }) = &entry.status.installed {
+                    receipt.verify_owner(&self.root_id)?;
+                }
             }
         }
         Ok(())
@@ -460,8 +501,4 @@ pub(super) fn skill_source(source: &str) -> Result<String> {
     } else {
         Ok(source.to_owned())
     }
-}
-
-pub(super) fn env_flag(name: &str) -> bool {
-    std::env::var_os(name).as_deref() == Some(OsStr::new("1"))
 }

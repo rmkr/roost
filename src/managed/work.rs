@@ -6,6 +6,7 @@ use super::{
 use crate::{managed_native as native, managed_skills as skills};
 use serde_json::Value;
 use std::{
+    ffi::OsString,
     path::{Path, PathBuf},
     process::{Command, Stdio},
 };
@@ -49,18 +50,53 @@ fn source_matches(rule: &Rule, source: Option<&str>) -> bool {
 }
 
 pub(super) fn verify_mode(rule: &Rule, db: &Database) -> Result<()> {
-    let source = |rule: &Rule| {
-        rule.source
+    fn normalized(source: &str) -> &str {
+        let source = source
             .trim_start_matches("claude:")
-            .trim_start_matches("codex:")
-            .trim_start_matches("https://github.com/")
-            .trim_end_matches(".git")
-            .to_owned()
-    };
-    let rule_source = source(rule);
-    for other in db.rules.iter().filter(|other| {
-        other.portable() != rule.portable() && !other.removing && source(other) == rule_source
-    }) {
+            .trim_start_matches("codex:");
+        let source = source.trim_start_matches("https://github.com/");
+        if source.starts_with('/') {
+            source
+        } else {
+            source.trim_end_matches(".git")
+        }
+    }
+    let source = normalized(&rule.source);
+    for other in db
+        .rules
+        .iter()
+        .filter(|other| other.portable() != rule.portable() && !other.removing)
+    {
+        let rule_provenance =
+            rule.targets
+                .iter()
+                .filter_map(|entry| match &entry.status.installed {
+                    Some(Artifact::Native {
+                        provenance: Some(source),
+                        ..
+                    }) => Some(normalized(source)),
+                    _ => None,
+                });
+        let other_provenance =
+            other
+                .targets
+                .iter()
+                .filter_map(|entry| match &entry.status.installed {
+                    Some(Artifact::Native {
+                        provenance: Some(source),
+                        ..
+                    }) => Some(normalized(source)),
+                    _ => None,
+                });
+        let other_source = normalized(&other.source);
+        if source != other_source
+            && !rule_provenance
+                .into_iter()
+                .any(|source| source == other_source)
+            && !other_provenance.into_iter().any(|other| other == source)
+        {
+            continue;
+        }
         let overlapping_agent = rule.agents.iter().any(|agent| {
             if !other.agents.contains(agent) {
                 return false;
@@ -92,6 +128,28 @@ pub(super) fn verify_mode(rule: &Rule, db: &Database) -> Result<()> {
     Ok(())
 }
 
+pub(super) fn resolve_native_ids(rule: &mut Rule) -> Result<()> {
+    if rule.portable() {
+        return Ok(());
+    }
+    for &agent in &rule.agents {
+        let source = model::native_source(rule, agent);
+        let id = match agent {
+            Agent::Claude => native::claude_preview(source),
+            Agent::Codex => native::codex_preview(source),
+        }
+        .map_err(|error| {
+            if error.code == "not_found" || error.code == "unsupported" {
+                error.next("For a portable skill source, retry with --skills --skill NAME")
+            } else {
+                error
+            }
+        })?;
+        rule.native_ids.insert(agent, id);
+    }
+    Ok(())
+}
+
 fn selected_rules(db: &Database, source: Option<&str>, job: Job) -> Result<Vec<Rule>> {
     let rules = db
         .rules
@@ -116,17 +174,22 @@ pub(super) fn dispatch(
     data: &mut Value,
 ) -> Result<Outcome> {
     let root = platform::root()?;
-    let store = Store::open_if_present(&root)?;
-    let db = empty_db(store.as_ref())?;
-    let preview = selected_rules(&db, source, job)?;
-    let plan = operation_preview(&preview, &db, job, store.as_ref())?;
-    drop(store);
-    if preview.is_empty() {
+    let db = empty_db(Store::open_if_present(&root)?.as_ref())?;
+    let baseline = selected_rules(&db, source, job)?;
+    if baseline.is_empty() {
         return output(vec![], vec![], false, data);
     }
+    let mut planned = baseline.clone();
+    if job == Job::Sync {
+        for rule in &mut planned {
+            resolve_pending_repositories(rule)?;
+        }
+    }
+    let (lines, targets) =
+        operation_preview(&planned, &db, job, Store::open_if_present(&root)?.as_ref())?;
     if job != Job::Check {
-        if plan.is_empty() {
-            return output(preview, vec![], false, data);
+        if lines.is_empty() {
+            return output(baseline, vec![], false, data);
         }
         let title = match job {
             Job::Sync => "Sync managed plugin and skill targets",
@@ -134,7 +197,7 @@ pub(super) fn dispatch(
             Job::Remove => "Uninstall managed rules and their owned artifacts",
             Job::Check => unreachable!(),
         };
-        confirmation(title, &plan, yes, is_interactive(json))?;
+        confirmation(title, &lines, yes, is_interactive(json))?;
     }
     let Some(session) = Session::start(root, false, true)? else {
         return Err(Error::new("ownership", "Roost storage disappeared"));
@@ -147,23 +210,21 @@ pub(super) fn dispatch(
             "Roost storage changed since the preview",
         ));
     }
-    if job != Job::Check
-        && serde_json::to_vec(&selected_rules(&now, source, job)?).ok()
-            != serde_json::to_vec(&preview).ok()
-    {
-        return Err(
-            Error::new("ownership", "Managed targets changed since the preview")
-                .next("Review the targets and retry"),
-        );
-    }
-    if job != Job::Check && operation_preview(&preview, &now, job, Some(&store))? != plan {
-        return Err(Error::new(
-            "ownership",
-            "Affected targets changed since the preview",
-        ));
+    let current = selected_rules(&now, source, job)?;
+    if job == Job::Check {
+        planned = current;
+    } else {
+        if serde_json::to_value(&current).ok() != serde_json::to_value(&baseline).ok()
+            || operation_preview(&planned, &now, job, Some(&store))? != (lines, targets)
+        {
+            return Err(
+                Error::new("ownership", "Managed targets changed since the preview")
+                    .next("Review the targets and retry"),
+            );
+        }
     }
     drop(store);
-    let result = run(&session, preview, job, data)?;
+    let result = run(&session, planned, job, data)?;
     if job == Job::Check && source.is_none() {
         session.edit(|db| {
             db.last_background_check = Some(platform::unix_seconds());
@@ -173,68 +234,113 @@ pub(super) fn dispatch(
     Ok(result)
 }
 
+fn resolve_pending_repositories(rule: &mut Rule) -> Result<()> {
+    let mut pending = vec![];
+    for mut unresolved in std::mem::take(&mut rule.unresolved) {
+        match model::Repository::resolve(&unresolved.path) {
+            Ok(repo) => {
+                if !rule.repositories.contains(&repo) {
+                    rule.repositories.push(repo);
+                }
+            }
+            Err(error) if error.code == "cancelled" => return Err(error),
+            Err(error) => {
+                unresolved.code = error.code.into();
+                unresolved.reason = error.message;
+                pending.push(unresolved);
+            }
+        }
+    }
+    rule.repositories
+        .sort_by(|left, right| left.path.cmp(&right.path));
+    rule.unresolved = pending;
+    Ok(())
+}
+
 fn operation_preview(
     rules: &[Rule],
     db: &Database,
     job: Job,
     store: Option<&Store>,
-) -> Result<Vec<String>> {
-    if job == Job::Check {
-        return Ok(vec![]);
+) -> Result<(Vec<String>, Vec<Target>)> {
+    if job == Job::Check || rules.is_empty() {
+        return Ok((vec![], vec![]));
     }
+    let store = store.ok_or_else(|| Error::new("ownership", "Roost storage disappeared"))?;
+    let mut rules = rules.to_vec();
     if job == Job::Sync {
-        let mut rules = rules.to_vec();
         for rule in &mut rules {
-            add_targets(rule, db, store, false, &mut vec![])?;
+            add_targets(rule, db, Some(store), false, &mut vec![])?;
             rule.targets
                 .retain(|entry| entry.status.installed.is_none());
         }
-        rules.retain(|rule| !rule.targets.is_empty());
-        return Ok(preview_for(&rules, db, job));
+        rules.retain(|rule| !rule.targets.is_empty() || !rule.unresolved.is_empty());
     }
-    Ok(preview_for(rules, db, job))
+    let targets = rules
+        .iter()
+        .flat_map(|rule| rule.targets.iter().map(|entry| entry.target.clone()))
+        .collect();
+    Ok((preview_for(&rules, db, job, store)?, targets))
 }
 
-fn preview_for(rules: &[Rule], db: &Database, job: Job) -> Vec<String> {
-    rules
-        .iter()
-        .filter(|rule| {
-            job != Job::Update
-                || rule
+fn preview_for(rules: &[Rule], db: &Database, job: Job, store: &Store) -> Result<Vec<String>> {
+    let mut rows = vec![];
+    for rule in rules {
+        if job == Job::Update
+            && !rule
+                .targets
+                .iter()
+                .any(|entry| entry.status.candidate.is_some())
+        {
+            continue;
+        }
+        rows.push(rule_header(rule));
+        for entry in &rule.targets {
+            if job != Job::Update {
+                rows.push(target_preview(entry, rule, &store.root));
+                continue;
+            }
+            let Some(candidate) = &entry.status.candidate else {
+                continue;
+            };
+            let current = entry
+                .status
+                .observed_revision
+                .as_deref()
+                .or_else(|| entry.status.installed.as_ref().map(Artifact::revision))
+                .unwrap_or("pending");
+            rows.push(format!(
+                "  {} | {current} → {candidate}",
+                entry.target.label()
+            ));
+            for related in db.rules.iter().filter(|other| other.id != rule.id) {
+                if related
                     .targets
                     .iter()
-                    .any(|entry| entry.status.candidate.is_some())
-        })
-        .flat_map(|rule| {
-            let mut rows = vec![rule_header(rule)];
-            for entry in &rule.targets {
-                if job == Job::Update {
-                    let Some(candidate) = &entry.status.candidate else {
-                        continue;
-                    };
-                    rows.push(format!("  {} → {candidate}", entry.target.label()));
-                    for related in db.rules.iter().filter(|other| other.id != rule.id) {
-                        if related
-                            .targets
-                            .iter()
-                            .any(|other| reference_matches(entry, other))
-                        {
-                            rows.push(format!("    Also affects {}", rule_header(related)));
-                        }
-                    }
-                    if matches!(entry.target, Target::Claude) {
-                        rows.push(
-                            "    Also updates any existing shared sets using this Claude plugin"
-                                .into(),
-                        );
-                    }
-                } else {
-                    rows.push(target_preview(entry, &rule.agents));
+                    .any(|other| reference_matches(entry, other))
+                {
+                    rows.push(format!("    Also affects {}", rule_header(related)));
                 }
             }
-            rows
-        })
-        .collect()
+            if let (Target::Claude, Some(Artifact::Native { id, .. })) =
+                (&entry.target, &entry.status.installed)
+            {
+                for name in crate::plugins::affected_sets(store, id)? {
+                    rows.push(format!("    Also affects Claude set {name}"));
+                }
+            }
+        }
+        if job != Job::Update {
+            for repo in &rule.unresolved {
+                rows.push(format!(
+                    "  {} | failed: {}",
+                    repo.path.display(),
+                    repo.reason
+                ));
+            }
+        }
+    }
+    Ok(rows)
 }
 
 fn run(session: &Session, mut rules: Vec<Rule>, job: Job, data: &mut Value) -> Result<Outcome> {
@@ -245,22 +351,40 @@ fn run(session: &Session, mut rules: Vec<Rule>, job: Job, data: &mut Value) -> R
             return Err(Error::cancelled());
         }
         // Refresh after preceding rules may have updated shared native receipts.
-        if let Some(saved) = session
+        let Some(saved) = session
             .read()?
             .rules
             .into_iter()
             .find(|saved| saved.id == rule.id)
-        {
+        else {
+            continue;
+        };
+        if saved.removing && job != Job::Remove {
+            continue;
+        }
+        if job == Job::Sync {
+            let repositories = std::mem::take(&mut rule.repositories);
+            let unresolved = std::mem::take(&mut rule.unresolved);
+            *rule = saved;
+            for repository in repositories
+                .iter()
+                .filter(|repo| !rule.repositories.contains(repo))
+            {
+                repository.verify()?;
+            }
+            rule.repositories = repositories;
+            rule.unresolved = unresolved;
+        } else {
             *rule = saved;
         }
         let result = match job {
             Job::Sync => {
                 expand(session, rule, &mut warnings)?;
                 session.save(rule)?;
-                sync_rule(session, rule)?
+                sync_rule(session, rule)? || !rule.unresolved.is_empty()
             }
             Job::Update => update_rule(session, rule)?,
-            Job::Check => check_rule(session, rule)?,
+            Job::Check => check_rule(session, rule, 0)?,
             Job::Remove => remove_rule(session, rule)?,
         };
         failed |= result;
@@ -308,11 +432,26 @@ fn native_artifact(install: native::NativeInstall) -> Artifact {
         id: install.id,
         revision: install.revision,
         owned: install.owned,
+        provenance: install.provenance,
     }
 }
 
-fn prepare_skills(rule: &Rule) -> Result<skills::Staged> {
-    skills::stage(&rule.source, &rule.skills, &skill_agents(rule))
+fn prepare_skills(session: &Session, rule: &Rule) -> Result<skills::Staged> {
+    let mut stage = skills::stage(&rule.source, &rule.skills, &skill_agents(rule))?;
+    stage.bind_owner(&session.root_id)?;
+    Ok(stage)
+}
+
+fn skills_cache(session: &Session, create: bool) -> Result<Directory> {
+    let mode = if create {
+        OpenMode::Mutate
+    } else {
+        OpenMode::Read
+    };
+    session
+        .open(mode)?
+        .reserved_dir(crate::store::side::Reserved::ManagedSkills, create)?
+        .ok_or_else(|| Error::new("not_found", "The selected skill revision is not cached"))
 }
 
 pub(super) fn sync_rule(session: &Session, rule: &mut Rule) -> Result<bool> {
@@ -324,7 +463,17 @@ pub(super) fn sync_rule(session: &Session, rule: &mut Rule) -> Result<bool> {
         return Ok(false);
     }
     verify_mode(rule, &session.read()?)?;
-    let staged = rule.portable().then(|| prepare_skills(rule));
+    let staged = rule.portable().then(|| {
+        if let Some(revision) = &rule.skill_revision {
+            let mut stage = skills::load(&skills_cache(session, false)?, revision)?;
+            stage.bind_owner(&session.root_id)?;
+            Ok(stage)
+        } else {
+            let stage = prepare_skills(session, rule)?;
+            stage.save(&skills_cache(session, true)?)?;
+            Ok(stage)
+        }
+    });
     if let Some(Ok(staged)) = &staged
         && rule.skill_revision.is_none()
     {
@@ -341,13 +490,21 @@ pub(super) fn sync_rule(session: &Session, rule: &mut Rule) -> Result<bool> {
             return Err(Error::cancelled());
         }
         let result = match &entry.target {
-            Target::Claude => {
-                native::claude_install(&session.root, model::native_source(rule, Agent::Claude))
-                    .map(native_artifact)
-            }
+            Target::Claude => native::claude_install(
+                &session.root,
+                model::native_source(rule, Agent::Claude),
+                &rule.native_ids[&Agent::Claude],
+            )
+            .map(native_artifact),
             Target::Codex { profile } => codex_home(session, profile).and_then(|home| {
-                native::codex_install(&home, model::native_source(rule, Agent::Codex))
-                    .map(native_artifact)
+                native::codex_install(
+                    &home,
+                    &profile.generation,
+                    model::native_source(rule, Agent::Codex),
+                    &rule.native_ids[&Agent::Codex],
+                    rule.codex_revision.as_deref(),
+                )
+                .map(native_artifact)
             }),
             Target::Skills { repository } => (|| {
                 let staged = staged
@@ -363,13 +520,45 @@ pub(super) fn sync_rule(session: &Session, rule: &mut Rule) -> Result<bool> {
                     .next("Review the new revision with roost plugin check, then update"));
                 }
                 repository.verify()?;
-                skills::apply(&repository.path, staged, None)
-                    .map(|receipt| Artifact::Skills { receipt })
+                let db = session.read()?;
+                let prior = db
+                    .rules
+                    .iter()
+                    .filter(|other| {
+                        other.id != rule.id
+                            && !other.removing
+                            && other.source == rule.source
+                            && other.skills == rule.skills
+                            && other.agents == rule.agents
+                    })
+                    .flat_map(|other| &other.targets)
+                    .find_map(|other| match &other.status.installed {
+                        Some(Artifact::Skills { receipt }) if other.target == entry.target => {
+                            Some(receipt)
+                        }
+                        _ => None,
+                    });
+                if prior.is_some_and(|receipt| receipt.revision != staged.revision()) {
+                    return Err(Error::new("conflict", "An overlapping install rule owns a different skill revision in this checkout")
+                        .next("Update the installed rule before syncing this target"));
+                }
+                skills::apply_verified(
+                    &repository.path,
+                    &repository.checkout_identity,
+                    &repository.common_identity,
+                    staged,
+                    prior,
+                )
+                .map(|receipt| Artifact::Skills { receipt })
             })(),
         };
+        let codex_target = matches!(rule.targets[index].target, Target::Codex { .. });
         let status = &mut rule.targets[index].status;
         match result {
             Ok(artifact) => {
+                if codex_target && rule.codex_revision.is_none() {
+                    rule.codex_revision = Some(artifact.revision().to_owned());
+                }
                 status.installed = Some(artifact);
                 status.failure = None;
             }
@@ -384,47 +573,96 @@ pub(super) fn sync_rule(session: &Session, rule: &mut Rule) -> Result<bool> {
     Ok(failed)
 }
 
-fn check_rule(session: &Session, rule: &mut Rule) -> Result<bool> {
+fn check_rule(session: &Session, rule: &mut Rule, offset: usize) -> Result<bool> {
     let staged = (rule.portable() && rule.skill_revision.is_some() && !rule.targets.is_empty())
-        .then(|| prepare_skills(rule));
+        .then(|| prepare_skills(session, rule));
     let mut failed = false;
-    for index in 0..rule.targets.len() {
+    for i in 0..rule.targets.len() {
         if platform::cancelled() {
             return Err(Error::cancelled());
         }
+        let index = (i + offset) % rule.targets.len();
         let entry = &rule.targets[index];
+        let before = entry.status.clone();
         let mut observed = None;
+        let mut local_conflict = None;
         let result = match (&entry.target, &entry.status.installed) {
-            (Target::Claude, Some(Artifact::Native { id, .. })) => (|| {
+            (Target::Claude, Some(Artifact::Native { id, revision, .. })) => (|| {
                 observed = native::claude_current(&session.root, id)?;
-                native::claude_check(&session.root, model::native_source(rule, Agent::Claude), id)
+                verify_native_drift(revision, &observed)?;
+                let candidate = native::claude_check(
+                    &session.root,
+                    model::native_source(rule, Agent::Claude),
+                    id,
+                )?;
+                if observed.as_deref() != Some(revision)
+                    && observed != native::claude_current(&session.root, id)?
+                {
+                    return Err(Error::new(
+                        "conflict",
+                        "Native plugin revision changed during the check",
+                    ));
+                }
+                Ok(candidate)
             })(),
-            (Target::Codex { profile }, Some(Artifact::Native { id, .. })) => {
+            (Target::Codex { profile }, Some(Artifact::Native { id, revision, .. })) => {
                 codex_home(session, profile).and_then(|home| {
-                    observed = native::codex_current(&home, id)?;
-                    native::codex_check(&home, model::native_source(rule, Agent::Codex), id)
+                    observed = native::codex_current(&home, &profile.generation, id)?;
+                    verify_native_drift(revision, &observed)?;
+                    let candidate = native::codex_check(
+                        &home,
+                        &profile.generation,
+                        model::native_source(rule, Agent::Codex),
+                        id,
+                    )?;
+                    if observed.as_deref() != Some(revision)
+                        && observed != native::codex_current(&home, &profile.generation, id)?
+                    {
+                        return Err(Error::new(
+                            "conflict",
+                            "Native plugin revision changed during the check",
+                        ));
+                    }
+                    Ok(candidate)
                 })
             }
-            (Target::Skills { .. }, installed)
+            (Target::Skills { repository }, installed)
                 if installed.is_some() || rule.skill_revision.is_some() =>
             {
-                staged
-                    .as_ref()
-                    .ok_or_else(|| Error::new("ownership", "Skill rule has no selected revision"))?
-                    .as_ref()
-                    .map_err(Clone::clone)
-                    .map(|staged| {
-                        let previous = installed
-                            .as_ref()
-                            .map(Artifact::revision)
-                            .or(rule.skill_revision.as_deref());
-                        (previous != Some(staged.revision())).then(|| staged.revision().to_owned())
-                    })
+                if let Some(Artifact::Skills { receipt }) = installed
+                    && let Err(error) = repository
+                        .verify()
+                        .and_then(|()| skills::inspect(&repository.path, receipt))
+                {
+                    if error.code == "cancelled" {
+                        return Err(error);
+                    }
+                    local_conflict = Some(error.to_string());
+                    Ok(None)
+                } else {
+                    staged
+                        .as_ref()
+                        .ok_or_else(|| {
+                            Error::new("ownership", "Skill rule has no selected revision")
+                        })?
+                        .as_ref()
+                        .map_err(Clone::clone)
+                        .map(|staged| {
+                            let previous = installed
+                                .as_ref()
+                                .map(Artifact::revision)
+                                .or(rule.skill_revision.as_deref());
+                            (previous != Some(staged.revision()))
+                                .then(|| staged.revision().to_owned())
+                        })
+                }
             }
             _ => continue,
         };
         let status = &mut rule.targets[index].status;
         status.observed_revision = observed;
+        failed |= local_conflict.is_some();
+        status.local_conflict = local_conflict;
         match result {
             Ok(candidate) => {
                 status.candidate = candidate;
@@ -437,9 +675,57 @@ fn check_rule(session: &Session, rule: &mut Rule) -> Result<bool> {
                 status.check_failure = Some(error.to_string());
             }
         }
-        session.save(rule)?;
+        save_checked_status(session, rule, index, &before)?;
     }
     Ok(failed)
+}
+
+fn save_checked_status(
+    session: &Session,
+    rule: &Rule,
+    index: usize,
+    before: &super::Entry,
+) -> Result<()> {
+    if session.lock.is_some() {
+        return session.save(rule);
+    }
+    let Some(_lock) = super::operation_lock(&session.root, false)? else {
+        return Ok(());
+    };
+    let checked = &rule.targets[index];
+    session.edit(|db| {
+        if let Some(entry) = db
+            .rules
+            .iter_mut()
+            .find(|saved| {
+                saved.id == rule.id
+                    && !saved.removing
+                    && saved.skill_revision == rule.skill_revision
+            })
+            .and_then(|saved| {
+                saved
+                    .targets
+                    .iter_mut()
+                    .find(|entry| entry.target == checked.target && &entry.status == before)
+            })
+        {
+            entry.status.clone_from(&checked.status);
+        }
+        Ok(())
+    })
+}
+
+fn verify_native_drift(recorded: &str, observed: &Option<String>) -> Result<()> {
+    if let Some(observed) = observed
+        && observed != recorded
+        && native::reported_version(observed) == native::reported_version(recorded)
+    {
+        return Err(Error::new(
+            "conflict",
+            "Installed native plugin content changed without a version change",
+        ));
+    }
+    Ok(())
 }
 
 fn same_native(left: &Target, right: &Target) -> bool {
@@ -453,29 +739,59 @@ fn same_native(left: &Target, right: &Target) -> bool {
 }
 
 fn reference_matches(left: &TargetEntry, right: &TargetEntry) -> bool {
-    matches!((&left.status.installed, &right.status.installed),
-        (Some(Artifact::Native { id: left_id, .. }), Some(Artifact::Native { id: right_id, .. })) if left_id == right_id)
-        && same_native(&left.target, &right.target)
+    match (&left.status.installed, &right.status.installed) {
+        (
+            Some(Artifact::Native { id: left_id, .. }),
+            Some(Artifact::Native { id: right_id, .. }),
+        ) => left_id == right_id && same_native(&left.target, &right.target),
+        (
+            Some(Artifact::Skills {
+                receipt: left_receipt,
+            }),
+            Some(Artifact::Skills {
+                receipt: right_receipt,
+            }),
+        ) => left.target == right.target && left_receipt == right_receipt,
+        _ => false,
+    }
 }
 
-fn update_other_native_refs(session: &Session, rule: &Rule, index: usize) -> Result<()> {
-    let source_entry = &rule.targets[index];
-    let Some(Artifact::Native { revision, .. }) = &source_entry.status.installed else {
-        return Ok(());
-    };
+fn save_updated_rule(
+    session: &Session,
+    rule: &Rule,
+    previous_entry: &TargetEntry,
+    index: usize,
+) -> Result<()> {
+    let updated = &rule.targets[index].status.installed;
     session.edit(|db| {
-        for other in db.rules.iter_mut().filter(|other| rule.id != other.id) {
+        for other in &mut db.rules {
+            if other.id == rule.id {
+                *other = rule.clone();
+                continue;
+            }
             for entry in other
                 .targets
                 .iter_mut()
-                .filter(|entry| reference_matches(source_entry, entry))
+                .filter(|entry| reference_matches(previous_entry, entry))
             {
-                if let Some(Artifact::Native { revision: old, .. }) = &mut entry.status.installed {
-                    old.clone_from(revision);
+                match (&mut entry.status.installed, updated) {
+                    (
+                        Some(Artifact::Native { revision, .. }),
+                        Some(Artifact::Native { revision: new, .. }),
+                    ) => {
+                        revision.clone_from(new);
+                    }
+                    (_, Some(Artifact::Skills { .. })) => {
+                        entry.status.installed.clone_from(updated)
+                    }
+                    _ => {}
                 }
                 entry.status.candidate = None;
                 entry.status.deferred = None;
                 entry.status.check_failure = None;
+                entry.status.local_conflict = None;
+                entry.status.observed_revision = None;
+                entry.status.failure = None;
             }
         }
         Ok(())
@@ -490,19 +806,19 @@ fn update_rule(session: &Session, rule: &mut Rule) -> Result<bool> {
     if selected.is_none() {
         return Ok(false);
     }
-    let staged = rule.portable().then(|| prepare_skills(rule));
-    if let Some(Ok(staged)) = &staged
-        && selected.as_deref() == Some(staged.revision())
-    {
-        rule.skill_revision = selected;
-        session.save(rule)?;
-    }
+    let staged = rule.portable().then(|| {
+        let stage = prepare_skills(session, rule)?;
+        if selected.as_deref() == Some(stage.revision()) {
+            stage.save(&skills_cache(session, true)?)?;
+        }
+        Ok(stage)
+    });
     let mut failed = false;
     for index in 0..rule.targets.len() {
         if platform::cancelled() {
             return Err(Error::cancelled());
         }
-        let entry = &rule.targets[index];
+        let entry = rule.targets[index].clone();
         let Some(candidate) = &entry.status.candidate else {
             continue;
         };
@@ -513,16 +829,22 @@ fn update_rule(session: &Session, rule: &mut Rule) -> Result<bool> {
                     id,
                     owned,
                     revision,
+                    provenance,
                 }),
             ) => native::claude_update(
                 &session.root,
                 model::native_source(rule, Agent::Claude),
                 id,
-                revision,
+                entry
+                    .status
+                    .observed_revision
+                    .as_deref()
+                    .unwrap_or(revision),
                 Some(candidate),
             )
             .map(|mut update| {
                 update.owned = *owned;
+                update.provenance = update.provenance.or_else(|| provenance.clone());
                 native_artifact(update)
             }),
             (
@@ -531,17 +853,24 @@ fn update_rule(session: &Session, rule: &mut Rule) -> Result<bool> {
                     id,
                     owned,
                     revision,
+                    provenance,
                 }),
             ) => codex_home(session, profile).and_then(|home| {
                 native::codex_update(
                     &home,
+                    &profile.generation,
                     model::native_source(rule, Agent::Codex),
                     id,
-                    revision,
+                    entry
+                        .status
+                        .observed_revision
+                        .as_deref()
+                        .unwrap_or(revision),
                     Some(candidate),
                 )
                 .map(|mut update| {
                     update.owned = *owned;
+                    update.provenance = update.provenance.or_else(|| provenance.clone());
                     native_artifact(update)
                 })
             }),
@@ -564,8 +893,14 @@ fn update_rule(session: &Session, rule: &mut Rule) -> Result<bool> {
                     None => None,
                     _ => unreachable!("skills target has native artifact"),
                 };
-                skills::apply(&repository.path, staged, prior)
-                    .map(|receipt| Artifact::Skills { receipt })
+                skills::apply_verified(
+                    &repository.path,
+                    &repository.checkout_identity,
+                    &repository.common_identity,
+                    staged,
+                    prior,
+                )
+                .map(|receipt| Artifact::Skills { receipt })
             })(),
             _ => Err(Error::new(
                 "ownership",
@@ -576,12 +911,22 @@ fn update_rule(session: &Session, rule: &mut Rule) -> Result<bool> {
         let updated = result.is_ok();
         match result {
             Ok(artifact) => {
+                match entry.target {
+                    Target::Skills { .. } => {
+                        rule.skill_revision = Some(artifact.revision().to_owned())
+                    }
+                    Target::Codex { .. } => {
+                        rule.codex_revision = Some(artifact.revision().to_owned())
+                    }
+                    Target::Claude => {}
+                }
                 status.installed = Some(artifact);
                 status.candidate = None;
                 status.deferred = None;
                 status.failure = None;
                 status.check_failure = None;
                 status.observed_revision = None;
+                status.local_conflict = None;
             }
             Err(error) if error.code == "cancelled" => return Err(error),
             Err(error) => {
@@ -589,9 +934,10 @@ fn update_rule(session: &Session, rule: &mut Rule) -> Result<bool> {
                 status.failure = Some(error.to_string());
             }
         }
-        session.save(rule)?;
         if updated {
-            update_other_native_refs(session, rule, index)?;
+            save_updated_rule(session, rule, &entry, index)?;
+        } else {
+            session.save(rule)?;
         }
     }
     Ok(failed)
@@ -658,21 +1004,49 @@ fn remove_rule(session: &Session, rule: &mut Rule) -> Result<bool> {
                     id,
                     revision,
                     owned: true,
+                    ..
                 }),
             ) => (|| {
                 if keep_or_transfer_native(session, rule, entry, id, revision)? {
                     return Ok(());
                 }
+                let expected =
+                    if entry.status.candidate.is_none() && entry.status.check_failure.is_none() {
+                        entry
+                            .status
+                            .observed_revision
+                            .as_deref()
+                            .unwrap_or(revision)
+                    } else {
+                        revision
+                    };
                 match target {
-                    Target::Claude => native::claude_remove(&session.root, id, revision),
-                    Target::Codex { profile } => codex_home(session, profile)
-                        .and_then(|home| native::codex_remove(&home, id, revision)),
+                    Target::Claude => native::claude_remove(&session.root, id, expected),
+                    Target::Codex { profile } => codex_home(session, profile).and_then(|home| {
+                        native::codex_remove(&home, &profile.generation, id, expected)
+                    }),
                     _ => unreachable!("native artifact on skills target"),
                 }
             })(),
-            (Target::Skills { repository }, Some(Artifact::Skills { receipt })) => repository
-                .verify()
-                .and_then(|()| skills::remove(&repository.path, receipt)),
+            (Target::Skills { repository }, Some(Artifact::Skills { receipt })) => (|| {
+                let refs = session.read()?.rules.into_iter().any(|other| {
+                    other.id != rule.id
+                        && other
+                            .targets
+                            .iter()
+                            .any(|target| reference_matches(entry, target))
+                });
+                if refs {
+                    return Ok(());
+                }
+                repository.verify()?;
+                skills::remove_verified(
+                    &repository.path,
+                    &repository.checkout_identity,
+                    &repository.common_identity,
+                    receipt,
+                )
+            })(),
             _ => Ok(()),
         };
         let status = &mut rule.targets[index].status;
@@ -696,19 +1070,33 @@ fn remove_rule(session: &Session, rule: &mut Rule) -> Result<bool> {
 }
 
 pub(crate) fn background_check(root: PathBuf, root_id: &str) -> Result<Outcome> {
-    let Some(session) = Session::start(root, false, false)? else {
-        return Ok(Outcome::quiet());
-    };
-    if session.root_id != root_id {
-        return Ok(Outcome::quiet());
-    }
-    let db = session.read()?;
-    let started = std::time::Instant::now();
-    for mut rule in db.rules.into_iter().filter(|rule| !rule.removing) {
-        if started.elapsed() >= std::time::Duration::from_secs(45) {
-            break;
+    // The foreground executable installed Roost's SIGINT handler before
+    // dispatch. Cancel all bounded probes in this disposable checker at its
+    // overall deadline, including a single slow target.
+    std::thread::spawn(|| {
+        std::thread::sleep(std::time::Duration::from_secs(45));
+        // SAFETY: SIGINT is handled by Roost's process-local cancel handler.
+        unsafe {
+            libc::raise(libc::SIGINT);
         }
-        check_rule(&session, &mut rule)?;
+    });
+    let session = Session {
+        root,
+        root_id: root_id.to_owned(),
+        lock: None,
+    };
+    let db = session.read()?;
+    let mut rules: Vec<_> = db.rules.into_iter().filter(|rule| !rule.removing).collect();
+    if !rules.is_empty() {
+        let offset = db.background_rotation % rules.len();
+        rules.rotate_left(offset);
+    }
+    for mut rule in rules {
+        let offset = db
+            .background_rotation
+            .checked_rem(rule.targets.len())
+            .unwrap_or(0);
+        check_rule(&session, &mut rule, offset)?;
     }
     Ok(Outcome::quiet())
 }
@@ -743,7 +1131,16 @@ fn entry_relevant(
     }
 }
 
-pub(crate) fn on_launch(root: &Path, root_id: &str, agent: Agent, generation: &str) {
+pub(crate) fn on_launch(
+    root: &Path,
+    root_id: &str,
+    agent: Agent,
+    generation: &str,
+    arguments: &[OsString],
+) {
+    if !is_interactive(false) || !interactive_session(agent, arguments) {
+        return;
+    }
     if let Err(error) = launch_updates(root, root_id, agent, generation)
         && error.code != "cancelled"
     {
@@ -751,12 +1148,44 @@ pub(crate) fn on_launch(root: &Path, root_id: &str, agent: Agent, generation: &s
     }
 }
 
-fn launch_updates(root: &Path, root_id: &str, agent: Agent, generation: &str) -> Result<()> {
-    // Help/auth/info launches may also pass here. Never prompt or spawn a check
-    // for a noninteractive launch. Outside Roost, use the explicit check command.
-    if !is_interactive(false) || model::env_flag("ROOST_SKIP_PLUGIN_CHECK") {
-        return Ok(());
+fn interactive_session(agent: Agent, arguments: &[OsString]) -> bool {
+    let head = arguments
+        .first()
+        .and_then(|argument| argument.to_str())
+        .unwrap_or("");
+    if arguments.iter().any(|argument| {
+        matches!(
+            argument.to_str(),
+            Some("--help" | "-h" | "--version" | "-V")
+        )
+    }) {
+        return false;
     }
+    match agent {
+        Agent::Claude => {
+            !crate::cli::CLAUDE_SUBCOMMANDS.contains(&head)
+                && !matches!(head, "plugin" | "doctor" | "update" | "install")
+                && !arguments
+                    .iter()
+                    .any(|argument| matches!(argument.to_str(), Some("-p" | "--print")))
+        }
+        Agent::Codex => !matches!(
+            head,
+            "exec"
+                | "e"
+                | "login"
+                | "logout"
+                | "plugin"
+                | "mcp"
+                | "app-server"
+                | "debug"
+                | "completion"
+                | "sandbox"
+        ),
+    }
+}
+
+fn launch_updates(root: &Path, root_id: &str, agent: Agent, generation: &str) -> Result<()> {
     let project = model::current_project_key();
     let cwd = model::current_directory()?;
     let store = Store::open(root, false, OpenMode::Launch)?;
@@ -791,9 +1220,13 @@ fn launch_updates(root: &Path, root_id: &str, agent: Agent, generation: &str) ->
     if due {
         store.update_side::<Database>(|db| {
             db.last_background_check = Some(now);
+            db.background_rotation = db.background_rotation.wrapping_add(1);
             Ok(())
         })?;
     }
+    let prompt = candidate
+        .map(|rule| preview_for(std::slice::from_ref(rule), &db, Job::Update, &store))
+        .transpose()?;
     drop(store);
     if due {
         let exe =
@@ -809,8 +1242,9 @@ fn launch_updates(root: &Path, root_id: &str, agent: Agent, generation: &str) ->
             .spawn()
             .map_err(|e| Error::io("start update check in", root, e))?;
     }
-    let Some(rule) = candidate else { return Ok(()) };
-    let lines = preview_for(std::slice::from_ref(rule), &db, Job::Update);
+    let (Some(rule), Some(lines)) = (candidate, prompt) else {
+        return Ok(());
+    };
     let answer = platform::prompt_line(&format!(
         "Managed plugin update available\n{}\nUpdate now? [y/N] ",
         lines.join("\n")
@@ -824,7 +1258,8 @@ fn launch_updates(root: &Path, root_id: &str, agent: Agent, generation: &str) ->
     if session.root_id != root_id {
         return Ok(());
     }
-    let latest = session.read()?;
+    let store = session.open(OpenMode::Read)?;
+    let latest = store.read_side_unfiltered::<Database>()?;
     let Some(mut saved) = latest
         .rules
         .iter()
@@ -833,12 +1268,15 @@ fn launch_updates(root: &Path, root_id: &str, agent: Agent, generation: &str) ->
     else {
         return Ok(());
     };
-    if saved.removing || preview_for(std::slice::from_ref(&saved), &latest, Job::Update) != lines {
+    if saved.removing
+        || preview_for(std::slice::from_ref(&saved), &latest, Job::Update, &store)? != lines
+    {
         return Err(
             Error::new("revision_changed", "Update changed since the prompt")
                 .next("Run roost plugin check"),
         );
     }
+    drop(store);
     if answer.eq_ignore_ascii_case("y") || answer.eq_ignore_ascii_case("yes") {
         if update_rule(&session, &mut saved)? {
             return Err(Error::new("managed_plugin_failed", "Update was incomplete")

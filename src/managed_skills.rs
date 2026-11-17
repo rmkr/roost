@@ -8,6 +8,7 @@ use rustix::fs::{self as sys, Mode, OFlags, RenameFlags};
 use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value, json};
 use std::{
+    cell::Cell,
     collections::{BTreeMap, BTreeSet},
     env,
     fs::{self, DirBuilder, File},
@@ -26,6 +27,7 @@ const INSTALLER: &str = "skills@1.9.0";
 const LOCK_FILE: &str = "skills-lock.json";
 const METADATA: &str = "roost-managed-skills";
 const RECORD: &str = "transaction.json";
+const BUNDLE: &str = "bundle.json";
 const JSON_LIMIT: usize = 4 * 1024 * 1024;
 const TREE_LIMIT: usize = 32 * 1024 * 1024;
 
@@ -33,11 +35,25 @@ const TREE_LIMIT: usize = 32 * 1024 * 1024;
 pub(crate) struct Receipt {
     pub revision: String,
     scope: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    owner: Option<String>,
     checkout: FileIdentity,
     source: String,
     files: Vec<Owned>,
     lock_version: Value,
     lock_entries: BTreeMap<String, Value>,
+}
+
+impl Receipt {
+    pub(crate) fn verify_owner(&self, root_id: &str) -> Result<()> {
+        if !valid_root_id(root_id) || self.owner.as_deref() != Some(root_id) {
+            return Err(Error::new(
+                "ownership",
+                "Managed skills receipt belongs to a different Roost root",
+            ));
+        }
+        Ok(())
+    }
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
@@ -61,14 +77,7 @@ enum Agent {
 
 impl Placement {
     fn parent(&self, root: &Directory, create: bool) -> Result<Option<Directory>> {
-        let agent_dir = match self.agent {
-            Agent::Canonical => ".agents",
-            Agent::Claude => ".claude",
-        };
-        let Some(agent_dir) = child(root, agent_dir, create)? else {
-            return Ok(None);
-        };
-        child(&agent_dir, "skills", create)
+        self.agent.skills_dir(root, create)
     }
 
     fn claude_link(&self) -> PathBuf {
@@ -76,11 +85,33 @@ impl Placement {
     }
 }
 
+impl Agent {
+    fn skills_dir(self, root: &Directory, create: bool) -> Result<Option<Directory>> {
+        let dir = match self {
+            Self::Canonical => ".agents",
+            Self::Claude => ".claude",
+        };
+        let Some(dir) = child(root, dir, create)? else {
+            return Ok(None);
+        };
+        child(&dir, "skills", create)
+    }
+}
+
 pub(crate) struct Staged {
     revision: String,
-    scope: String,
-    source: String,
+    bundle: Bundle,
     files: Vec<(Placement, Content, String)>,
+}
+
+#[derive(Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+struct Bundle {
+    version: u32,
+    source: String,
+    skills: BTreeSet<String>,
+    agents: BTreeSet<String>,
+    owner: Option<String>,
     lock_version: Value,
     lock_entries: BTreeMap<String, Value>,
 }
@@ -89,6 +120,119 @@ impl Staged {
     pub(crate) fn revision(&self) -> &str {
         &self.revision
     }
+
+    pub(crate) fn bind_owner(&mut self, root_id: &str) -> Result<()> {
+        if !valid_root_id(root_id) || self.bundle.owner.as_deref().is_some_and(|id| id != root_id) {
+            return Err(Error::new(
+                "ownership",
+                "Invalid or foreign staged skills owner",
+            ));
+        }
+        self.bundle.owner = Some(root_id.to_owned());
+        Ok(())
+    }
+
+    fn scope(&self) -> Result<String> {
+        let scope = self.bundle.scope()?;
+        match &self.bundle.owner {
+            Some(owner) => digest(&(owner, scope)),
+            None => Ok(scope),
+        }
+    }
+
+    pub(crate) fn save(&self, cache: &Directory) -> Result<()> {
+        verify_cache(cache)?;
+        if self.bundle.owner.is_none() {
+            return Err(Error::new(
+                "ownership",
+                "Staged skills have no Roost root owner",
+            ));
+        }
+        let reuse = || {
+            if load(cache, self.revision())?.bundle.owner != self.bundle.owner {
+                return Err(Error::new(
+                    "ownership",
+                    "Cached skills belong to a different Roost root",
+                ));
+            }
+            cache.sync()
+        };
+        if cache.entry(self.revision())?.is_some() {
+            return reuse();
+        }
+        let manifest = serde_json::to_vec(&self.bundle)
+            .map_err(|e| Error::new("io", format!("Cannot encode staged skills bundle: {e}")))?;
+        if manifest.len() > JSON_LIMIT {
+            return Err(invalid_stage(
+                "Staged skills bundle metadata exceeds supported size",
+            ));
+        }
+        // Keep the manifest and portable tree under one private directory.
+        // Publishing that directory makes the complete revision visible at once.
+        let name = format!("bundle-{}", platform::random_id()?);
+        let prepared = cache.create_dir(&name)?;
+        let result = (|| {
+            prepared.write_new(BUNDLE, &manifest, 0o600)?;
+            for (placement, content, _) in &self.files {
+                let parent = placement
+                    .parent(&prepared, true)?
+                    .expect("create skills directory");
+                write_content(&parent, &placement.name, content)?;
+                parent.sync()?;
+            }
+            prepared.sync()?;
+            match cache.publish_new_entry(&name, prepared.identity()?, self.revision()) {
+                Ok(()) => cache.sync(),
+                Err(e) if e.code == "collision" => reuse(),
+                Err(e) => Err(e),
+            }
+        })();
+        let cleanup = clean_workspace(cache, &name);
+        result.and(cleanup)
+    }
+}
+
+impl Bundle {
+    fn scope(&self) -> Result<String> {
+        digest(&(&self.source, &self.skills, &self.agents))
+    }
+}
+
+fn verify_cache(cache: &Directory) -> Result<()> {
+    let current = Directory::open(&cache.path, true)?;
+    if current.identity()? != cache.identity()? {
+        return Err(conflict(&cache.path));
+    }
+    Ok(())
+}
+
+pub(crate) fn load(cache: &Directory, revision: &str) -> Result<Staged> {
+    if !valid_hash(revision) {
+        return Err(invalid_stage("Invalid staged skills revision"));
+    }
+    verify_cache(cache)?;
+    if cache.entry(revision)?.is_none() {
+        return Err(Error::new(
+            "skills_unavailable",
+            "Selected staged skills revision is not cached",
+        ));
+    }
+    let directory = cache.child(revision, true)?;
+    let bytes = directory
+        .read(BUNDLE, true, JSON_LIMIT)?
+        .ok_or_else(|| invalid_stage("Cached skills bundle has no manifest"))?;
+    let bundle: Bundle = serde_json::from_slice(&bytes)
+        .map_err(|_| invalid_stage("Invalid cached skills bundle manifest"))?;
+    if !bundle.owner.as_deref().is_some_and(valid_root_id) {
+        return Err(invalid_stage("Invalid cached skills bundle owner"));
+    }
+    let stage = read_bundle(&directory, bundle)?;
+    if stage.revision() != revision {
+        return Err(invalid_stage(
+            "Cached skills bundle does not match the selected revision",
+        ));
+    }
+    Ok(stage)
 }
 
 #[derive(Serialize)]
@@ -192,6 +336,13 @@ fn valid_hash(hash: &str) -> bool {
     hash.len() == 40 && hash.bytes().all(|b| b.is_ascii_hexdigit())
 }
 
+fn valid_root_id(id: &str) -> bool {
+    id.len() == 32
+        && id
+            .bytes()
+            .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
+}
+
 fn valid_skill(name: &str) -> bool {
     name.len() <= 255
         && name
@@ -251,7 +402,18 @@ fn read_content(
         Some(entry) if entry.is_dir => {
             let dir = parent.child(name, false)?;
             let mut children = BTreeMap::new();
-            for name in dir.entries()? {
+            let budget = Cell::new(*remaining);
+            let names = dir.matching_entries(|name| {
+                let name = name
+                    .ok_or_else(|| Error::new("unsafe_path", "Skill file name is not Unicode"))?;
+                platform::valid_name(name)?;
+                let left = budget.get().checked_sub(name.len() + 1).ok_or_else(|| {
+                    Error::new("unsafe_path", "Skill tree exceeds supported size")
+                })?;
+                budget.set(left);
+                Ok(true)
+            })?;
+            for name in names {
                 let content = read_content(&dir, &name, remaining, depth + 1)?;
                 children.insert(name, content);
             }
@@ -349,44 +511,53 @@ fn run_installer(mut command: Command, timeout: Duration) -> Result<ExitStatus> 
     result
 }
 
-pub(crate) fn stage(source: &str, skills: &[String], agents: &[String]) -> Result<Staged> {
-    let skills: BTreeSet<&str> = skills.iter().map(String::as_str).collect();
-    let agents: BTreeSet<&str> = agents
-        .iter()
-        .map(|agent| match agent.as_str() {
-            "claude" => "claude-code",
-            agent => agent,
-        })
-        .collect();
-    if source.is_empty()
-        || source.starts_with('-')
-        || source.contains(['\0', '\r', '\n'])
-        || skills.is_empty()
-        || skills.iter().any(|name| !valid_skill(name))
-        || agents.is_empty()
-        || agents
-            .iter()
-            .any(|agent| !matches!(*agent, "claude-code" | "codex"))
-    {
-        return Err(Error::new(
-            "usage",
-            "Select a skills source, explicit skill names and supported agents",
-        ));
-    }
+fn valid_source(source: &str) -> bool {
+    !source.is_empty() && !source.starts_with('-') && !source.contains(['\0', '\r', '\n'])
+}
 
+fn valid_selection(skills: &BTreeSet<String>, agents: &BTreeSet<String>) -> bool {
+    !skills.is_empty()
+        && (skills.len() == 1 && skills.contains("*")
+            || skills.iter().all(|name| valid_skill(name)))
+        && !agents.is_empty()
+        && agents
+            .iter()
+            .all(|agent| matches!(agent.as_str(), "claude-code" | "codex"))
+}
+
+fn normalize_source(source: &str) -> Result<String> {
     let local = Path::new(source);
-    let source = if local.is_absolute()
-        || local.exists()
-        || source.starts_with("./")
-        || source.starts_with("../")
-    {
+    if local.is_absolute() || source.starts_with("./") || source.starts_with("../") {
         let local = local
             .canonicalize()
             .map_err(|e| Error::io("resolve local skills source", local, e))?;
-        platform::absolute(&local)?.to_string_lossy().into_owned()
+        Ok(platform::absolute(&local)?.to_string_lossy().into_owned())
     } else {
-        source.to_owned()
-    };
+        Ok(source.to_owned())
+    }
+}
+
+pub(crate) fn stage(source: &str, skills: &[String], agents: &[String]) -> Result<Staged> {
+    let wildcard = skills.len() == 1 && skills[0] == "*";
+    let skills: BTreeSet<String> = skills.iter().cloned().collect();
+    let agents: BTreeSet<String> = agents
+        .iter()
+        .map(|agent| match agent.as_str() {
+            "claude" => "claude-code".to_owned(),
+            _ => agent.clone(),
+        })
+        .collect();
+    if !valid_source(source)
+        || !valid_selection(&skills, &agents)
+        || skills.contains("*") && !wildcard
+    {
+        return Err(Error::new(
+            "usage",
+            "Select a skills source, explicit skill names or '*' alone, and supported agents",
+        ));
+    }
+
+    let source = normalize_source(source)?;
 
     let bunx =
         launch::resolve_program("bunx").map_err(|e| Error::new("skills_unavailable", e.message))?;
@@ -462,45 +633,91 @@ pub(crate) fn stage(source: &str, skills: &[String], agents: &[String]) -> Resul
     let lock = lock_document(&project)?
         .ok_or_else(|| invalid_stage("The skills installer did not produce skills-lock.json"))?
         .fields;
-    let staged_entries = lock["skills"].as_object().expect("validated lock document");
-    if staged_entries
-        .keys()
-        .map(String::as_str)
-        .collect::<BTreeSet<_>>()
-        != skills
-    {
-        return Err(invalid_stage(
-            "The skills installer did not stage exactly the requested skills",
-        ));
-    }
     let mut lock_entries = BTreeMap::new();
-    let mut files = Vec::new();
-    let mut remaining = TREE_LIMIT;
-    for name in &skills {
-        let name = *name;
-        let entry = staged_entries[name]
+    for (name, entry) in lock["skills"].as_object().expect("validated lock document") {
+        let mut entry = entry
             .as_object()
+            .cloned()
             .ok_or_else(|| invalid_stage("The skills installer produced an invalid lock entry"))?;
-        let mut entry = entry.clone();
         if entry.get("sourceType").and_then(Value::as_str) == Some("local") {
             // skills resolves relative local sources against its working
             // directory. Store the original absolute source, not a temp path.
             entry.insert("source".into(), json!(source));
         }
-        let copy = entry.get("installMode").and_then(Value::as_str) == Some("copy");
-        lock_entries.insert(name.to_owned(), Value::Object(entry));
-        let placement = Placement {
-            agent: if claude_only {
-                Agent::Claude
-            } else {
-                Agent::Canonical
-            },
-            name: name.to_owned(),
+        lock_entries.insert(name.clone(), Value::Object(entry));
+    }
+    read_bundle(
+        &project,
+        Bundle {
+            version: 1,
+            source,
+            skills,
+            agents,
+            owner: None,
+            lock_version: lock["version"].clone(),
+            lock_entries,
+        },
+    )
+}
+
+fn read_bundle(project: &Directory, bundle: Bundle) -> Result<Staged> {
+    let names: BTreeSet<_> = bundle.lock_entries.keys().cloned().collect();
+    if bundle.version != 1
+        || !valid_source(&bundle.source)
+        || !valid_selection(&bundle.skills, &bundle.agents)
+        || !bundle.lock_version.is_u64()
+        || names.is_empty()
+        || names.iter().any(|name| !valid_skill(name))
+        || !bundle.skills.contains("*") && names != bundle.skills
+        || bundle.lock_entries.values().any(|entry| !entry.is_object())
+    {
+        return Err(invalid_stage(
+            "Invalid staged skills bundle metadata or selection",
+        ));
+    }
+    let canonical = bundle.agents.contains("codex");
+    let claude = bundle.agents.contains("claude-code");
+    let locate = |agent: Agent, selected: bool| -> Result<Option<Directory>> {
+        let mismatch = || {
+            invalid_stage("Staged skills directory does not match the selected skills and agents")
         };
-        let parent = placement
-            .parent(&project, false)?
-            .ok_or_else(|| invalid_stage("Missing staged skills directory"))?;
-        let content = read_content(&parent, name, &mut remaining, 0)?;
+        if let Some(parent) = agent.skills_dir(project, false)? {
+            let entries = parent.matching_entries(|name| {
+                if !selected || !name.is_some_and(|name| names.contains(name)) {
+                    return Err(mismatch());
+                }
+                Ok(true)
+            })?;
+            if !selected || entries.into_iter().collect::<BTreeSet<_>>() == names {
+                return Ok(Some(parent));
+            }
+        } else if !selected {
+            return Ok(None);
+        }
+        Err(mismatch())
+    };
+    let canonical_parent = locate(Agent::Canonical, canonical)?;
+    let claude_parent = locate(Agent::Claude, claude)?;
+    let primary = if canonical {
+        Agent::Canonical
+    } else {
+        Agent::Claude
+    };
+    let primary_parent = if canonical {
+        &canonical_parent
+    } else {
+        &claude_parent
+    };
+    let primary_parent = primary_parent.as_ref().expect("selected skills directory");
+    let mut files = Vec::new();
+    let mut remaining = TREE_LIMIT;
+    for (name, entry) in &bundle.lock_entries {
+        let copy = entry.get("installMode").and_then(Value::as_str) == Some("copy");
+        let placement = Placement {
+            agent: primary,
+            name: name.clone(),
+        };
+        let content = read_content(primary_parent, name, &mut remaining, 0)?;
         if !matches!(&content, Content::Tree { children, .. } if matches!(children.get("SKILL.md"), Some(Content::File { .. })))
         {
             return Err(invalid_stage(format!(
@@ -510,17 +727,15 @@ pub(crate) fn stage(source: &str, skills: &[String], agents: &[String]) -> Resul
         let hash = digest(&content)?;
         files.push((placement, content, hash.clone()));
 
-        if !claude_only && agents.contains("claude-code") {
+        if canonical && claude {
             let claude = Placement {
                 agent: Agent::Claude,
                 name: name.to_owned(),
             };
-            let parent = claude
-                .parent(&project, false)?
-                .ok_or_else(|| invalid_stage("Missing staged Claude skills directory"))?;
+            let parent = claude_parent.as_ref().expect("selected Claude directory");
             let link = claude.claude_link();
             let (content, hash) = if copy {
-                let content = read_content(&parent, name, &mut remaining, 0)?;
+                let content = read_content(parent, name, &mut remaining, 0)?;
                 if digest(&content)? != hash {
                     return Err(invalid_stage(format!(
                         "Staged Claude copy differs for skill {name}"
@@ -541,23 +756,41 @@ pub(crate) fn stage(source: &str, skills: &[String], agents: &[String]) -> Resul
         }
     }
     files.sort_by(|(left, _, _), (right, _, _)| left.cmp(right));
-    let scope = digest(&(&source, &skills, &agents))?;
-    let fingerprints: Vec<_> = files.iter().map(|(path, _, hash)| (path, hash)).collect();
-    let lock_version = lock["version"].clone();
-    let revision = digest(&(&scope, &fingerprints, &lock_version, &lock_entries))?;
+    let revision = bundle_revision(&bundle, &files)?;
     Ok(Staged {
         revision,
-        scope,
-        source,
+        bundle,
         files,
-        lock_version,
-        lock_entries,
     })
 }
 
+fn bundle_revision(bundle: &Bundle, files: &[(Placement, Content, String)]) -> Result<String> {
+    let fingerprints: Vec<_> = files.iter().map(|(path, _, hash)| (path, hash)).collect();
+    digest(&(
+        &bundle.scope()?,
+        &fingerprints,
+        &bundle.lock_version,
+        &bundle.lock_entries,
+    ))
+}
+
 impl Checkout {
-    fn open(root: &Path) -> Result<Self> {
+    fn open(root: &Path, expected: Option<(&FileIdentity, &FileIdentity)>) -> Result<Self> {
         let root = Directory::open(&platform::absolute(root)?, false)?;
+        let changed = || {
+            Error::new(
+                "ownership",
+                format!(
+                    "Repository checkout or Git directory changed at {}",
+                    root.path.display()
+                ),
+            )
+        };
+        if let Some((checkout, _)) = expected
+            && root.identity()? != *checkout
+        {
+            return Err(changed());
+        }
         let dot_git = root.path.join(".git");
         let invalid = || {
             Error::new(
@@ -577,17 +810,16 @@ impl Checkout {
         let mut command = git();
         command.current_dir(&root.path).args([
             "rev-parse",
+            "--path-format=absolute",
             "--show-toplevel",
             "--absolute-git-dir",
+            "--git-common-dir",
             "--is-inside-work-tree",
         ]);
         let (bytes, status) = launch::probe(command, "invalid_project", Duration::from_secs(5))?;
         let mut lines = std::str::from_utf8(&bytes).map_err(|_| invalid())?.lines();
-        let Some((top, gitdir, "true")) = lines
-            .next()
-            .zip(lines.next())
-            .zip(lines.next())
-            .map(|((top, gitdir), inside)| (top, gitdir, inside))
+        let (Some(top), Some(gitdir), Some(common), Some("true")) =
+            (lines.next(), lines.next(), lines.next(), lines.next())
         else {
             return Err(invalid());
         };
@@ -595,21 +827,79 @@ impl Checkout {
             return Err(invalid());
         }
         let gitdir = Directory::open(Path::new(gitdir), false)?;
+        let common = Directory::open(Path::new(common), false)?;
+        if let Some((_, common_identity)) = expected
+            && common.identity()? != *common_identity
+        {
+            return Err(changed());
+        }
+        let common_pointer = gitdir.read("commondir", false, 4096)?;
+        let mut backlink = None;
         if marker.is_dir {
             if gitdir.path != dot_git || gitdir.identity()? != marker.identity {
                 return Err(invalid());
             }
-        } else if gitdir.entry("commondir")?.is_some() {
-            let backlink = gitdir.read("gitdir", false, 4096)?.ok_or_else(invalid)?;
-            let backlink = std::str::from_utf8(&backlink)
+        } else {
+            let pointer = marker_contents.as_deref().ok_or_else(invalid)?;
+            let pointer = std::str::from_utf8(pointer)
                 .map_err(|_| invalid())?
-                .trim_end_matches(['\r', '\n']);
-            if platform::absolute(&gitdir.path.join(backlink))? != dot_git {
+                .trim_end_matches(['\r', '\n'])
+                .strip_prefix("gitdir:")
+                .ok_or_else(invalid)?
+                .trim_start();
+            if Directory::open(&root.path.join(pointer), false)?.identity()? != gitdir.identity()? {
                 return Err(invalid());
             }
+            if common_pointer.is_some() {
+                let bytes = gitdir.read("gitdir", false, 4096)?.ok_or_else(invalid)?;
+                let target = std::str::from_utf8(&bytes)
+                    .map_err(|_| invalid())?
+                    .trim_end_matches(['\r', '\n']);
+                if platform::absolute(&gitdir.path.join(target))? != dot_git {
+                    return Err(invalid());
+                }
+                backlink = Some(bytes);
+            }
         }
-        if root.entry(".git")?.map(|entry| entry.identity) != Some(marker.identity.clone()) {
+        let configured_common = match &common_pointer {
+            Some(pointer) => {
+                let pointer = std::str::from_utf8(pointer)
+                    .map_err(|_| invalid())?
+                    .trim_end_matches(['\r', '\n']);
+                Directory::open(&gitdir.path.join(pointer), false)?.identity()?
+            }
+            None => gitdir.identity()?,
+        };
+        if configured_common != common.identity()? {
             return Err(invalid());
+        }
+        let verify = || -> Result<()> {
+            for dir in [&root, &gitdir, &common] {
+                if Directory::open(&dir.path, false)?.identity()? != dir.identity()? {
+                    return Err(changed());
+                }
+            }
+            if root.entry(".git")?.map(|entry| entry.identity).as_ref() != Some(&marker.identity)
+                || (marker.is_file && root.read(".git", false, 4096)? != marker_contents)
+                || gitdir.read("commondir", false, 4096)? != common_pointer
+                || (backlink.is_some() && gitdir.read("gitdir", false, 4096)? != backlink)
+            {
+                return Err(invalid());
+            }
+            Ok(())
+        };
+        verify()?;
+        let device = |dir: &Directory| -> Result<_> {
+            directory_handle(dir)?
+                .metadata()
+                .map(|metadata| metadata.dev())
+                .map_err(|e| Error::io("inspect directory filesystem", &dir.path, e))
+        };
+        if device(&root)? != device(&gitdir)? {
+            return Err(Error::new(
+                "unsafe_path",
+                "Skill checkout and Git metadata must share a filesystem",
+            ));
         }
         let state = private_child(&gitdir, METADATA)?;
         let lock = match state.create_file("lock", 0o600) {
@@ -634,19 +924,13 @@ impl Checkout {
                 }
             }
         }
-        if root.entry(".git")?.map(|entry| entry.identity) != Some(marker.identity)
-            || (marker.is_file && root.read(".git", false, 4096)? != marker_contents)
+        verify()?;
+        if gitdir.entry(METADATA)?.map(|entry| entry.identity) != Some(state.identity()?)
             || state.entry("lock")?.map(|entry| entry.identity)
                 != Some(platform::file_identity(&lock)?)
         {
             return Err(invalid());
         }
-        let device = |dir: &Directory| -> Result<_> {
-            directory_handle(dir)?
-                .metadata()
-                .map(|metadata| metadata.dev())
-                .map_err(|e| Error::io("inspect directory filesystem", &dir.path, e))
-        };
         if device(&root)? != device(&state)? {
             return Err(Error::new(
                 "unsafe_path",
@@ -669,35 +953,49 @@ impl Checkout {
         }
         private_child(&self.state, key)
     }
+}
 
-    fn verify_receipt(&self, receipt: &Receipt, key: &str) -> Result<()> {
-        let mut paths = BTreeSet::new();
-        if receipt.checkout != self.root.identity()?
-            || receipt.scope != key
-            || !valid_hash(&receipt.revision)
-            || !receipt.lock_version.is_u64()
-            || receipt.files.is_empty()
-            || receipt.files.iter().any(|owned| {
-                !valid_skill(&owned.placement.name)
-                    || !receipt.lock_entries.contains_key(&owned.placement.name)
-                    || !valid_hash(&owned.digest)
-                    || !paths.insert(&owned.placement)
-            })
-            || receipt.lock_entries.iter().any(|(name, entry)| {
-                !entry.is_object()
-                    || !receipt
-                        .files
-                        .iter()
-                        .any(|owned| owned.placement.name == *name)
-            })
-        {
-            return Err(Error::new(
-                "ownership",
-                "Invalid or foreign managed skills receipt",
-            ));
-        }
-        Ok(())
+fn verify_receipt(root: &Directory, receipt: &Receipt, key: &str) -> Result<()> {
+    let mut paths = BTreeSet::new();
+    if receipt.checkout != root.identity()?
+        || receipt.scope != key
+        || !valid_hash(key)
+        || receipt
+            .owner
+            .as_deref()
+            .is_some_and(|owner| !valid_root_id(owner))
+        || !valid_hash(&receipt.revision)
+        || !valid_source(&receipt.source)
+        || !receipt.lock_version.is_u64()
+        || receipt.files.is_empty()
+        || receipt.files.iter().any(|owned| {
+            !valid_skill(&owned.placement.name)
+                || !receipt.lock_entries.contains_key(&owned.placement.name)
+                || !valid_hash(&owned.digest)
+                || !paths.insert(&owned.placement)
+        })
+        || receipt.lock_entries.iter().any(|(name, entry)| {
+            !entry.is_object()
+                || !receipt
+                    .files
+                    .iter()
+                    .any(|owned| owned.placement.name == *name)
+        })
+    {
+        return Err(Error::new(
+            "ownership",
+            "Invalid or foreign managed skills receipt",
+        ));
     }
+    Ok(())
+}
+
+pub(crate) fn inspect(root: &Path, receipt: &Receipt) -> Result<()> {
+    let root = Directory::open(root, false)?;
+    verify_receipt(&root, receipt, &receipt.scope)?;
+    check_owned(&root, Some(receipt), false)?;
+    lock_changes(&root, Some(receipt), Some(receipt), false)?;
+    Ok(())
 }
 
 fn private_child(parent: &Directory, name: &str) -> Result<Directory> {
@@ -816,7 +1114,7 @@ fn get_transaction(
         ));
     }
     for receipt in record.before.iter().chain(&record.after) {
-        checkout.verify_receipt(receipt, key)?;
+        verify_receipt(&checkout.root, receipt, key)?;
     }
     Ok(Some(record))
 }
@@ -1084,19 +1382,52 @@ fn finish(root: &Directory, scope: &Directory, mut record: Transaction) -> Resul
     Ok(record.after)
 }
 
-pub(crate) fn apply(root: &Path, stage: &Staged, prior: Option<&Receipt>) -> Result<Receipt> {
-    let checkout = Checkout::open(root)?;
-    let root = &checkout.root;
-    let scope = checkout.scope(&stage.scope)?;
-    if let Some(prior) = prior {
-        checkout.verify_receipt(prior, &stage.scope)?;
+#[cfg(test)]
+fn apply(root: &Path, stage: &Staged, prior: Option<&Receipt>) -> Result<Receipt> {
+    apply_with_identities(root, None, stage, prior)
+}
+
+pub(crate) fn apply_verified(
+    root: &Path,
+    checkout: &FileIdentity,
+    common: &FileIdentity,
+    stage: &Staged,
+    prior: Option<&Receipt>,
+) -> Result<Receipt> {
+    if stage.bundle.owner.is_none() {
+        return Err(Error::new(
+            "ownership",
+            "Staged skills have no Roost root owner",
+        ));
     }
-    if let Some(record) = get_transaction(&scope, &checkout, &stage.scope)? {
-        if record
-            .after
-            .as_ref()
-            .is_some_and(|after| after.revision == stage.revision)
-            && (prior == record.before.as_ref() || prior == record.after.as_ref())
+    apply_with_identities(root, Some((checkout, common)), stage, prior)
+}
+
+fn apply_with_identities(
+    root: &Path,
+    expected: Option<(&FileIdentity, &FileIdentity)>,
+    stage: &Staged,
+    prior: Option<&Receipt>,
+) -> Result<Receipt> {
+    let key = stage.scope()?;
+    if let Some(prior) = prior
+        && (prior.owner != stage.bundle.owner || prior.scope != key)
+    {
+        return Err(Error::new(
+            "ownership",
+            "Invalid or foreign managed skills receipt",
+        ));
+    }
+    let checkout = Checkout::open(root, expected)?;
+    let root = &checkout.root;
+    if let Some(prior) = prior {
+        verify_receipt(root, prior, &key)?;
+    }
+    let scope = checkout.scope(&key)?;
+    if let Some(record) = get_transaction(&scope, &checkout, &key)? {
+        if record.after.as_ref().is_some_and(|after| {
+            after.revision == stage.revision && after.owner == stage.bundle.owner
+        }) && (prior == record.before.as_ref() || prior == record.after.as_ref())
         {
             if record.complete {
                 check_owned(root, record.after.as_ref(), false)?;
@@ -1113,13 +1444,14 @@ pub(crate) fn apply(root: &Path, stage: &Staged, prior: Option<&Receipt>) -> Res
     }
     check_owned(root, prior, false)?;
 
-    let record = prepare(root, &scope, stage, prior)?;
+    let record = prepare(root, &scope, &key, stage, prior)?;
     finish(root, &scope, record).map(|receipt| receipt.expect("apply transaction"))
 }
 
 fn prepare(
     root: &Directory,
     scope: &Directory,
+    key: &str,
     stage: &Staged,
     prior: Option<&Receipt>,
 ) -> Result<Transaction> {
@@ -1128,14 +1460,31 @@ fn prepare(
     let prepared = (|| {
         let mut after = Receipt {
             revision: stage.revision.clone(),
-            scope: stage.scope.clone(),
+            scope: key.to_owned(),
+            owner: stage.bundle.owner.clone(),
             checkout: root.identity()?,
-            source: stage.source.clone(),
+            source: stage.bundle.source.clone(),
             files: Vec::new(),
-            lock_version: stage.lock_version.clone(),
-            lock_entries: stage.lock_entries.clone(),
+            lock_version: stage.bundle.lock_version.clone(),
+            lock_entries: stage.bundle.lock_entries.clone(),
         };
-        for (index, (placement, content, digest)) in stage.files.iter().enumerate() {
+        // Recovery indexes the union of old and new placements, including
+        // those that a wildcard update removes.
+        let mut paths = placements(prior, None);
+        paths.extend(
+            stage
+                .files
+                .iter()
+                .map(|(placement, _, _)| placement.clone()),
+        );
+        for (index, path) in paths.iter().enumerate() {
+            let Ok(staged_index) = stage
+                .files
+                .binary_search_by(|(placement, _, _)| placement.cmp(path))
+            else {
+                continue;
+            };
+            let (placement, content, digest) = &stage.files[staged_index];
             let old = opposite(prior, placement);
             if old.is_none()
                 && let Some(parent) = placement.parent(root, false)?
@@ -1182,10 +1531,34 @@ fn prepare(
     Ok(record)
 }
 
-pub(crate) fn remove(root: &Path, receipt: &Receipt) -> Result<()> {
-    let checkout = Checkout::open(root)?;
+#[cfg(test)]
+fn remove(root: &Path, receipt: &Receipt) -> Result<()> {
+    remove_with_identities(root, None, receipt)
+}
+
+pub(crate) fn remove_verified(
+    root: &Path,
+    checkout: &FileIdentity,
+    common: &FileIdentity,
+    receipt: &Receipt,
+) -> Result<()> {
+    if receipt.owner.is_none() {
+        return Err(Error::new(
+            "ownership",
+            "Managed skills receipt has no Roost root owner",
+        ));
+    }
+    remove_with_identities(root, Some((checkout, common)), receipt)
+}
+
+fn remove_with_identities(
+    root: &Path,
+    expected: Option<(&FileIdentity, &FileIdentity)>,
+    receipt: &Receipt,
+) -> Result<()> {
+    let checkout = Checkout::open(root, expected)?;
     let root = &checkout.root;
-    checkout.verify_receipt(receipt, &receipt.scope)?;
+    verify_receipt(root, receipt, &receipt.scope)?;
     let scope = checkout.scope(&receipt.scope)?;
     if let Some(record) = get_transaction(&scope, &checkout, &receipt.scope)? {
         if record.before.as_ref() == Some(receipt) && record.after.is_none() {
@@ -1198,6 +1571,8 @@ pub(crate) fn remove(root: &Path, receipt: &Receipt) -> Result<()> {
             return Err(conflict(&scope.path));
         }
         clean_transaction_workspace(&scope, &record)?;
+    } else if receipt.owner.is_some() {
+        return Err(conflict(&scope.path));
     }
     check_owned(root, Some(receipt), true)?;
     lock_changes(root, Some(receipt), None, true)?;
@@ -1219,6 +1594,9 @@ mod tests {
     use super::*;
     use std::os::unix::fs::symlink;
 
+    const OWNER: &str = "0123456789abcdef0123456789abcdef";
+    const OTHER_OWNER: &str = "fedcba9876543210fedcba9876543210";
+
     fn repo() -> Temp {
         let repo = Temp::new().unwrap();
         assert!(
@@ -1233,9 +1611,13 @@ mod tests {
     }
 
     fn bundle(body: &str) -> Staged {
+        bundle_with_names(body, &["alpha", "beta"])
+    }
+
+    fn bundle_with_names(body: &str, names: &[&str]) -> Staged {
         let mut files = Vec::new();
         let mut lock_entries = BTreeMap::new();
-        for name in ["alpha", "beta"] {
+        for &name in names {
             let content = Content::Tree {
                 mode: 0o755,
                 children: BTreeMap::from([(
@@ -1265,13 +1647,20 @@ mod tests {
             files.push((location, content, hash));
         }
         files.sort_by(|(left, _, _), (right, _, _)| left.cmp(right));
-        Staged {
-            revision: digest(&body).unwrap(),
-            scope: digest(&"scope").unwrap(),
+        let bundle = Bundle {
+            version: 1,
             source: "owner/repo".into(),
-            files,
+            skills: names.iter().map(|&name| name.to_owned()).collect(),
+            agents: ["claude-code".into(), "codex".into()].into(),
+            owner: None,
             lock_entries,
             lock_version: json!(2),
+        };
+        let revision = bundle_revision(&bundle, &files).unwrap();
+        Staged {
+            revision,
+            bundle,
+            files,
         }
     }
 
@@ -1281,6 +1670,222 @@ mod tests {
 
     fn lock(root: &Path) -> Value {
         serde_json::from_slice(&fs::read(root.join(LOCK_FILE)).unwrap()).unwrap()
+    }
+
+    fn identity(path: &Path) -> FileIdentity {
+        Directory::open(path, false).unwrap().identity().unwrap()
+    }
+
+    #[test]
+    fn inspect_detects_edits_without_creating_checkout_metadata() {
+        let repo = repo();
+        let root = &repo.0;
+        let receipt = apply(root, &bundle("v1"), None).unwrap();
+        let metadata = root.join(".git").join(METADATA);
+        fs::remove_dir_all(&metadata).unwrap();
+        let lock_path = root.join(LOCK_FILE);
+        let original = fs::read(&lock_path).unwrap();
+        inspect(root, &receipt).unwrap();
+        assert_eq!(fs::read(&lock_path).unwrap(), original);
+
+        let mut edited = lock(root);
+        edited["skills"]["beta"]["ref"] = json!("edited");
+        fs::write(&lock_path, serde_json::to_vec(&edited).unwrap()).unwrap();
+        assert_eq!(inspect(root, &receipt).unwrap_err().code, "conflict");
+        fs::write(&lock_path, &original).unwrap();
+        fs::write(installed(root, "alpha"), "edited").unwrap();
+        assert_eq!(inspect(root, &receipt).unwrap_err().code, "conflict");
+
+        let mut invalid = receipt;
+        invalid.scope = "../foreign".into();
+        assert_eq!(inspect(root, &invalid).unwrap_err().code, "ownership");
+        assert!(!metadata.exists());
+    }
+
+    #[test]
+    fn owner_binding_namespaces_recovery_without_changing_revision() {
+        let repo = repo();
+        let root = &repo.0;
+        let checkout = identity(root);
+        let common = identity(&root.join(".git"));
+        let mut first = bundle("v1");
+        let mut foreign = bundle("v1");
+        first.bind_owner(OWNER).unwrap();
+        first.bind_owner(OWNER).unwrap();
+        foreign.bind_owner(OTHER_OWNER).unwrap();
+        assert_eq!(first.revision(), foreign.revision());
+        assert_ne!(first.scope().unwrap(), foreign.scope().unwrap());
+        assert_eq!(first.bind_owner(OTHER_OWNER).unwrap_err().code, "ownership");
+
+        let receipt = apply_verified(root, &checkout, &common, &first, None).unwrap();
+        assert_eq!(
+            apply_verified(root, &checkout, &common, &first, None).unwrap(),
+            receipt
+        );
+        receipt.verify_owner(OWNER).unwrap();
+        assert_eq!(
+            receipt.verify_owner(OTHER_OWNER).unwrap_err().code,
+            "ownership"
+        );
+        assert_eq!(
+            apply_verified(root, &checkout, &common, &foreign, None)
+                .unwrap_err()
+                .code,
+            "conflict"
+        );
+        assert_eq!(
+            apply_verified(root, &checkout, &common, &foreign, Some(&receipt))
+                .unwrap_err()
+                .code,
+            "ownership"
+        );
+        let mut relabeled = receipt.clone();
+        relabeled.owner = Some(OTHER_OWNER.into());
+        relabeled.scope = foreign.scope().unwrap();
+        assert_eq!(
+            remove_verified(root, &checkout, &common, &relabeled)
+                .unwrap_err()
+                .code,
+            "conflict"
+        );
+        remove_verified(root, &checkout, &common, &receipt).unwrap();
+    }
+
+    #[test]
+    fn cached_bundle_is_private_idempotent_and_checked_before_use() {
+        let temp = Temp::new().unwrap();
+        let cache = Directory::open(&temp.0, true).unwrap();
+        let mut staged = bundle("v1");
+        staged.bind_owner(OWNER).unwrap();
+        staged.save(&cache).unwrap();
+        staged.save(&cache).unwrap();
+        assert_eq!(cache.entries().unwrap(), [staged.revision()]);
+
+        let mut loaded = load(&cache, staged.revision()).unwrap();
+        assert_eq!(
+            loaded.bind_owner(OTHER_OWNER).unwrap_err().code,
+            "ownership"
+        );
+        loaded.bind_owner(OWNER).unwrap();
+        let repo = repo();
+        let receipt = apply_verified(
+            &repo.0,
+            &identity(&repo.0),
+            &identity(&repo.0.join(".git")),
+            &loaded,
+            None,
+        )
+        .unwrap();
+        inspect(&repo.0, &receipt).unwrap();
+        assert_eq!(
+            fs::read_to_string(installed(&repo.0, "alpha")).unwrap(),
+            "v1 alpha"
+        );
+
+        let saved = temp.0.join(staged.revision());
+        assert_eq!(fs::metadata(saved.join(BUNDLE)).unwrap().mode() & 0o077, 0);
+        let claude = saved.join(".claude/skills/alpha");
+        fs::remove_file(&claude).unwrap();
+        symlink("../../.agents/skills/beta", &claude).unwrap();
+        assert!(load(&cache, staged.revision()).is_err());
+        fs::remove_file(&claude).unwrap();
+        symlink("../../.agents/skills/alpha", &claude).unwrap();
+        fs::write(installed(&saved, "alpha"), "edited cache").unwrap();
+        assert!(load(&cache, staged.revision()).is_err());
+        assert!(staged.save(&cache).is_err());
+        assert!(load(&cache, "../other").is_err());
+    }
+
+    #[test]
+    fn verified_operations_reject_changed_identities_before_creating_metadata() {
+        let repo = repo();
+        let root = &repo.0;
+        let checkout = identity(root);
+        let common = identity(&root.join(".git"));
+        let mut staged = bundle("v1");
+        staged.bind_owner(OWNER).unwrap();
+        let receipt = apply_verified(root, &checkout, &common, &staged, None).unwrap();
+
+        fs::rename(root.join(".git"), root.join(".old-git")).unwrap();
+        assert!(
+            git()
+                .current_dir(root)
+                .args(["init", "-q", "--template="])
+                .status()
+                .unwrap()
+                .success()
+        );
+        assert_eq!(
+            apply_verified(root, &checkout, &common, &staged, Some(&receipt))
+                .unwrap_err()
+                .code,
+            "ownership"
+        );
+        let replacement_common = identity(&root.join(".git"));
+        assert_eq!(
+            apply_verified(root, &common, &replacement_common, &staged, None)
+                .unwrap_err()
+                .code,
+            "ownership"
+        );
+        assert_eq!(
+            remove_verified(root, &checkout, &common, &receipt)
+                .unwrap_err()
+                .code,
+            "ownership"
+        );
+        assert!(!root.join(".git").join(METADATA).exists());
+        inspect(root, &receipt).unwrap();
+    }
+
+    #[test]
+    fn accepts_wildcard_only_when_it_is_the_only_selector() {
+        let agents = ["codex".into()];
+        for other in ["alpha", "*"] {
+            let err = stage("owner/repo", &["*".into(), other.into()], &agents)
+                .err()
+                .unwrap();
+            assert_eq!(err.code, "usage");
+        }
+    }
+
+    #[test]
+    fn wildcard_update_can_add_and_remove_skills() {
+        let repo = repo();
+        let checkout = identity(&repo.0);
+        let common = identity(&repo.0.join(".git"));
+        let wildcard = |body, names: &[&str]| {
+            let mut stage = bundle_with_names(body, names);
+            stage.bundle.skills = ["*".into()].into();
+            stage.revision = bundle_revision(&stage.bundle, &stage.files).unwrap();
+            stage.bind_owner(OWNER).unwrap();
+            stage
+        };
+        let first = wildcard("v1", &["alpha", "beta"]);
+        let before = apply_verified(&repo.0, &checkout, &common, &first, None).unwrap();
+        let update = wildcard("v2", &["beta", "gamma"]);
+        let after = apply_verified(&repo.0, &checkout, &common, &update, Some(&before)).unwrap();
+        inspect(&repo.0, &after).unwrap();
+        assert!(!installed(&repo.0, "alpha").exists());
+        assert!(!repo.0.join(".claude/skills/alpha").is_symlink());
+        assert_eq!(
+            fs::read_to_string(installed(&repo.0, "beta")).unwrap(),
+            "v2 beta"
+        );
+        assert_eq!(
+            fs::read_to_string(installed(&repo.0, "gamma")).unwrap(),
+            "v2 gamma"
+        );
+    }
+
+    #[test]
+    fn normalizes_only_explicit_local_sources() {
+        assert!(Path::new("src/store").is_dir());
+        assert_eq!(normalize_source("src/store").unwrap(), "src/store");
+        assert_eq!(
+            Path::new(&normalize_source("./src/store").unwrap()),
+            Path::new("./src/store").canonicalize().unwrap(),
+        );
     }
 
     #[test]
@@ -1363,9 +1968,10 @@ mod tests {
         let root = &repo.0;
         let staged = bundle("v1");
         {
-            let checkout = Checkout::open(root).unwrap();
-            let scope = checkout.scope(&staged.scope).unwrap();
-            let record = prepare(&checkout.root, &scope, &staged, None).unwrap();
+            let checkout = Checkout::open(root, None).unwrap();
+            let key = staged.scope().unwrap();
+            let scope = checkout.scope(&key).unwrap();
+            let record = prepare(&checkout.root, &scope, &key, &staged, None).unwrap();
             let work = scope.child(&record.workspace, true).unwrap();
             let placement = &staged.files[0].0;
             let parent = placement.parent(&checkout.root, true).unwrap().unwrap();
@@ -1420,15 +2026,26 @@ mod tests {
         let copy = targets.0.join("copied");
         fs::create_dir(&copy).unwrap();
         fs::copy(linked.join(".git"), copy.join(".git")).unwrap();
-        let staged = bundle("v1");
-        let first = apply(&linked, &staged, None).unwrap();
+        let mut staged = bundle("v1");
+        staged.bind_owner(OWNER).unwrap();
+        let checkout = identity(&linked);
+        let common = identity(&repo.0.join(".git"));
+        let gitdir = repo.0.join(".git/worktrees/linked");
+        assert_eq!(
+            apply_verified(&linked, &checkout, &identity(&gitdir), &staged, None)
+                .unwrap_err()
+                .code,
+            "ownership"
+        );
+        assert!(!gitdir.join(METADATA).exists());
+        let first = apply_verified(&linked, &checkout, &common, &staged, None).unwrap();
         assert_eq!(
             apply(&copy, &staged, None).unwrap_err().code,
             "invalid_project"
         );
         assert_eq!(remove(&repo.0, &first).unwrap_err().code, "ownership");
         assert!(!installed(&repo.0, "alpha").exists());
-        remove(&linked, &first).unwrap();
+        remove_verified(&linked, &checkout, &common, &first).unwrap();
     }
 
     #[test]
@@ -1472,6 +2089,24 @@ mod tests {
         assert!(!installed(&repo.0, "beta").exists());
         assert!(repo.0.join(".claude/skills/beta/SKILL.md").is_file());
         assert_eq!(lock(&repo.0)["skills"]["beta"]["installMode"], "copy");
+        remove(&repo.0, &receipt).unwrap();
+
+        let mut wildcard = stage(source, &["*".into()], &both).unwrap();
+        wildcard.bind_owner(OWNER).unwrap();
+        let cache = Temp::new().unwrap();
+        let cache = Directory::open(&cache.0, true).unwrap();
+        wildcard.save(&cache).unwrap();
+        fs::remove_dir_all(Path::new(source).join("skills")).unwrap();
+        let loaded = load(&cache, wildcard.revision()).unwrap();
+        let receipt = apply(&repo.0, &loaded, None).unwrap();
+        for name in ["alpha", "beta"] {
+            assert!(installed(&repo.0, name).is_file());
+            assert!(repo.0.join(".claude/skills").join(name).is_symlink());
+        }
+        assert_eq!(
+            receipt.lock_entries.keys().collect::<Vec<_>>(),
+            ["alpha", "beta"]
+        );
         remove(&repo.0, &receipt).unwrap();
     }
 }

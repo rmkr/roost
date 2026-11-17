@@ -222,7 +222,13 @@ impl Profile {
                 let root = store.root.clone();
                 let root_id = store.root_id.clone();
                 drop(store);
-                crate::managed::on_launch(&root, &root_id, crate::cli::Agent::Codex, &home.id);
+                crate::managed::on_launch(
+                    &root,
+                    &root_id,
+                    crate::cli::Agent::Codex,
+                    &home.id,
+                    arguments,
+                );
                 Ok(Outcome {
                     exit: launch::exec(command, arguments, "Codex")?,
                     ..Outcome::quiet()
@@ -284,6 +290,7 @@ pub(crate) fn start(
             &root_id,
             crate::cli::Agent::Claude,
             &registration.registration_id,
+            arguments,
         );
     }
     plugins.finish(&mut env);

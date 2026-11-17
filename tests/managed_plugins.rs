@@ -343,3 +343,135 @@ sys.exit(os.waitstatus_to_exitcode(status))
     f.ok(&["plugin", "update", "--managed", "--yes"]);
     assert!(fs::read_to_string(&skill).unwrap().contains("second"));
 }
+
+#[test]
+fn overlap_preserves_the_shared_checkout_and_sync_uses_the_selected_revision() {
+    let f = fixture();
+    let checkout = repo(&f, "checkout");
+    let later = repo(&f, "later");
+    f.ok(&["project", "add", s(&checkout)]);
+    for scope in [vec!["--repo", s(&checkout)], vec!["--all-repos"]] {
+        f.ok(&[
+            &[
+                "plugin",
+                "install",
+                "example/skills",
+                "--skills",
+                "--skill",
+                "*",
+                "--agent",
+                "claude",
+                "--yes",
+            ][..],
+            &scope,
+        ]
+        .concat());
+    }
+    fs::write(f.path.join("revision"), "second").unwrap();
+    let report = f.json(&["plugin", "list", "--managed", "--json"]);
+    let first = report["data"]["rules"][0]["id"].as_str().unwrap();
+    let second = report["data"]["rules"][1]["id"].as_str().unwrap();
+    f.ok(&["plugin", "uninstall", first, "--yes"]);
+    let location = ".claude/skills/demo/SKILL.md";
+    assert!(
+        fs::read_to_string(checkout.join(location))
+            .unwrap()
+            .contains("first")
+    );
+
+    f.ok(&["project", "add", s(&later)]);
+    f.ok(&["plugin", "sync", "--yes"]);
+    assert!(
+        fs::read_to_string(later.join(location))
+            .unwrap()
+            .contains("first")
+    );
+    f.ok(&["plugin", "check"]);
+    f.ok(&["plugin", "update", "--managed", second, "--yes"]);
+    for repo in [&checkout, &later] {
+        assert!(
+            fs::read_to_string(repo.join(location))
+                .unwrap()
+                .contains("second")
+        );
+    }
+    f.ok(&["plugin", "uninstall", second, "--yes"]);
+    assert!(!checkout.join(location).exists());
+    assert!(!later.join(location).exists());
+}
+
+#[test]
+fn an_unavailable_repo_reports_partial_results_and_retries_when_registered_as_git() {
+    let f = fixture();
+    let checkout = repo(&f, "valid");
+    let missing = f.path.join("missing");
+    let install = [
+        "plugin",
+        "install",
+        "example/skills",
+        "--skills",
+        "--skill",
+        "demo",
+        "--agent",
+        "codex",
+        "--repo",
+        s(&checkout),
+        "--repo",
+        s(&missing),
+    ];
+    let dry_run = f.run(&[&install[..], &["--dry-run", "--json"]].concat());
+    assert!(!dry_run.status.success());
+    let preview = parsed(&dry_run);
+    assert_eq!(
+        preview["data"]["rule"]["unresolved"][0]["path"],
+        s(&missing)
+    );
+    assert_eq!(
+        preview["data"]["rule"]["targets"].as_array().unwrap().len(),
+        1
+    );
+    assert!(!f.root.exists());
+
+    let run = f.run(&[&install[..], &["--yes", "--json"]].concat());
+    assert!(!run.status.success());
+    let state = parsed(&run);
+    assert_eq!(
+        state["data"]["rules"][0]["unresolved"][0]["code"],
+        "not_repository"
+    );
+    let location = ".agents/skills/demo/SKILL.md";
+    assert!(checkout.join(location).is_file());
+    assert!(!missing.exists());
+    repo(&f, "missing");
+    f.ok(&["plugin", "sync", "--yes"]);
+    assert!(missing.join(location).is_file());
+}
+
+#[test]
+fn check_reports_local_edits_even_when_upstream_is_current() {
+    let f = fixture();
+    let checkout = repo(&f, "checkout");
+    f.ok(&[
+        "plugin",
+        "install",
+        "example/skills",
+        "--skills",
+        "--skill",
+        "demo",
+        "--agent",
+        "codex",
+        "--repo",
+        s(&checkout),
+        "--yes",
+    ]);
+    let location = checkout.join(".agents/skills/demo/SKILL.md");
+    fs::write(&location, "local edit").unwrap();
+    let run = f.run(&["plugin", "check", "--json"]);
+    let data = parsed(&run);
+    assert!(!run.status.success());
+    let status = &data["data"]["rules"][0]["targets"][0]["status"];
+    assert!(status["local_conflict"].is_string());
+    assert!(status["candidate"].is_null());
+    assert!(status["check_failure"].is_null());
+    assert_eq!(fs::read_to_string(location).unwrap(), "local edit");
+}

@@ -9,7 +9,9 @@ use crate::{
     platform::{self, Directory},
     store::{Kind, OpenMode, Registration, Store},
 };
-use model::{Artifact, Database, Entry, Profile, Repository, Rule, Target, TargetEntry};
+use model::{
+    Artifact, Database, Entry, Profile, Repository, Rule, Target, TargetEntry, UnresolvedRepo,
+};
 use serde_json::{Value, json};
 use std::{
     collections::BTreeSet,
@@ -96,7 +98,7 @@ pub(crate) fn claude_for_launch(store: &Store, registration: &Registration) -> V
 struct Session {
     root: PathBuf,
     root_id: String,
-    _lock: File,
+    lock: Option<File>,
 }
 
 impl Session {
@@ -113,7 +115,7 @@ impl Session {
         Ok(Some(Self {
             root,
             root_id,
-            _lock: lock,
+            lock: Some(lock),
         }))
     }
 
@@ -190,7 +192,10 @@ fn add_targets(
         return Ok(());
     }
 
-    if rule.agents.contains(&Agent::Claude) && !target_present(rule, &Target::Claude) {
+    if rule.agents.contains(&Agent::Claude)
+        && (rule.all_repos || !rule.repositories.is_empty())
+        && !target_present(rule, &Target::Claude)
+    {
         rule.targets.push(TargetEntry {
             target: Target::Claude,
             status: Entry::default(),
@@ -374,12 +379,24 @@ fn install_rule(args: &InstallArgs, root: &Path, db: &Database) -> Result<Rule> 
         }
         all_profiles = true;
     }
-    let mut repositories = paths
-        .iter()
-        .map(|path| Repository::resolve(path))
-        .collect::<Result<Vec<_>>>()?;
+    let mut repositories = vec![];
+    let mut unresolved = vec![];
+    for path in &paths {
+        let path = platform::absolute(path)?;
+        match Repository::resolve(&path) {
+            Ok(repo) => repositories.push(repo),
+            Err(error) if error.code == "cancelled" => return Err(error),
+            Err(error) => unresolved.push(UnresolvedRepo {
+                path,
+                code: error.code.into(),
+                reason: error.message,
+            }),
+        }
+    }
     repositories.sort_by(|left, right| left.path.cmp(&right.path));
     repositories.dedup();
+    unresolved.sort_by(|left, right| left.path.cmp(&right.path));
+    unresolved.dedup_by(|left, right| left.path == right.path);
     profiles.sort_by(|left, right| left.label.cmp(&right.label));
     let mut skills = args.skill.clone();
     skills.sort();
@@ -405,10 +422,13 @@ fn install_rule(args: &InstallArgs, root: &Path, db: &Database) -> Result<Rule> 
         skills,
         all_repos,
         repositories,
+        unresolved,
         all_profiles,
         profiles,
         targets: vec![],
         skill_revision: None,
+        codex_revision: None,
+        native_ids: Default::default(),
         removing: false,
     })
 }
@@ -424,7 +444,9 @@ fn rule_header(rule: &Rule) -> String {
     } else {
         rule.repositories
             .iter()
-            .map(|repo| repo.path.display().to_string())
+            .map(|repo| &repo.path)
+            .chain(rule.unresolved.iter().map(|repo| &repo.path))
+            .map(|path| path.display().to_string())
             .collect::<Vec<_>>()
             .join(", ")
     };
@@ -451,19 +473,32 @@ fn rule_header(rule: &Rule) -> String {
     format!("{} | {agents} | {repos} | {profiles}", rule.source)
 }
 
-fn target_preview(entry: &TargetEntry, agents: &[Agent]) -> String {
+fn target_preview(entry: &TargetEntry, rule: &Rule, root: &Path) -> String {
     let target = entry.target.label();
     if matches!(entry.target, Target::Skills { .. }) {
         let mut paths = vec!["skills-lock.json"];
-        if agents.contains(&Agent::Codex) {
+        if rule.agents.contains(&Agent::Codex) {
             paths.push(".agents/skills/");
         }
-        if agents.contains(&Agent::Claude) {
+        if rule.agents.contains(&Agent::Claude) {
             paths.push(".claude/skills/");
         }
         return format!("  {target} ({})", paths.join(", "));
     }
-    format!("  {target}")
+    let (agent, directory) = match &entry.target {
+        Target::Claude => (Agent::Claude, root.join("plugin-store")),
+        Target::Codex { profile } => (
+            Agent::Codex,
+            root.join("codex")
+                .join(profile.label.trim_start_matches("codex:")),
+        ),
+        Target::Skills { .. } => unreachable!(),
+    };
+    let id = rule
+        .native_ids
+        .get(&agent)
+        .map_or("unresolved plugin", String::as_str);
+    format!("  {target} | {id} | {}", directory.display())
 }
 
 fn install(args: InstallArgs, data: &mut Value) -> Result<Outcome> {
@@ -474,6 +509,8 @@ fn install(args: InstallArgs, data: &mut Value) -> Result<Outcome> {
     // No root lock while interacting with the terminal or invoking Git.
     drop(candidate_store);
     let mut rule = install_rule(&args, &root, &db)?;
+    work::resolve_native_ids(&mut rule)?;
+    work::verify_mode(&rule, &db)?;
     let mut warnings = vec![];
     add_targets(
         &mut rule,
@@ -486,7 +523,12 @@ fn install(args: InstallArgs, data: &mut Value) -> Result<Outcome> {
     preview.extend(
         rule.targets
             .iter()
-            .map(|entry| target_preview(entry, &rule.agents)),
+            .map(|entry| target_preview(entry, &rule, &root)),
+    );
+    preview.extend(
+        rule.unresolved
+            .iter()
+            .map(|repo| format!("  {} | failed: {}", repo.path.display(), repo.reason)),
     );
     if rule.portable() && rule.targets.is_empty() {
         preview.push(
@@ -495,18 +537,54 @@ fn install(args: InstallArgs, data: &mut Value) -> Result<Outcome> {
     }
     if args.dry_run {
         *data = json!({"dry_run":true,"rule":rule,"targets":preview});
+        let failed = !rule.unresolved.is_empty();
+        let error = failed.then(|| {
+            Error::new(
+                "managed_plugin_failed",
+                "One or more repositories could not be verified",
+            )
+        });
         return Ok(Outcome {
             warnings,
+            exit: i32::from(failed),
+            error,
             ..Outcome::lines(preview)
         });
     }
-    work::verify_mode(&rule, &db)?;
+    if !rule.all_repos && rule.repositories.is_empty() {
+        return output(vec![rule], warnings, true, data);
+    }
     confirmation(
         "Install managed plugins or skills",
         &preview,
         args.yes,
         is_interactive(args.json),
     )?;
+    let mut verified = vec![];
+    for repo in std::mem::take(&mut rule.repositories) {
+        match repo.verify() {
+            Ok(()) => verified.push(repo),
+            Err(error) if error.code == "cancelled" => return Err(error),
+            Err(error) => rule.unresolved.push(UnresolvedRepo {
+                path: repo.path,
+                code: error.code.into(),
+                reason: error.message,
+            }),
+        }
+    }
+    rule.repositories = verified;
+    if !rule.all_repos && rule.repositories.is_empty() {
+        return output(vec![rule], warnings, true, data);
+    }
+    if !rule.all_repos {
+        rule.targets.retain(|entry| match &entry.target {
+            Target::Skills { repository } => rule
+                .repositories
+                .iter()
+                .any(|repo| repo.same_repo(repository)),
+            _ => true,
+        });
+    }
     let session = Session::start(root, true, true)?.expect("initialized storage");
     if root_id.as_ref().is_some_and(|id| id != &session.root_id) {
         return Err(Error::new(
@@ -514,9 +592,7 @@ fn install(args: InstallArgs, data: &mut Value) -> Result<Outcome> {
             "Roost storage changed since the preview",
         ));
     }
-    for repo in &rule.repositories {
-        repo.verify()?;
-    }
+    // Adapter writes validate the checkout identity under their own lock.
     let db = session.read()?;
     work::verify_mode(&rule, &db)?;
     {
@@ -550,7 +626,7 @@ fn install(args: InstallArgs, data: &mut Value) -> Result<Outcome> {
         work::expand(&session, &mut rule, &mut warnings)?;
     }
     session.save(&rule)?;
-    let result = work::sync_rule(&session, &mut rule)?;
+    let result = work::sync_rule(&session, &mut rule)? || !rule.unresolved.is_empty();
     output(vec![rule], warnings, result, data)
 }
 
@@ -631,7 +707,9 @@ fn output(
         lines.push(format!("{} | {}", rule.id, rule_header(rule)));
         for entry in &rule.targets {
             let status = &entry.status;
-            let description = if let Some(error) = &status.failure {
+            let description = if let Some(conflict) = &status.local_conflict {
+                format!("local conflict: {conflict}")
+            } else if let Some(error) = &status.failure {
                 format!("failed: {error}")
             } else if let Some(candidate) = &status.candidate {
                 let deferred = if status.deferred.as_ref() == Some(candidate) {
@@ -655,6 +733,13 @@ fn output(
             if let Some(error) = &status.check_failure {
                 lines.push(format!("    update check failed: {error}"));
             }
+        }
+        for repo in &rule.unresolved {
+            lines.push(format!(
+                "  {} | failed: {}",
+                repo.path.display(),
+                repo.reason
+            ));
         }
     }
     *data = json!({"rules":rules});

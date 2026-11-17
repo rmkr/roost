@@ -200,6 +200,10 @@ assert os.getcwd()=='/'
 assert all(key not in os.environ for key in ('OPENAI_API_KEY','CODEX_API_KEY','CODEX_ACCESS_TOKEN'))
 assert sys.argv[1:3]==['-c','cli_auth_credentials_store = "file"']
 args=sys.argv[3:]
+market_root=os.environ['FAKE_MARKET_ROOT']
+if args[:1]==['-c']:
+    market_root=json.loads(args[1].split('source=',1)[1][:-1])
+    args=args[2:]
 assert args[0]=='plugin'
 pid='demo@tools'
 home=pathlib.Path(os.environ['CODEX_HOME'])
@@ -209,6 +213,14 @@ with (home/'calls').open('a') as calls:
     calls.write(' '.join(args)+'\n')
 if args[1]=='list':
     print(json.dumps({'installed':[row] if cache.exists() else [],'available':[]}))
+elif args[1:3]==['marketplace','list']:
+    print(json.dumps({'marketplaces':[{
+        'name':'tools',
+        'marketplaceRoot':market_root,
+        'marketplaceSource':{'sourceType':'local','source':market_root},
+    }]}))
+elif args[1:3]==['marketplace','add']:
+    print(json.dumps({'name':'tools'}))
 elif args[1]=='add':
     assert args[2]==pid
     cache.mkdir(parents=True)
@@ -224,7 +236,11 @@ else:
 
 #[test]
 fn managed_native_plugins_target_verified_homes_and_sync_future_profiles() {
-    let f = Fixture::with_fakes("codex-plugin", &[("codex", PLUGIN_CODEX)])
+    let f = Fixture::with_fakes("codex-plugin", &[("codex", PLUGIN_CODEX)]);
+    let marketplace = f.path.join("marketplace");
+    fs::create_dir(&marketplace).unwrap();
+    let f = f
+        .with_var("FAKE_MARKET_ROOT", marketplace)
         .with_var("OPENAI_API_KEY", "fixture")
         .with_var("CODEX_ACCESS_TOKEN", "fixture");
     for name in ["work", "personal"] {

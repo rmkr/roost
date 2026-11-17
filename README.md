@@ -177,12 +177,12 @@ Claude receives native plugins from the shared store when the repo and profile m
 | `roost project add PATH` | Register a Git checkout for future installs. All-repo skills rules include newly registered checkouts on sync. |
 | `roost project list` | List registered checkouts. Register each linked worktree that should receive its own skill files. |
 | `roost plugin list --managed` | Show each rule's scope and its installed, pending, failed, or update status. |
-| `roost plugin sync` | Retry pending or failed targets and enroll new eligible Codex homes or checkouts. |
+| `roost plugin sync` | Retry pending or failed targets and enroll new eligible Codex homes or checkouts. Portable skills use the saved revision. Native Codex targets stay pending if the provider cannot reproduce the selected revision. |
 | `roost plugin check` | Check managed sources for updates and cache the results. |
 | `roost plugin update --managed [SOURCE]` | Review and apply a checked update to existing targets. |
-| `roost plugin uninstall SOURCE` | Remove managed rules and artifacts that Roost installed and still owns. |
+| `roost plugin uninstall SOURCE` | Remove managed rules and artifacts that Roost installed and still owns. Use a rule ID from `plugin list --managed` to remove one scope. |
 
-Roost CLI launches can check for updates in the background and offer a cached update at a later terminal launch. Checkouts with local skill edits report a conflict during update. Provider-native updates may also occur when running the provider directly.
+Roost CLI launches can check for updates in the background and offer a cached update at a later terminal launch. A check reports local skill edits as conflicts. Provider-native updates may also occur when running the provider directly.
 
 ### Share Claude plugins through sets
 

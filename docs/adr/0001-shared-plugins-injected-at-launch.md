@@ -29,3 +29,9 @@ Resolved 2026-10-06 by [injected plugin research](../../.scratch/workflow-ux/res
 - Inject each plugin's `installPath` (the `plugins/cache/<mkt>/<name>/<version>/` directory), never the marketplace checkout. Roost learns it from the public `claude plugin list --json` run in the store after each store mutation, under the store lock, and records it in its own store record; launches read only that record and recheck each path (inside the store cache, real directory, not `.orphaned_at`). Updates create a new version directory and mark the old one `.orphaned_at`.
 
 Rules carried into the plugin-store work: inject the dependency closure, refuse duplicate manifest names, skip missing or orphaned directories, and decide whether Roost prunes orphaned store versions, since Claude's CLI subcommands did not sweep them.
+
+## Managed repository and profile rules
+
+`roost plugin install` can add repository and profile filters to native Claude plugin injection. Roost matches these rules on CLI launch, adds the results to the subscribed set plugins, and injects them from the same Claude store. Claude Desktop receives its profile's shared sets.
+
+Codex installs native plugins into marker-verified Roost Codex homes. These installs apply across repos in the selected homes, including T3 sessions configured to use them. Portable skills give Claude and Codex a supported path for selected checkouts. [Managed install plan](../plans/repository-plugin-installation.md)

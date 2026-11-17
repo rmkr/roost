@@ -461,58 +461,88 @@ fn record_changed_store(session: &Session, operation: Result<Vec<u8>>) -> Result
     Ok(())
 }
 
-pub(crate) fn claude_install(root: &Path, source: &str) -> Result<NativeInstall> {
+fn claude_preview_catalog(claude: &Path, source: &CatalogSource) -> Result<String> {
+    let temporary = managed_native::scratch()?;
+    let candidate = Directory::open(&temporary.0, false)?;
+    claude_add_marketplace(claude, &candidate, source)?;
+    let fresh = claude_marketplaces(claude, &candidate)?;
+    let market = managed_native::match_market(&fresh, source)?.ok_or_else(|| {
+        Error::new(
+            "native_plugin",
+            "Claude did not register the requested marketplace",
+        )
+    })?;
+    managed_native::unique_plugin(claude_catalog_ids(&candidate, market)?)
+}
+
+pub(crate) fn claude_preview(source: &str) -> Result<String> {
+    match managed_native::source_for("claude", source)? {
+        managed_native::Source::Id(id) => Ok(id.to_owned()),
+        managed_native::Source::Catalog(source) => {
+            let (claude, _) = launch::claude_info()?;
+            claude_preview_catalog(&claude, &source)
+        }
+    }
+}
+
+pub(crate) fn claude_install(
+    root: &Path,
+    source: &str,
+    expected_id: &str,
+) -> Result<NativeInstall> {
     use managed_native::Source;
 
     let source = managed_native::source_for("claude", source)?;
+    managed_native::split_id(expected_id)?;
+    if let Source::Id(id) = source {
+        managed_native::require_id(expected_id, id)?;
+    }
     let session = Session::open(root)?;
-    let id = match source {
-        Source::Id(id) => id.to_owned(),
+    let provenance = match source {
+        Source::Id(_) => None,
         Source::Catalog(source) => {
             let markets = claude_marketplaces(&session.claude, &session.store)?;
             if let Some(market) = managed_native::match_market(&markets, &source)? {
-                managed_native::unique_plugin(claude_catalog_ids(&session.store, market)?)?
+                let id =
+                    managed_native::unique_plugin(claude_catalog_ids(&session.store, market)?)?;
+                managed_native::require_id(expected_id, &id)?;
             } else {
-                let temporary = managed_native::scratch()?;
-                let candidate = Directory::open(&temporary.0, false)?;
-                claude_add_marketplace(&session.claude, &candidate, &source)?;
-                let fresh = claude_marketplaces(&session.claude, &candidate)?;
-                let market = managed_native::match_market(&fresh, &source)?.ok_or_else(|| {
-                    Error::new(
-                        "native_plugin",
-                        "Claude did not register the requested marketplace",
-                    )
-                })?;
-                if markets.iter().any(|m| m.name == market.name) {
+                let id = claude_preview_catalog(&session.claude, &source)?;
+                managed_native::require_id(expected_id, &id)?;
+                let (_, name) = managed_native::split_id(&id)?;
+                if markets.iter().any(|m| m.name == name) {
                     return Err(Error::new(
                         "collision",
                         "A different Claude marketplace already uses that name",
                     ));
                 }
-                let id = managed_native::unique_plugin(claude_catalog_ids(&candidate, market)?)?;
                 claude_add_marketplace(&session.claude, &session.store, &source)?;
                 let live = claude_marketplaces(&session.claude, &session.store)?;
                 let registered =
-                    managed_native::market_for_id(&live, Source::Catalog(source), &id)?
+                    managed_native::market_for_id(&live, Source::Catalog(source.clone()), &id)?
                         .expect("catalog source required a matching marketplace");
-                if managed_native::unique_plugin(claude_catalog_ids(&session.store, registered)?)?
-                    != id
-                {
-                    return Err(Error::new(
-                        "conflict",
-                        "The Claude marketplace changed during installation",
-                    ));
-                }
-                id
+                let resolved =
+                    managed_native::unique_plugin(claude_catalog_ids(&session.store, registered)?)?;
+                managed_native::require_id(expected_id, &resolved)?;
             }
+            Some(source.arg().to_owned())
         }
     };
-    if let Some(revision) = claude_revision(&session.claude, &session.store, &id)? {
+    let id = expected_id;
+    let provenance = || {
+        provenance.or_else(|| {
+            claude_marketplaces(&session.claude, &session.store)
+                .ok()
+                .and_then(|markets| managed_native::marketplace_provenance(&markets, id))
+        })
+    };
+    if let Some(revision) = claude_revision(&session.claude, &session.store, id)? {
         session.refresh(Duration::from_secs(10))?;
         return Ok(NativeInstall {
-            id,
+            id: id.into(),
             revision,
             owned: false,
+            provenance: provenance(),
         });
     }
     record_changed_store(
@@ -521,20 +551,21 @@ pub(crate) fn claude_install(root: &Path, source: &str) -> Result<NativeInstall>
             &session.claude,
             &session.store,
             "plugin install",
-            &["plugin", "install", &id],
+            &["plugin", "install", id],
             false,
         ),
     )?;
-    let revision = claude_revision(&session.claude, &session.store, &id)?.ok_or_else(|| {
+    let revision = claude_revision(&session.claude, &session.store, id)?.ok_or_else(|| {
         Error::new(
             "native_plugin",
             "Claude did not report the plugin after installation",
         )
     })?;
     Ok(NativeInstall {
-        id,
+        id: id.into(),
         revision,
         owned: true,
+        provenance: provenance(),
     })
 }
 
@@ -661,6 +692,9 @@ pub(crate) fn claude_update(
         id: id.into(),
         revision,
         owned: false,
+        provenance: market
+            .and_then(|m| m.source.as_ref())
+            .map(|source| source.arg().to_owned()),
     })
 }
 
@@ -963,6 +997,27 @@ fn dependency_ids(record: &Record, ids: impl IntoIterator<Item = String>) -> BTr
         }
     }
     resolved
+}
+
+pub(crate) fn affected_sets(store: &Store, id: &str) -> Result<Vec<String>> {
+    let record = read_record(store)?
+        .map(|(_, record)| record)
+        .unwrap_or_else(|| Record::empty(&store.root_id));
+    Ok(store
+        .read_sets()?
+        .sets
+        .into_iter()
+        .filter_map(|set| {
+            let plugins = set
+                .items
+                .into_iter()
+                .filter(|item| item.kind == ItemKind::Plugin)
+                .map(|item| item.value);
+            dependency_ids(&record, plugins)
+                .contains(id)
+                .then_some(set.name)
+        })
+        .collect())
 }
 
 /// The store and its record; `None` when the store was never created.
