@@ -123,7 +123,10 @@ fn help_version_and_usage_do_not_touch_storage() {
             .unwrap()
             .contains("auth login")
     );
-    assert_eq!(f.ok(&["--version"]).stdout, b"0.1.0\n");
+    assert_eq!(
+        f.ok(&["--version"]).stdout,
+        concat!(env!("CARGO_PKG_VERSION"), "\n").as_bytes()
+    );
     // Bare roost without storage names roost add and creates nothing.
     let bare = f.run(&[]);
     assert_eq!(bare.status.code(), Some(1));
