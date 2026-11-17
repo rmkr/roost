@@ -117,7 +117,7 @@ pub fn run(name: Option<&str>, foreground: bool) -> Result<i32> {
 /// running Desktop, reports the outcome above the list and shows it again (with
 /// fresh Desktop states) on the same row.
 fn picker(root: &Path, no_terminal: impl Fn() -> Error) -> Result<(Store, Registration)> {
-    use crate::select::{Actions, Choice};
+    use crate::select::{Actions, Choice, Picker, Profile};
     let mut initial = None;
     loop {
         let store = crate::select::open_launch(root)?;
@@ -138,11 +138,14 @@ fn picker(root: &Path, no_terminal: impl Fn() -> Error) -> Result<(Store, Regist
             store,
             root,
             "Choose a profile for Claude Desktop",
-            Some(actions),
+            Picker::Desktop(actions),
             &no_terminal,
             picker_rows,
         )? {
-            Choice::Chosen(store, registration) => return Ok((*store, registration)),
+            Choice::Chosen(store, Profile::Claude(registration)) => {
+                return Ok((*store, registration));
+            }
+            Choice::Chosen(_, Profile::Codex(_)) => unreachable!("Claude Desktop picker"),
             Choice::Action(listed, index) => {
                 initial = Some(index);
                 let store = Store::open(root, false, OpenMode::Read)?;

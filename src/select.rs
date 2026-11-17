@@ -1,11 +1,11 @@
 //! Selected profile per project, `roost switch`, bare `roost` and last use.
 //!
 //! Selections and last-use times live in the manager's `state.json`, keyed by
-//! registration ID; nothing is ever written into upstream or default data.
+//! Claude registration ID or Codex home identity.
 use crate::{
     Error, Outcome, Result, cli, launch, platform, sets,
     store::{
-        Kind, OpenMode, Registration, State, Store,
+        CodexHome, Kind, OpenMode, Registration, State, Store, codex_selection_name,
         side::{Selection, StateFile, Timestamp},
     },
     table,
@@ -129,13 +129,12 @@ fn selection_key() -> Result<PathBuf> {
 /// Sets `id`'s time in a per-registration timestamp list (`last_used`,
 /// `desktop_launched`), adding an entry when absent.
 pub(crate) fn stamp(list: &mut Vec<Timestamp>, id: &str, at: u64) {
-    match list.iter_mut().find(|t| t.registration_id == id) {
-        Some(time) => time.at = at,
-        None => list.push(Timestamp {
-            registration_id: id.to_owned(),
-            at,
-        }),
-    }
+    // Preserve launch order when multiple launches share the same Unix second.
+    list.retain(|time| time.registration_id != id);
+    list.push(Timestamp {
+        registration_id: id.to_owned(),
+        at,
+    });
 }
 
 pub(crate) fn open_launch(root: &Path) -> Result<Store> {
@@ -148,31 +147,114 @@ pub(crate) fn open_launch(root: &Path) -> Result<Store> {
     })
 }
 
-/// Records a launch of `registration` as its last use. Default aliases record
-/// nothing. Failure warns on stderr; the launch continues.
-pub fn launched(store: &Store, registration: &Registration) {
-    if registration.kind == Kind::DefaultAlias {
-        return;
+/// A launchable Claude registration or marker-verified Codex home.
+#[derive(Clone, PartialEq, Eq)]
+pub(crate) enum Profile {
+    Claude(Registration),
+    Codex(CodexHome),
+}
+
+impl Profile {
+    pub(crate) fn named(store: &Store, selector: &str) -> Result<Self> {
+        if let Some(name) = selector.strip_prefix("claude:") {
+            return Ok(Self::Claude(store.find(name, false)?.clone()));
+        }
+        if let Some(name) = selector.strip_prefix("codex:") {
+            crate::store::validate_name(name)?;
+            return Self::codex(store, name);
+        }
+        match store.find(selector, false) {
+            Ok(r) => Ok(Self::Claude(r.clone())),
+            Err(e) if e.code == "not_found" => Self::codex(store, selector).map_err(|codex_err| {
+                if codex_err.code == "not_found" {
+                    e
+                } else {
+                    codex_err
+                }
+            }),
+            Err(e) => Err(e),
+        }
     }
+
+    fn codex(store: &Store, name: &str) -> Result<Self> {
+        let home = store.codex_profile(&name.to_ascii_lowercase())?;
+        if store.pending() {
+            return Err(
+                Error::new("ownership", "Pending operation blocks profile use")
+                    .next("Inspect doctor and complete the pending operation first"),
+            );
+        }
+        Ok(Self::Codex(home))
+    }
+
+    fn id(&self) -> &str {
+        match self {
+            Self::Claude(r) => &r.registration_id,
+            Self::Codex(home) => &home.id,
+        }
+    }
+
+    fn label(&self) -> String {
+        match self {
+            Self::Claude(r) => r.name.clone(),
+            Self::Codex(home) => format!("codex:{}", home.name),
+        }
+    }
+
+    fn validate(&self, store: &Store) -> Result<()> {
+        match self {
+            Self::Claude(r) => store.validate(r),
+            Self::Codex(home) => {
+                if Self::codex(store, &home.name)? != *self {
+                    return Err(Error::new("ownership", "Codex home identity changed"));
+                }
+                Ok(())
+            }
+        }
+    }
+
+    pub(crate) fn launch(
+        self,
+        store: Store,
+        allow_auth_env: bool,
+        arguments: &[OsString],
+    ) -> Result<Outcome> {
+        match self {
+            Self::Claude(r) => start(store, &r, allow_auth_env, arguments),
+            Self::Codex(ref home) => {
+                self.validate(&store)?;
+                let command = launch::codex_command(&home.path, allow_auth_env)?;
+                record_use(&store, &home.id, &home.name);
+                drop(store);
+                Ok(Outcome {
+                    exit: launch::exec(command, arguments, "Codex")?,
+                    ..Outcome::quiet()
+                })
+            }
+        }
+    }
+}
+
+fn record_use(store: &Store, id: &str, name: &str) {
     let at = platform::unix_seconds();
     let result = store.update_state(|state| {
-        stamp(&mut state.last_used, &registration.registration_id, at);
+        stamp(&mut state.last_used, id, at);
         Ok(())
     });
     if let Err(e) = result {
         eprintln!(
-            "warning: Could not record the last use of {}: {}",
-            registration.name, e.message
+            "warning: Could not record the last use of {name}: {}",
+            e.message
         );
     }
 }
 
-fn record_selection(store: &Store, project: &Path, registration: &Registration) -> Result<()> {
+fn record_selection(store: &Store, project: &Path, profile: &Profile) -> Result<()> {
     store.update_state(|state| {
         state.selections.retain(|s| s.project != project);
         state.selections.push(Selection {
             project: project.to_owned(),
-            registration_id: registration.registration_id.clone(),
+            registration_id: profile.id().to_owned(),
         });
         Ok(())
     })
@@ -191,7 +273,9 @@ pub(crate) fn start(
     let mut env = launch::profile_env(&store, registration, allow_auth_env)?;
     let program = launch::resolve_program("claude")?;
     let plugins = crate::plugins::claim(&store, registration, &env);
-    launched(&store, registration);
+    if registration.kind != Kind::DefaultAlias {
+        record_use(&store, &registration.registration_id, &registration.name);
+    }
     sets::reconcile_at_launch(&store, registration);
     drop(store);
     plugins.finish(&mut env);
@@ -202,7 +286,11 @@ pub(crate) fn start(
 }
 
 /// Bare `roost`: launches this project's selection, or asks with the picker.
-pub fn launch_selected(allow_auth_env: bool, arguments: &[OsString]) -> Result<Outcome> {
+pub fn launch_selected(
+    allow_auth_env: bool,
+    arguments: &[OsString],
+    claude_shortcut: bool,
+) -> Result<Outcome> {
     let key = selection_key()?;
     let root = platform::root()?;
     let store = open_launch(&root)?;
@@ -217,49 +305,78 @@ pub fn launch_selected(allow_auth_env: bool, arguments: &[OsString]) -> Result<O
             None
         }
     };
-    let current = selected.as_ref().map(|id| {
-        store
-            .registry
-            .registrations
-            .iter()
-            .find(|r| &r.registration_id == id)
-    });
-    let (store, registration) = match current {
-        Some(Some(r)) if r.state == State::Active => {
-            let r = r.clone();
-            (store, r)
-        }
-        stale => {
-            match stale {
-                Some(Some(r)) => eprintln!(
-                    "warning: The profile selected for this project ({}) is no longer active; choose another",
-                    r.name
-                ),
-                Some(None) => eprintln!(
-                    "warning: The profile selected for this project no longer exists; choose another"
-                ),
-                None => (),
-            }
-            let (store, registration, recorded) = pick(store, &root, &key)?;
-            warn_unrecorded(&registration, recorded);
-            (store, registration)
+    let current = match selected.as_deref() {
+        Some(id) => remembered(&store, id)?,
+        None => None,
+    };
+    let (store, profile) = match current {
+        Some(profile) => (store, profile),
+        None => {
+            let (store, profile, recorded) = pick(store, &root, &key, claude_shortcut)?;
+            warn_unrecorded(&profile, recorded);
+            (store, profile)
         }
     };
-    // A Claude subcommand finishes without showing a session, so name the profile it acts on.
-    if arguments
-        .first()
-        .is_some_and(|a| cli::CLAUDE_SUBCOMMANDS.iter().any(|c| a == *c))
-    {
-        eprintln!("roost: using profile {}", registration.name);
+    if claude_shortcut && matches!(profile, Profile::Codex(_)) {
+        return Err(Error::new(
+            "usage",
+            format!(
+                "{} is selected, but this shortcut requires a Claude profile",
+                profile.label()
+            ),
+        )
+        .next(
+            "Use roost run claude:NAME for Claude, or roost -- ARGS to pass arguments to Codex",
+        ));
     }
-    start(store, &registration, allow_auth_env, arguments)
+    if matches!(profile, Profile::Claude(_))
+        && arguments
+            .first()
+            .is_some_and(|a| cli::CLAUDE_SUBCOMMANDS.iter().any(|c| a == *c))
+    {
+        eprintln!("roost: using profile {}", profile.label());
+    }
+    profile.launch(store, allow_auth_env, arguments)
 }
 
-fn warn_unrecorded(registration: &Registration, recorded: Result<()>) {
+fn remembered(store: &Store, id: &str) -> Result<Option<Profile>> {
+    if let Some(name) = codex_selection_name(id) {
+        match store.codex_profile(name) {
+            Ok(home) if home.id == id => return Ok(Some(Profile::Codex(home))),
+            Ok(_) => (),
+            Err(e) if e.code == "not_found" => (),
+            Err(e) => return Err(e),
+        }
+        eprintln!(
+            "warning: The Codex home selected for this project ({name}) has changed or no longer exists; choose another"
+        );
+    } else if let Some(r) = store
+        .registry
+        .registrations
+        .iter()
+        .find(|r| r.registration_id == id)
+    {
+        if r.state == State::Active {
+            return Ok(Some(Profile::Claude(r.clone())));
+        }
+        eprintln!(
+            "warning: The profile selected for this project ({}) is no longer active; choose another",
+            r.name
+        );
+    } else {
+        eprintln!(
+            "warning: The profile selected for this project no longer exists; choose another"
+        );
+    }
+    Ok(None)
+}
+
+fn warn_unrecorded(profile: &Profile, recorded: Result<()>) {
     if let Err(e) = recorded {
         eprintln!(
             "warning: Could not remember {} for this project: {}",
-            registration.name, e.message
+            profile.label(),
+            e.message
         );
     }
 }
@@ -273,7 +390,12 @@ pub(crate) fn terminal() -> bool {
 /// selection, else the most recently launched profile, else the first row. Then
 /// reacquires, revalidates the choice and records the selection, returning the
 /// recording result for the caller to warn about or fail on.
-fn pick(store: Store, root: &Path, key: &Path) -> Result<(Store, Registration, Result<()>)> {
+fn pick(
+    store: Store,
+    root: &Path,
+    key: &Path,
+    claude_only: bool,
+) -> Result<(Store, Profile, Result<()>)> {
     let no_terminal = || {
         Error::new(
             "usage",
@@ -297,7 +419,14 @@ fn pick(store: Store, root: &Path, key: &Path) -> Result<(Store, Registration, R
             .unwrap_or(0);
         (lines, initial)
     };
-    let Choice::Chosen(store, chosen) = choose_with(store, root, title, None, no_terminal, render)?
+    let Choice::Chosen(store, chosen) = choose_with(
+        store,
+        root,
+        title,
+        Picker::Project { claude_only },
+        no_terminal,
+        render,
+    )?
     else {
         unreachable!("no action keys")
     };
@@ -318,8 +447,27 @@ pub(crate) struct Actions<'a> {
 /// action key pressed on a row (the registration as listed, the row index), with
 /// the store released for the caller to act and show the picker again.
 pub(crate) enum Choice {
-    Chosen(Box<Store>, Registration),
+    Chosen(Box<Store>, Profile),
     Action(Registration, usize),
+}
+
+pub(crate) enum Picker<'a> {
+    Project { claude_only: bool },
+    Desktop(Actions<'a>),
+}
+
+fn codex_record(home: &CodexHome) -> Value {
+    json!({
+        "name": home.name, "provider": "codex", "selection_id": home.id,
+        "kind": "codex", "state": "active", "directory": home.path,
+        "token_present": null, "launchers": [], "sets": [], "last_used": null,
+        "selected": false, "most_recent": false, "probe": null
+    })
+}
+
+pub(crate) fn append_codex_profiles(store: &Store, records: &mut Vec<Value>) -> Result<()> {
+    records.extend(store.codex_profiles()?.iter().map(codex_record));
+    Ok(())
 }
 
 /// The shared picker flow: with an active registration and a terminal (else
@@ -331,64 +479,70 @@ pub(crate) fn choose_with(
     store: Store,
     root: &Path,
     title: &str,
-    actions: Option<Actions>,
+    picker: Picker,
     no_terminal: impl FnOnce() -> Error,
     render: impl FnOnce(&Store, &mut [Value]) -> (Vec<String>, usize),
 ) -> Result<Choice> {
-    let active = store
-        .registry
-        .registrations
-        .iter()
-        .any(|r| r.state == State::Active);
-    if !active {
+    let mut records = store.profiles(false)?;
+    let _ = sets::annotate(&store, &mut records);
+    if matches!(picker, Picker::Project { claude_only: false }) {
+        append_codex_profiles(&store, &mut records)?;
+    }
+    if records.is_empty() {
         return Err(Error::new("not_found", "No active profiles to choose from")
             .next("Create a profile with roost add NAME"));
     }
     if !terminal() {
         return Err(no_terminal());
     }
-    let mut records = store.profiles(false)?;
-    let _ = sets::annotate(&store, &mut records);
-    let choices: Vec<Registration> = records
-        .iter()
-        .map(|record| {
-            store
-                .registry
-                .registrations
-                .iter()
-                .find(|r| r.state == State::Active && record["name"] == r.name.as_str())
-                .cloned()
-                .ok_or_else(|| Error::new("ownership", "Profile list changed while reading"))
-        })
-        .collect::<Result<_>>()?;
     let (lines, initial) = render(&store, &mut records);
     let root_id = store.root_id.clone();
+    let registrations = store.registry.registrations.clone();
     drop(store);
+    let listed_claude = |index: usize| {
+        registrations
+            .iter()
+            .find(|r| records[index]["name"] == r.name.as_str())
+            .cloned()
+            .ok_or_else(|| Error::new("ownership", "Listed Claude registration is missing"))
+    };
     let rows = &lines[1..=records.len()];
-    let (hint, keys, initial) = match actions {
-        None => ("↑/↓, Enter; Esc cancels", &[][..], initial),
-        Some(a) => (a.hint, a.keys, a.initial.unwrap_or(initial)),
+    let (hint, keys, initial) = match picker {
+        Picker::Project { .. } => ("↑/↓, Enter; Esc cancels", &[][..], initial),
+        Picker::Desktop(a) => (a.hint, a.keys, a.initial.unwrap_or(initial)),
     };
     let index = match platform::pick_with(title, hint, &lines[0], rows, initial, keys)? {
         platform::Picked::Chosen(index) => index,
         platform::Picked::Action(index) => {
-            return Ok(Choice::Action(choices[index].clone(), index));
+            return Ok(Choice::Action(listed_claude(index)?, index));
         }
     };
-    let chosen = &choices[index];
     let store = open_launch(root)?;
-    let current = store
-        .registry
-        .registrations
-        .iter()
-        .find(|r| r.registration_id == chosen.registration_id);
-    if store.root_id != root_id || current != Some(chosen) {
+    if store.root_id != root_id {
         return Err(
             Error::new("ownership", "Profile changed while the picker was open")
                 .next("Repeat the command to choose from the current profiles"),
         );
     }
-    Ok(Choice::Chosen(Box::new(store), chosen.clone()))
+    let record = &records[index];
+    let chosen = if record["provider"] == "codex" {
+        let name = record["name"]
+            .as_str()
+            .ok_or_else(|| Error::new("ownership", "Listed Codex name is missing"))?;
+        let current = Profile::codex(&store, name)?;
+        if record["selection_id"] != current.id() {
+            return Err(Error::new(
+                "ownership",
+                "Codex home changed while the picker was open",
+            ));
+        }
+        current
+    } else {
+        let r = listed_claude(index)?;
+        store.validate(&r)?;
+        Profile::Claude(r)
+    };
+    Ok(Choice::Chosen(Box::new(store), chosen))
 }
 
 /// `roost switch`: select NAME (or, without NAME, the picker's choice) for this
@@ -433,25 +587,25 @@ pub fn switch(
             key.display()
         )]));
     }
-    let (store, registration, recorded) = match name {
+    let (store, profile, recorded) = match name {
         Some(name) => {
-            let registration = store.find(name, false)?.clone();
-            store.validate(&registration)?;
-            let recorded = record_selection(&store, &key, &registration);
-            (store, registration, recorded)
+            let profile = Profile::named(&store, name)?;
+            profile.validate(&store)?;
+            let recorded = record_selection(&store, &key, &profile);
+            (store, profile, recorded)
         }
-        None => pick(store, &root, &key)?,
+        None => pick(store, &root, &key, false)?,
     };
     if no_launch {
         recorded?;
         return Ok(Outcome::lines(vec![format!(
             "Selected {} for {}",
-            registration.name,
+            profile.label(),
             key.display()
         )]));
     }
-    warn_unrecorded(&registration, recorded);
-    start(store, &registration, allow_auth_env, arguments)
+    warn_unrecorded(&profile, recorded);
+    profile.launch(store, allow_auth_env, arguments)
 }
 
 /// Fills each ProfileRecord's `last_used`, `selected` (valid selection for
@@ -468,30 +622,37 @@ pub fn annotate(store: &Store, profiles: &mut [Value], project: Option<&Path>) -
             .find(|s| s.project == p)
             .map(|s| s.registration_id.as_str())
     });
-    let mut most_recent: Option<&Timestamp> = None;
-    for time in &state.last_used {
-        if most_recent.is_none_or(|m| time.at > m.at) {
-            most_recent = Some(time);
-        }
-    }
-    for profile in profiles.iter_mut() {
-        let Some(registration) = store
-            .registry
-            .registrations
-            .iter()
-            .find(|r| profile["name"] == r.name.as_str())
-        else {
-            continue;
+    let mut latest = None;
+    for (index, profile) in profiles.iter_mut().enumerate() {
+        let id = if profile["provider"] == "codex" {
+            profile["selection_id"].as_str()
+        } else {
+            store
+                .registry
+                .registrations
+                .iter()
+                .find(|r| profile["name"] == r.name.as_str())
+                .map(|r| r.registration_id.as_str())
         };
-        let id = registration.registration_id.as_str();
-        let last_used = state
+        let Some(id) = id else { continue };
+        let timestamp = state
             .last_used
             .iter()
-            .find(|t| t.registration_id == id)
-            .map(|t| t.at);
-        profile["last_used"] = json!(last_used);
-        profile["selected"] = json!(selected == Some(id) && registration.state == State::Active);
-        profile["most_recent"] = json!(most_recent.is_some_and(|t| t.registration_id == id));
+            .enumerate()
+            .find(|(_, time)| time.registration_id == id)
+            .map(|(order, time)| (time.at, order));
+        let selected_here = selected == Some(id) && profile["state"] == "active";
+        profile["last_used"] = json!(timestamp.map(|(at, _)| at));
+        profile["selected"] = json!(selected_here);
+        profile["most_recent"] = json!(false);
+        if let Some(time) = timestamp
+            && latest.is_none_or(|(_, previous)| time > previous)
+        {
+            latest = Some((index, time));
+        }
+    }
+    if let Some((index, _)) = latest {
+        profiles[index]["most_recent"] = json!(true);
     }
     vec![]
 }
