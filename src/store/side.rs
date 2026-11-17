@@ -230,13 +230,12 @@ impl SideFile for StateFile {
         (self.schema_version, &self.root_id)
     }
     fn check(&self) -> Result<()> {
-        ids(
-            STATE,
-            self.selections
-                .iter()
-                .map(|s| &s.registration_id)
-                .chain(self.last_used.iter().map(|t| &t.registration_id))
-                .chain(self.links.iter().map(|l| &l.registration_id))
+        if self.selections.iter().map(|s| &s.registration_id)
+            .chain(self.last_used.iter().map(|t| &t.registration_id))
+            .any(|id| !valid_id(id) && super::codex_selection_name(id).is_none()) {
+            return Err(invalid(STATE));
+        }
+        ids(STATE, self.links.iter().map(|l| &l.registration_id)
                 .chain(self.desktop_launched.iter().map(|t| &t.registration_id))
                 .chain(self.desktop_links.iter().map(|l| &l.registration_id))
                 .chain(self.settings.iter().map(|s| &s.registration_id)),
@@ -288,8 +287,9 @@ impl SideFile for StateFile {
     }
     fn retain_registered(&mut self, known: &HashSet<&str>) {
         let keep = |id: &String| known.contains(id.as_str());
-        self.selections.retain(|s| keep(&s.registration_id));
-        self.last_used.retain(|t| keep(&t.registration_id));
+        let launchable = |id: &String| keep(id) || super::codex_selection_name(id).is_some();
+        self.selections.retain(|s| launchable(&s.registration_id));
+        self.last_used.retain(|t| launchable(&t.registration_id));
         self.links.retain(|l| keep(&l.registration_id));
         self.desktop_launched.retain(|t| keep(&t.registration_id));
         self.desktop_links.retain(|l| keep(&l.registration_id));

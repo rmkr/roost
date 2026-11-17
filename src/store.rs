@@ -25,7 +25,7 @@ mod codex;
 mod desktop;
 mod plugin_store;
 pub mod side;
-pub(crate) use codex::FILE_AUTH;
+pub(crate) use codex::{CodexHome, FILE_AUTH, codex_selection_name};
 
 #[derive(Clone, Copy, Debug, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]

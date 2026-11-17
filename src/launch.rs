@@ -469,6 +469,17 @@ pub fn claude_info() -> Result<(PathBuf, String)> {
     Ok((path, version))
 }
 
+pub(crate) fn codex_command(home: &Path, allow_auth_env: bool) -> Result<Command> {
+    let mut command = Command::new(resolve_program("codex")?);
+    command.env("CODEX_HOME", home);
+    if !allow_auth_env {
+        for key in ["OPENAI_API_KEY", "CODEX_API_KEY", "CODEX_ACCESS_TOKEN"] {
+            command.env_remove(key);
+        }
+    }
+    Ok(command)
+}
+
 pub fn execute(command: Command, arguments: &[OsString]) -> Result<i32> {
     version_at(command.get_program())?;
     exec(command, arguments, "Claude")

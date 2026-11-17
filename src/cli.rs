@@ -7,7 +7,7 @@ use std::{
 const RECIPES: &str = "First login:\n  roost add work\n  roost run work auth login\n  roost status work\n\nConcurrent sessions (separate terminals):\n  roost run work --name client-a\n  roost run work --name client-b\n  roost run work --resume client-a\n  roost run work --continue\n  roost run work --resume client-a --fork-session\n\nProfiles select configuration contexts, not proven account identities.\nDefault aliases pass through the caller environment.\nClear an owned manager token before relying on native browser login:\n  roost token work --clear\n\nClaude subcommands run with this project's selected profile (picker if none):\n  roost agents, attach, auth, auto-mode, import, kill, logs, mcp,\n  respawn, setup-token, stop, ultrareview\n  roost run NAME <subcommand> uses NAME instead\n";
 
 #[derive(Parser)]
-#[command(name="roost", about="Manage Claude profiles alongside your existing installation", disable_version_flag=true, disable_help_subcommand=true, after_help=RECIPES)]
+#[command(name="roost", about="Manage Claude and Codex profiles", disable_version_flag=true, disable_help_subcommand=true, after_help=RECIPES)]
 struct Cli {
     #[arg(short = 'v', long)]
     version: bool,
@@ -54,7 +54,7 @@ pub enum Action {
     /// Print the selected absolute configuration directory
     #[command(alias = "path")]
     Where { name: String },
-    /// Start Claude; manager options precede NAME, the rest belongs to Claude
+    /// Launch a Claude or Codex profile; use codex:NAME to select Codex explicitly
     Run {
         #[arg(long)]
         allow_auth_env: bool,
@@ -174,6 +174,7 @@ pub enum Action {
     /// Bare `roost`: launch the profile selected for this project.
     #[command(skip)]
     Launch {
+        claude_shortcut: bool,
         allow_auth_env: bool,
         arguments: Vec<OsString>,
     },
@@ -358,7 +359,6 @@ impl Action {
             | Self::Register { name, .. }
             | Self::Reuse { name }
             | Self::Where { name }
-            | Self::Run { name, .. }
             | Self::Status { name, .. }
             | Self::Token { name, .. }
             | Self::Remove { name, .. }
@@ -372,9 +372,8 @@ impl Action {
                 action:
                     CodexAction::Add { name } | CodexAction::Home { name } | CodexAction::Login { name },
             }
-            | Self::Switch {
-                name: Some(name), ..
-            } => Some(name),
+            => Some(name),
+            Self::Run { name, .. } | Self::Switch { name: Some(name), .. } => Some(name.strip_prefix("codex:").or_else(|| name.strip_prefix("claude:")).unwrap_or(name)),
             _ => None,
         }
     }
@@ -481,6 +480,7 @@ fn parse_launch(args: &[OsString]) -> std::result::Result<Option<Action>, clap::
         Some(_) => return Ok(None),
     };
     Ok(Some(Action::Launch {
+        claude_shortcut: args.get(index).is_some_and(|v| v != "--"),
         allow_auth_env,
         arguments,
     }))
@@ -638,7 +638,7 @@ mod tests {
         ] {
             let Action::Launch {
                 allow_auth_env,
-                arguments,
+                arguments, ..
             } = parse(values)
             else {
                 panic!("{values:?}")

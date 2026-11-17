@@ -325,8 +325,8 @@ fn dispatch(action: Action, data: &mut Value) -> Result<Outcome> {
             arguments,
         } => {
             let store = open(&platform::root()?, OpenMode::Launch)?;
-            let reg = store.find(&name, false)?.clone();
-            select::start(store, &reg, allow_auth_env, &arguments)
+            let profile = select::Profile::named(&store, &name)?;
+            profile.launch(store, allow_auth_env, &arguments)
         }
         Action::Internal {
             root,
@@ -569,7 +569,8 @@ fn dispatch(action: Action, data: &mut Value) -> Result<Outcome> {
         Action::Launch {
             allow_auth_env,
             arguments,
-        } => select::launch_selected(allow_auth_env, &arguments),
+            claude_shortcut,
+        } => select::launch_selected(allow_auth_env, &arguments, claude_shortcut),
         Action::Token { name, stdin, clear } => {
             let root = platform::root()?;
             let selection = {
@@ -623,12 +624,8 @@ fn codex(action: CodexAction) -> Result<Outcome> {
         }
         CodexAction::Login { name } => {
             let home = open(&root, OpenMode::Read)?.codex_home(&name.to_ascii_lowercase())?;
-            let mut command = process::Command::new(launch::resolve_program("codex")?);
+            let mut command = launch::codex_command(&home, false)?;
             command
-                .env("CODEX_HOME", home)
-                .env_remove("OPENAI_API_KEY")
-                .env_remove("CODEX_API_KEY")
-                .env_remove("CODEX_ACCESS_TOKEN")
                 // Login does not need the caller's project config.
                 .current_dir("/")
                 .args(["login", "-c", store::FILE_AUTH]);

@@ -16,6 +16,21 @@ struct HomeMarker {
     directory_identity: FileIdentity,
 }
 
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct CodexHome {
+    pub name: String,
+    pub path: PathBuf,
+    pub id: String,
+}
+
+/// Older homes have no registration UUID. Bind selections to the same name and
+/// directory identity as their existing ownership marker.
+pub(crate) fn codex_selection_name(id: &str) -> Option<&str> {
+    let (name, identity) = id.strip_prefix("codex:")?.split_once(':')?;
+    let (device, inode) = identity.split_once(':')?;
+    (super::validate_name(name).is_ok() && device.parse::<u64>().is_ok() && inode.parse::<u64>().is_ok()).then_some(name)
+}
+
 impl Store {
     fn codex_marker(&self, name: &str, home: &Directory) -> Result<HomeMarker> {
         Ok(HomeMarker {
@@ -49,7 +64,7 @@ impl Store {
         Ok(parent.path.join(name))
     }
 
-    pub(crate) fn codex_home(&self, name: &str) -> Result<PathBuf> {
+    pub(crate) fn codex_profile(&self, name: &str) -> Result<CodexHome> {
         let missing = || {
             err("not_found", format!("Codex home {name} does not exist"))
                 .next(format!("Run roost codex add {name}"))
@@ -82,6 +97,24 @@ impl Store {
         }
         self.check_root()?;
         home.verify_namespace()?;
-        Ok(home.path)
+        let FileIdentity::Unix { device, inode } = marker.directory_identity;
+        Ok(CodexHome { name: name.into(), path: home.path, id: format!("codex:{name}:{device}:{inode}") })
+    }
+
+    pub(crate) fn codex_home(&self, name: &str) -> Result<PathBuf> {
+        Ok(self.codex_profile(name)?.path)
+    }
+
+    pub(crate) fn codex_profiles(&self) -> Result<Vec<CodexHome>> {
+        let Some(parent) = self.reserved_dir(Reserved::Codex, false)? else { return Ok(vec![]) };
+        let mut homes = Vec::new();
+        for name in parent.entries()? {
+            if super::validate_name(&name).is_err() || name != name.to_ascii_lowercase() { continue; }
+            match self.codex_profile(&name) {
+                Ok(home) => homes.push(home),
+                Err(e) => eprintln!("warning: Skipping Codex home {name}: {}", e.message),
+            }
+        }
+        Ok(homes)
     }
 }
