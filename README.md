@@ -4,9 +4,32 @@
 
 Roost manages profiles for Claude and Codex. It can give a T3 Code provider its own Codex home folder for a work account. For Claude, it can create profiles, register existing ones, remember which profile each project uses, share settings and plugins, and start Claude Desktop per profile.
 
-This is a source-only development build. Local Linux automated tests and disposable Bash/Fish checks pass, and the automated tests cover macOS (Apple silicon), including experimental Desktop launches with disposable fake apps. Native Windows is unsupported and does not compile; on Windows, use a Linux Roost and Claude installation in WSL 2. Other architectures, WSL and real-account acceptance remain unverified. No prebuilt downloads or package publication are provided.
+Roost runs on macOS and Linux. Desktop support is experimental. On Windows, use a Linux Roost and Claude installation in WSL 2. WSL and real-account acceptance remain unverified.
 
 Terms such as profile, account, owned, registered upstream, selected profile and shared set are defined in the [glossary](GLOSSARY.md).
+
+## Install from a release
+
+Choose the archive for your system and download it alongside `SHA256SUMS`. Run `uname -m` to check your architecture. For older releases that provide only source archives, use the source build instructions below. [Roost releases](https://github.com/rmkr/roost/releases)
+
+| System | Architecture | Archive suffix |
+| --- | --- | --- |
+| macOS | Apple silicon (`arm64`) | `aarch64-apple-darwin.tar.gz` |
+| macOS | Intel (`x86_64`) | `x86_64-apple-darwin.tar.gz` |
+| Linux | `aarch64` | `aarch64-unknown-linux-gnu.tar.gz` |
+| Linux | `x86_64` | `x86_64-unknown-linux-gnu.tar.gz` |
+
+The release workflow tests macOS 15 and Ubuntu 22.04. Linux binaries target glibc and are tested with glibc 2.35. Mac binaries ship without Developer ID signing or notarization. If macOS blocks the download from running, use the source build instructions below.
+
+Download both files to an empty directory, set `archive` to the filename you chose, then verify and extract it.
+
+```sh
+archive=roost-vX.Y.Z-aarch64-apple-darwin.tar.gz
+awk -v name="$archive" '$2 == name' SHA256SUMS | shasum -a 256 -c &&
+  tar -xzf "$archive" && ./roost --version
+```
+
+Place the `roost` executable in a directory on your PATH. Check for an existing `roost` first so you avoid overwriting an unrelated executable.
 
 ## Build from source
 
@@ -232,7 +255,15 @@ Registration preserves upstream ownership: Roost does not write/clear borrowed t
 
 Set owned manager tokens with hidden terminal input or explicit `roost token work --stdin`; never put token values on the command line. Isolated launches reject known inherited auth/provider overrides by default. Deliberate `roost run --allow-auth-env work` preserves caller auth and suppresses manager-token injection, while retaining filesystem/token safety checks. Default aliases are pass-through.
 
-`roost update` delegates to the shared `claude update`; upgrade Roost by explicitly installing the next tested source revision. Compatible state stays intact; unsupported schemas are refused. End Roost operations before replacement, then verify version/doctor and refresh relocated bindings with reuse. `cargo uninstall roost-claude` removes the Cargo executable and retains profile data, launchers and PATH edits.
+`roost update` delegates to the shared `claude update`. To upgrade Roost, install the next release using the same method you used for the current version. Compatible state stays intact; unsupported schemas are refused. End Roost operations before replacement, then verify version/doctor and refresh relocated bindings with reuse. `cargo uninstall roost-claude` removes the Cargo executable and retains profile data, launchers and PATH edits.
+
+## Cut a release
+
+1. Bump the package version in `Cargo.toml` and `Cargo.lock`, then merge the change into `main`.
+2. Fetch `origin/main`. Tag the merged commit with the matching `vMAJOR.MINOR.PATCH` version and push the tag.
+3. Check the Release workflow for that tag. It publishes the GitHub Release after all four builds pass. If an upload fails, rerun the workflow to finish the draft.
+
+To rehearse packaging without publishing, run the Release workflow manually from Actions and download its build artifacts.
 
 ## Further reading
 
