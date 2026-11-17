@@ -2278,6 +2278,39 @@ fn legacy_codex_home_gets_a_stable_selection_on_first_use() {
 }
 
 #[test]
+fn picker_binds_only_the_legacy_codex_home_the_user_chooses() {
+    let f = Fixture::with_fakes("legacy-picker", &[("codex", FAKE), ("claude", FAKE)]);
+    f.add("A");
+    let generation = |name: &str| {
+        f.root
+            .join("codex")
+            .join(name)
+            .join(".roost-codex-generation")
+    };
+    for name in ["personal", "work"] {
+        f.ok(&["codex", "add", name]);
+        fs::remove_file(generation(name)).unwrap();
+    }
+    assert_eq!(f.run(&[]).status.code(), Some(2));
+    let cases: &[(&Path, &[&str], &[&str])] = &[
+        (&f.path, &[], &["q"]),
+        (&f.path, &[], &["\r"]), // Claude A
+    ];
+    let results = pty_session(&f, &[], cases);
+    assert_eq!(results[0]["exit"], 130);
+    assert_eq!(results[1]["exit"], 0);
+    assert!(!generation("work").exists() && !generation("personal").exists());
+    let picked = pty_session(&f, &[], &[(&f.path, &["switch"], &["j", "\r"])]);
+    assert_eq!(picked[0]["exit"], 0);
+    assert!(generation("personal").exists());
+    assert!(!generation("work").exists());
+    assert_eq!(
+        launched(&f.ok(&[]))["env"]["CODEX_HOME"],
+        json!(f.root.join("codex/personal"))
+    );
+}
+
+#[test]
 fn mixed_inventory_sorts_valid_names_and_ignores_unusable_filenames() {
     use std::os::unix::ffi::OsStrExt;
     let f = Fixture::new();

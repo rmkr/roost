@@ -395,7 +395,7 @@ impl Store {
         Ok(Some(created))
     }
 
-    pub(super) fn side_ready(&self) -> Result<()> {
+    pub(crate) fn side_ready(&self) -> Result<()> {
         if self.mode == OpenMode::Read {
             return Err(err(
                 "ownership",

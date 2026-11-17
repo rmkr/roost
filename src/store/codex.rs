@@ -17,11 +17,28 @@ struct HomeMarker {
     directory_identity: FileIdentity,
 }
 
-#[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) struct CodexHome {
     pub name: String,
     pub path: PathBuf,
     pub id: String,
+    // Pins legacy directories across the unlocked picker until selection.
+    pub unbound: Option<Directory>,
+}
+
+impl CodexHome {
+    pub fn bind(mut self, store: &Store) -> Result<Self> {
+        store.side_ready()?;
+        if let Some(directory) = self.unbound.take() {
+            directory.verify_namespace()?;
+            let generation = platform::random_id()?;
+            let temp = format!(".roost-tmp-{generation}");
+            let identity = directory.write_new(&temp, generation.as_bytes(), 0o600)?;
+            directory.publish_new_entry(&temp, identity, GENERATION)?;
+            directory.sync()?;
+            self.id = format!("codex:{}:{generation}", self.name);
+        }
+        Ok(self)
+    }
 }
 
 /// Recognize old filesystem-only IDs as stale selections when reading state.
@@ -104,29 +121,22 @@ impl Store {
         }
         self.check_root()?;
         home.verify_namespace()?;
-        let generation = match home.read(GENERATION, true, 32)? {
-            Some(bytes) => String::from_utf8(bytes)
-                .ok()
-                .filter(|id| super::valid_id(id))
-                .ok_or_else(|| err("ownership", "Invalid Codex home generation"))?,
-            None if self.mode == super::OpenMode::Launch && !self.pending() => {
-                self.side_ready()?;
-                let generation = platform::random_id()?;
-                let temp = format!(".roost-tmp-{generation}");
-                let identity = home.write_new(&temp, generation.as_bytes(), 0o600)?;
-                home.publish_new_entry(&temp, identity, GENERATION)?;
-                home.sync()?;
-                generation
+        let path = home.path.clone();
+        let (id, unbound) = match home.read(GENERATION, true, 32)? {
+            Some(bytes) => {
+                let generation = String::from_utf8(bytes)
+                    .ok()
+                    .filter(|id| super::valid_id(id))
+                    .ok_or_else(|| err("ownership", "Invalid Codex home generation"))?;
+                (format!("codex:{name}:{generation}"), None)
             }
-            // Read-only discovery of a pre-picker home. No saved selection can
-            // refer to this value. Launch binds the verified home before picking.
-            None => "unbound".into(),
+            None => (format!("codex:{name}:unbound"), Some(home)),
         };
-        home.verify_namespace()?;
         Ok(CodexHome {
             name: name.into(),
-            path: home.path,
-            id: format!("codex:{name}:{generation}"),
+            path,
+            id,
+            unbound,
         })
     }
 

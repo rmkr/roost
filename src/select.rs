@@ -148,7 +148,6 @@ pub(crate) fn open_launch(root: &Path) -> Result<Store> {
 }
 
 /// A launchable Claude registration or marker-verified Codex home.
-#[derive(Clone, PartialEq, Eq)]
 pub(crate) enum Profile {
     Claude(Registration),
     Codex(CodexHome),
@@ -178,13 +177,7 @@ impl Profile {
 
     fn codex(store: &Store, name: &str) -> Result<Self> {
         let home = store.codex_profile(&name.to_ascii_lowercase())?;
-        if store.pending() {
-            return Err(
-                Error::new("ownership", "Pending operation blocks profile use")
-                    .next("Inspect doctor and complete the pending operation first"),
-            );
-        }
-        Ok(Self::Codex(home))
+        Ok(Self::Codex(home.bind(store)?))
     }
 
     fn id(&self) -> &str {
@@ -205,7 +198,8 @@ impl Profile {
         match self {
             Self::Claude(r) => store.validate(r),
             Self::Codex(home) => {
-                if Self::codex(store, &home.name)? != *self {
+                store.side_ready()?;
+                if store.codex_profile(&home.name)?.id != home.id {
                     return Err(Error::new("ownership", "Codex home identity changed"));
                 }
                 Ok(())
@@ -468,9 +462,9 @@ fn codex_record(home: &CodexHome) -> Value {
 pub(crate) fn append_codex_profiles(
     store: &Store,
     records: &mut Vec<Value>,
-) -> Result<Vec<String>> {
-    let mut warnings = Vec::new();
-    let homes = store.codex_profiles(&mut warnings)?;
+    warnings: &mut Vec<String>,
+) -> Result<Vec<CodexHome>> {
+    let homes = store.codex_profiles(warnings)?;
     if !homes.is_empty() {
         records.extend(homes.iter().map(codex_record));
         records.sort_by_cached_key(|r| {
@@ -482,7 +476,7 @@ pub(crate) fn append_codex_profiles(
             )
         });
     }
-    Ok(warnings)
+    Ok(homes)
 }
 
 /// The shared picker flow: with an active registration and a terminal (else
@@ -500,11 +494,16 @@ pub(crate) fn choose_with(
 ) -> Result<Choice> {
     let mut records = store.profiles(false)?;
     let _ = sets::annotate(&store, &mut records);
-    if matches!(picker, Picker::Project { claude_only: false }) {
-        for warning in append_codex_profiles(&store, &mut records)? {
+    let homes = if matches!(picker, Picker::Project { claude_only: false }) {
+        let mut warnings = Vec::new();
+        let homes = append_codex_profiles(&store, &mut records, &mut warnings)?;
+        for warning in warnings {
             eprintln!("warning: {warning}");
         }
-    }
+        homes
+    } else {
+        vec![]
+    };
     if records.is_empty() {
         let hint = if matches!(picker, Picker::Project { claude_only: false }) {
             "Create a profile with roost add NAME (Claude) or roost codex add NAME (Codex)"
@@ -550,14 +549,22 @@ pub(crate) fn choose_with(
         let name = record["name"]
             .as_str()
             .ok_or_else(|| Error::new("ownership", "Listed Codex name is missing"))?;
-        let current = Profile::codex(&store, name)?;
-        if record["selection_id"] != current.id() {
+        let listed = homes
+            .iter()
+            .find(|home| home.name == name)
+            .ok_or_else(|| Error::new("ownership", "Listed Codex home is missing"))?;
+        let current = store.codex_profile(name)?;
+        if let Some(directory) = &listed.unbound {
+            // The handle prevents inode reuse and permits another picker to bind
+            // the same verified home while this picker is waiting.
+            directory.verify_namespace()?;
+        } else if current.id != listed.id {
             return Err(Error::new(
                 "ownership",
                 "Codex home changed while the picker was open",
             ));
         }
-        current
+        Profile::Codex(current.bind(&store)?)
     } else {
         let r = listed_claude(index)?;
         store.validate(&r)?;

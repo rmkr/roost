@@ -281,7 +281,7 @@ fn dispatch(action: Action, data: &mut Value) -> Result<Outcome> {
             let (project, mut warnings) = select::list_project();
             if let Some(store) = &store {
                 warnings.extend(sets::annotate(store, &mut profiles));
-                warnings.extend(select::append_codex_profiles(store, &mut profiles)?);
+                select::append_codex_profiles(store, &mut profiles, &mut warnings)?;
                 warnings.extend(select::annotate(store, &mut profiles, project.as_deref()));
             }
             if store.as_ref().is_some_and(Store::pending) {
