@@ -193,3 +193,101 @@ fn concurrent_adds_publish_only_one_home() {
     assert_eq!(success.stdout, format!("{}\n", s(&work)).as_bytes());
     assert_eq!(fs::read_dir(f.root.join("codex")).unwrap().count(), 1);
 }
+
+const PLUGIN_CODEX: &str = r#"#!/usr/bin/python3
+import json,os,pathlib,shutil,sys
+assert os.getcwd()=='/'
+assert all(key not in os.environ for key in ('OPENAI_API_KEY','CODEX_API_KEY','CODEX_ACCESS_TOKEN'))
+assert sys.argv[1:3]==['-c','cli_auth_credentials_store = "file"']
+args=sys.argv[3:]
+assert args[0]=='plugin'
+pid='demo@tools'
+home=pathlib.Path(os.environ['CODEX_HOME'])
+cache=home/'plugins/cache/tools/demo/1.0'
+row={'pluginId':pid,'version':'1.0','installed':True}
+with (home/'calls').open('a') as calls:
+    calls.write(' '.join(args)+'\n')
+if args[1]=='list':
+    print(json.dumps({'installed':[row] if cache.exists() else [],'available':[]}))
+elif args[1]=='add':
+    assert args[2]==pid
+    cache.mkdir(parents=True)
+    (cache/'plugin.json').write_text(json.dumps({'name':'demo'}))
+    print(json.dumps(row))
+elif args[1]=='remove':
+    assert args[2]==pid
+    shutil.rmtree(cache)
+    print(json.dumps({'pluginId':pid}))
+else:
+    sys.exit(2)
+"#;
+
+#[test]
+fn managed_native_plugins_target_verified_homes_and_sync_future_profiles() {
+    let f = Fixture::with_fakes("codex-plugin", &[("codex", PLUGIN_CODEX)])
+        .with_var("OPENAI_API_KEY", "fixture")
+        .with_var("CODEX_ACCESS_TOKEN", "fixture");
+    for name in ["work", "personal"] {
+        f.ok(&["codex", "add", name]);
+    }
+    let target = |name| {
+        f.root
+            .join("codex")
+            .join(name)
+            .join("plugins/cache/tools/demo/1.0")
+    };
+    let selected = [
+        "plugin",
+        "install",
+        "codex:demo@tools",
+        "--all-repos",
+        "--profile",
+        "codex:work",
+        "--yes",
+    ];
+    f.ok(&selected);
+    f.ok(&selected);
+    assert!(target("work").exists());
+    assert!(!target("personal").exists());
+    let calls = fs::read_to_string(f.root.join("codex/work/calls")).unwrap();
+    assert_eq!(
+        calls
+            .lines()
+            .filter(|line| line.starts_with("plugin add "))
+            .count(),
+        1
+    );
+
+    f.ok(&[
+        "plugin",
+        "install",
+        "codex:demo@tools",
+        "--all-repos",
+        "--all-profiles",
+        "--yes",
+    ]);
+    assert!(target("personal").exists());
+    f.ok(&["codex", "add", "later"]);
+    let listed = f.json(&["plugin", "list", "--managed", "--json"]);
+    let rules = listed["data"]["rules"].as_array().unwrap();
+    assert_eq!(rules.len(), 2);
+    assert!(
+        rules
+            .iter()
+            .flat_map(|rule| rule["targets"].as_array().unwrap())
+            .any(|entry| {
+                entry["target"]["profile"]["label"] == "codex:later"
+                    && entry["status"]["installed"].is_null()
+            })
+    );
+    f.ok(&["plugin", "sync", "--yes"]);
+    assert!(target("later").exists());
+
+    let first = rules[0]["id"].as_str().unwrap();
+    f.ok(&["plugin", "uninstall", first, "--yes"]);
+    assert!(target("work").exists());
+    f.ok(&["plugin", "uninstall", "codex:demo@tools", "--yes"]);
+    for name in ["work", "personal", "later"] {
+        assert!(!target(name).exists());
+    }
+}

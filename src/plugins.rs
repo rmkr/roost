@@ -18,6 +18,7 @@ use crate::{
     Error, Result,
     cli::{MarketplaceAction, PluginAction},
     launch::{self, ProfileEnv},
+    managed_native::{self, CatalogSource, Marketplace, NativeInstall},
     platform::{self, Directory},
     sets,
     store::{
@@ -131,20 +132,36 @@ pub(crate) fn valid_id(id: &str) -> bool {
 /// Takes the store lock; with `wait`, polls up to 10 seconds like the root lock,
 /// otherwise returns `None` at once when it is held. Never inherited by children.
 fn store_lock(store: &Directory, wait: bool) -> Result<Option<File>> {
-    if store.entry(STORE_LOCK)?.is_none()
-        && let Err(error) = store.write_new(STORE_LOCK, b"", 0o600)
-        && store.entry(STORE_LOCK)?.is_none()
+    provider_lock(store, STORE_LOCK, "plugin store", wait)
+}
+
+pub(crate) fn provider_lock(
+    directory: &Directory,
+    name: &str,
+    label: &str,
+    wait: bool,
+) -> Result<Option<File>> {
+    if directory.entry(name)?.is_none()
+        && let Err(error) = directory.write_new(name, b"", 0o600)
+        && directory.entry(name)?.is_none()
     {
         return Err(error);
     }
-    let file = store.open_file(STORE_LOCK, true, true)?;
+    let file = directory.open_file(name, true, true)?;
     let deadline = Instant::now() + LOCK_WAIT;
     loop {
         if platform::cancelled() {
             return Err(Error::cancelled());
         }
         match file.try_lock() {
-            Ok(()) => return Ok(Some(file)),
+            Ok(()) => {
+                if directory.entry(name)?.map(|entry| entry.identity)
+                    != Some(platform::file_identity(&file)?)
+                {
+                    return Err(Error::new("ownership", "Native plugin lock was replaced"));
+                }
+                return Ok(Some(file));
+            }
             Err(std::fs::TryLockError::WouldBlock) if !wait => return Ok(None),
             Err(std::fs::TryLockError::WouldBlock) if Instant::now() < deadline => {
                 thread::sleep(Duration::from_millis(25))
@@ -152,12 +169,12 @@ fn store_lock(store: &Directory, wait: bool) -> Result<Option<File>> {
             Err(std::fs::TryLockError::WouldBlock) => {
                 return Err(Error::new(
                     "io",
-                    "Another Roost plugin operation holds the plugin store lock",
+                    format!("Another Roost plugin operation holds the {label} lock"),
                 )
                 .next("Retry after the other operation finishes."));
             }
             Err(std::fs::TryLockError::Error(e)) => {
-                return Err(Error::io("lock plugin store", &store.path, e));
+                return Err(Error::io("lock native plugin target", &directory.path, e));
             }
         }
     }
@@ -171,6 +188,7 @@ fn store_command(claude: &Path, store: &Path) -> Command {
         command.env_remove(name);
     }
     command
+        .current_dir("/")
         .env("CLAUDE_CONFIG_DIR", store)
         .env("DISABLE_AUTOUPDATER", "1");
     command
@@ -191,7 +209,31 @@ impl Session {
         let store = manager.ensure_plugin_store()?;
         let root_id = manager.root_id.clone();
         drop(manager);
+        Self::locked(claude, root_id, store)
+    }
+
+    fn existing(root: &Path) -> Result<Option<Self>> {
+        let Some(manager) = Store::open_if_present(root)? else {
+            return Ok(None);
+        };
+        if manager.pending() {
+            return Err(Error::new(
+                "ownership",
+                "A pending Roost operation blocks the Claude plugin store",
+            ));
+        }
+        let Some(store) = manager.plugin_store()? else {
+            return Ok(None);
+        };
+        let root_id = manager.root_id.clone();
+        drop(manager);
+        let (claude, _) = launch::claude_info()?;
+        Self::locked(claude, root_id, store).map(Some)
+    }
+
+    fn locked(claude: PathBuf, root_id: String, store: Directory) -> Result<Self> {
         let lock = store_lock(&store, true)?.expect("waiting lock");
+        store.verify_namespace()?;
         Ok(Self {
             claude,
             root_id,
@@ -232,6 +274,442 @@ impl Session {
     fn refresh(&self, timeout: Duration) -> Result<(Record, Vec<String>)> {
         refresh(&self.claude, &self.store, &self.root_id, timeout)
     }
+}
+
+// Managed operations capture provider output and discard diagnostics. The old
+// interactive plugin commands continue to let Claude present its own output.
+fn managed_command(
+    claude: &Path,
+    store: &Directory,
+    operation: &str,
+    args: &[&str],
+    read_only: bool,
+) -> Result<Vec<u8>> {
+    store.verify_namespace()?;
+    managed_native::run(
+        store_command(claude, &store.path),
+        "Claude",
+        operation,
+        args,
+        read_only,
+    )
+}
+
+fn claude_marketplaces(claude: &Path, store: &Directory) -> Result<Vec<Marketplace>> {
+    let output = managed_command(
+        claude,
+        store,
+        "marketplace list",
+        &["plugin", "marketplace", "list", "--json"],
+        true,
+    )?;
+    let listing = managed_native::json(&output, "Claude", "marketplace list")?;
+    let rows = listing.as_array().ok_or_else(|| {
+        Error::new(
+            "native_plugin",
+            "Claude did not report its configured marketplaces",
+        )
+    })?;
+    Ok(rows
+        .iter()
+        .filter_map(|row| {
+            let name = row["name"]
+                .as_str()
+                .filter(|n| managed_native::valid_part(n))?
+                .into();
+            let source = match row["source"].as_str() {
+                Some("github") if row["ref"].is_null() && row["path"].is_null() => {
+                    row["repo"].as_str().and_then(CatalogSource::remote)
+                }
+                Some("url") if row["ref"].is_null() && row["path"].is_null() => {
+                    row["url"].as_str().and_then(CatalogSource::remote)
+                }
+                Some("directory" | "file") => row["path"].as_str().and_then(CatalogSource::local),
+                _ => None,
+            };
+            let location = row["installLocation"].as_str().map(PathBuf::from);
+            Some(Marketplace {
+                name,
+                source,
+                location,
+            })
+        })
+        .collect())
+}
+
+fn claude_add_marketplace(claude: &Path, store: &Directory, source: &CatalogSource) -> Result<()> {
+    managed_command(
+        claude,
+        store,
+        "marketplace add",
+        &["plugin", "marketplace", "add", source.arg()],
+        false,
+    )?;
+    Ok(())
+}
+
+fn claude_catalog_ids(store: &Directory, market: &Marketplace) -> Result<Vec<String>> {
+    let malformed = || {
+        Error::new(
+            "native_plugin",
+            "Claude's marketplace catalog could not be verified",
+        )
+    };
+    let path = market.location.as_ref().ok_or_else(malformed)?;
+    let (directory, manifest) = match market.source.as_ref().ok_or_else(malformed)? {
+        CatalogSource::Local(source) if source == path && source.is_file() => {
+            let directory = Directory::open(source.parent().ok_or_else(malformed)?, false)?;
+            let name = source
+                .file_name()
+                .and_then(|name| name.to_str())
+                .ok_or_else(malformed)?;
+            (directory, name)
+        }
+        CatalogSource::Local(source) if source == path => (
+            Directory::open(source, false)?.child(".claude-plugin", false)?,
+            "marketplace.json",
+        ),
+        source
+            if source.is_git()
+                && *path
+                    == store
+                        .path
+                        .join("plugins")
+                        .join("marketplaces")
+                        .join(&market.name) =>
+        {
+            let directory = store
+                .child("plugins", false)?
+                .child("marketplaces", false)?
+                .child(&market.name, false)?
+                .child(".claude-plugin", false)?;
+            (directory, "marketplace.json")
+        }
+        _ => return Err(malformed()),
+    };
+    let bytes = directory
+        .read(manifest, false, RECORD_LIMIT)?
+        .ok_or_else(malformed)?;
+    let catalog = managed_native::json(&bytes, "Claude", "marketplace catalog")?;
+    let entries = catalog["plugins"].as_array().ok_or_else(malformed)?;
+    if catalog["name"] != market.name {
+        return Err(malformed());
+    }
+    Ok(entries
+        .iter()
+        .filter_map(|entry| {
+            let name = entry["name"]
+                .as_str()
+                .filter(|n| managed_native::valid_part(n))?;
+            Some(format!("{name}@{}", market.name))
+        })
+        .collect())
+}
+
+fn claude_revision(claude: &Path, store: &Directory, id: &str) -> Result<Option<String>> {
+    let (plugin, market) = managed_native::split_id(id)?;
+    let plugins = listing(claude, &store.path, false, Duration::from_secs(10))?;
+    if plugins
+        .as_array()
+        .or_else(|| plugins["installed"].as_array())
+        .is_none()
+    {
+        return Err(Error::new(
+            "native_plugin",
+            "Claude did not report its installed plugins",
+        ));
+    }
+    let mut matching = installed_rows(&plugins, true)
+        .into_iter()
+        .filter(|row| row.0 == id);
+    let Some((_, path, version)) = matching.next() else {
+        return Ok(None);
+    };
+    let invalid = || {
+        Error::new(
+            "native_plugin",
+            "Claude did not report a verifiable installed plugin version",
+        )
+    };
+    let version = version
+        .filter(|version| managed_native::valid_version(version))
+        .ok_or_else(invalid)?;
+    if matching.next().is_some()
+        || path
+            != store
+                .path
+                .join("plugins")
+                .join("cache")
+                .join(market)
+                .join(plugin)
+                .join(&version)
+    {
+        return Err(invalid());
+    }
+    let directory = open_install(store, &path)?;
+    if directory.entry(".orphaned_at")?.is_some() {
+        return Err(invalid());
+    }
+    managed_native::revision(&version, &directory).map(Some)
+}
+
+fn record_changed_store(session: &Session, operation: Result<Vec<u8>>) -> Result<()> {
+    // Even a failed provider operation can change an installed plugin.
+    let refresh = session.refresh(Duration::from_secs(10));
+    operation?;
+    refresh?;
+    Ok(())
+}
+
+pub(crate) fn claude_install(root: &Path, source: &str) -> Result<NativeInstall> {
+    use managed_native::Source;
+
+    let source = managed_native::source_for("claude", source)?;
+    let session = Session::open(root)?;
+    let id = match source {
+        Source::Id(id) => id.to_owned(),
+        Source::Catalog(source) => {
+            let markets = claude_marketplaces(&session.claude, &session.store)?;
+            if let Some(market) = managed_native::match_market(&markets, &source)? {
+                managed_native::unique_plugin(claude_catalog_ids(&session.store, market)?)?
+            } else {
+                let temporary = managed_native::scratch()?;
+                let candidate = Directory::open(&temporary.0, false)?;
+                claude_add_marketplace(&session.claude, &candidate, &source)?;
+                let fresh = claude_marketplaces(&session.claude, &candidate)?;
+                let market = managed_native::match_market(&fresh, &source)?.ok_or_else(|| {
+                    Error::new(
+                        "native_plugin",
+                        "Claude did not register the requested marketplace",
+                    )
+                })?;
+                if markets.iter().any(|m| m.name == market.name) {
+                    return Err(Error::new(
+                        "collision",
+                        "A different Claude marketplace already uses that name",
+                    ));
+                }
+                let id = managed_native::unique_plugin(claude_catalog_ids(&candidate, market)?)?;
+                claude_add_marketplace(&session.claude, &session.store, &source)?;
+                let live = claude_marketplaces(&session.claude, &session.store)?;
+                let registered =
+                    managed_native::market_for_id(&live, Source::Catalog(source), &id)?
+                        .expect("catalog source required a matching marketplace");
+                if managed_native::unique_plugin(claude_catalog_ids(&session.store, registered)?)?
+                    != id
+                {
+                    return Err(Error::new(
+                        "conflict",
+                        "The Claude marketplace changed during installation",
+                    ));
+                }
+                id
+            }
+        }
+    };
+    if let Some(revision) = claude_revision(&session.claude, &session.store, &id)? {
+        session.refresh(Duration::from_secs(10))?;
+        return Ok(NativeInstall {
+            id,
+            revision,
+            owned: false,
+        });
+    }
+    record_changed_store(
+        &session,
+        managed_command(
+            &session.claude,
+            &session.store,
+            "plugin install",
+            &["plugin", "install", &id],
+            false,
+        ),
+    )?;
+    let revision = claude_revision(&session.claude, &session.store, &id)?.ok_or_else(|| {
+        Error::new(
+            "native_plugin",
+            "Claude did not report the plugin after installation",
+        )
+    })?;
+    Ok(NativeInstall {
+        id,
+        revision,
+        owned: true,
+    })
+}
+
+pub(crate) fn claude_current(root: &Path, id: &str) -> Result<Option<String>> {
+    managed_native::split_id(id)?;
+    let Some(session) = Session::existing(root)? else {
+        return Ok(None);
+    };
+    claude_revision(&session.claude, &session.store, id)
+}
+
+pub(crate) fn claude_check(root: &Path, source: &str, id: &str) -> Result<Option<String>> {
+    let source = managed_native::source_for("claude", source)?;
+    let (claude, current, catalog) = {
+        let session = Session::existing(root)?
+            .ok_or_else(|| Error::new("not_found", "The Claude plugin store does not exist"))?;
+        let current = claude_revision(&session.claude, &session.store, id)?.ok_or_else(|| {
+            Error::new(
+                "not_found",
+                "The plugin is missing from the Claude plugin store",
+            )
+        })?;
+        let markets = claude_marketplaces(&session.claude, &session.store)?;
+        let catalog = managed_native::market_for_id(&markets, source, id)?
+            .and_then(|m| m.source.clone())
+            .ok_or_else(|| {
+                Error::new(
+                    "unsupported",
+                    "Claude cannot reliably check updates for this marketplace",
+                )
+            })?;
+        (session.claude, current, catalog)
+    };
+    let revision = claude_candidate(&claude, catalog, id)?;
+    if current != revision
+        && managed_native::reported_version(&current) == managed_native::reported_version(&revision)
+    {
+        return Err(Error::new(
+            "unsupported",
+            "The Claude plugin contents changed without a version bump and Claude may keep the old cache",
+        ));
+    }
+    Ok(managed_native::changed_revision(&current, revision))
+}
+
+fn claude_candidate(claude: &Path, catalog: CatalogSource, id: &str) -> Result<String> {
+    let temporary = managed_native::scratch()?;
+    let candidate = Directory::open(&temporary.0, false)?;
+    claude_add_marketplace(claude, &candidate, &catalog)?;
+    let markets = claude_marketplaces(claude, &candidate)?;
+    managed_native::market_for_id(&markets, managed_native::Source::Catalog(catalog), id)?;
+    managed_command(
+        claude,
+        &candidate,
+        "plugin install",
+        &["plugin", "install", id],
+        false,
+    )?;
+    claude_revision(claude, &candidate, id)?.ok_or_else(|| {
+        Error::new(
+            "native_plugin",
+            "Claude did not report a candidate plugin revision",
+        )
+    })
+}
+
+pub(crate) fn claude_update(
+    root: &Path,
+    source: &str,
+    id: &str,
+    expected_revision: &str,
+    expected_candidate: Option<&str>,
+) -> Result<NativeInstall> {
+    let source = managed_native::source_for("claude", source)?;
+    let session = Session::existing(root)?
+        .ok_or_else(|| Error::new("not_found", "The Claude plugin store does not exist"))?;
+    let current = claude_revision(&session.claude, &session.store, id)?;
+    managed_native::require_revision(current.as_deref(), expected_revision)?;
+    let markets = claude_marketplaces(&session.claude, &session.store)?;
+    let market = managed_native::market_for_id(&markets, source, id)?;
+    if let Some(expected) = expected_candidate {
+        let catalog = market.and_then(|m| m.source.clone()).ok_or_else(|| {
+            Error::new(
+                "unsupported",
+                "Claude cannot verify a candidate for this marketplace",
+            )
+        })?;
+        let candidate = claude_candidate(&session.claude, catalog, id)?;
+        managed_native::require_candidate(expected, &candidate, false)?;
+        let current = claude_revision(&session.claude, &session.store, id)?;
+        managed_native::require_revision(current.as_deref(), expected_revision)?;
+    }
+    if let Some(market) = market {
+        managed_command(
+            &session.claude,
+            &session.store,
+            "marketplace update",
+            &["plugin", "marketplace", "update", &market.name],
+            false,
+        )?;
+        let current = claude_revision(&session.claude, &session.store, id)?;
+        managed_native::require_revision(current.as_deref(), expected_revision)?;
+    }
+    record_changed_store(
+        &session,
+        managed_command(
+            &session.claude,
+            &session.store,
+            "plugin update",
+            &["plugin", "update", id],
+            false,
+        ),
+    )?;
+    let revision = claude_revision(&session.claude, &session.store, id)?.ok_or_else(|| {
+        Error::new(
+            "native_plugin",
+            "Claude did not report the plugin after updating",
+        )
+    })?;
+    if let Some(expected) = expected_candidate {
+        managed_native::require_candidate(expected, &revision, true)?;
+    }
+    Ok(NativeInstall {
+        id: id.into(),
+        revision,
+        owned: false,
+    })
+}
+
+pub(crate) fn claude_remove(root: &Path, id: &str, expected_revision: &str) -> Result<()> {
+    managed_native::split_id(id)?;
+    let Some(session) = Session::existing(root)? else {
+        return Ok(());
+    };
+    let current = claude_revision(&session.claude, &session.store, id)?;
+    if current.is_none() {
+        return Ok(());
+    }
+    managed_native::require_revision(current.as_deref(), expected_revision)?;
+    {
+        let manager = Store::open(root, false, OpenMode::Read)?;
+        same_root(&manager.root_id, &session.root_id)?;
+        let sets = manager.read_sets()?;
+        let mut referenced = crate::managed::claude_references(&manager)?;
+        // The caller already checks overlapping direct managed references.
+        referenced.remove(id);
+        referenced.extend(
+            sets.sets
+                .iter()
+                .flat_map(|set| &set.items)
+                .filter(|item| item.kind == ItemKind::Plugin)
+                .map(|item| item.value.clone()),
+        );
+        let record = read_record_in(&session.store, &session.root_id)?;
+        if dependency_ids(&record, referenced).contains(id) {
+            return Ok(());
+        }
+    }
+    record_changed_store(
+        &session,
+        managed_command(
+            &session.claude,
+            &session.store,
+            "plugin uninstall",
+            &["plugin", "uninstall", id],
+            false,
+        ),
+    )?;
+    if claude_revision(&session.claude, &session.store, id)?.is_some() {
+        return Err(Error::new(
+            "native_plugin",
+            "Claude still reports the plugin as installed after removal",
+        ));
+    }
+    Ok(())
 }
 
 /// `claude plugin list --json [--available]` in the store, bounded.
@@ -474,6 +952,19 @@ fn read_record_in(store: &Directory, root_id: &str) -> Result<Record> {
     Ok(record)
 }
 
+fn dependency_ids(record: &Record, ids: impl IntoIterator<Item = String>) -> BTreeSet<String> {
+    let mut pending: Vec<_> = ids.into_iter().collect();
+    let mut resolved = BTreeSet::new();
+    while let Some(id) = pending.pop() {
+        if resolved.insert(id.clone())
+            && let Some(plugin) = record.get(&id)
+        {
+            pending.extend(plugin.dependencies.iter().cloned());
+        }
+    }
+    resolved
+}
+
 /// The store and its record; `None` when the store was never created.
 fn read_record(store: &Store) -> Result<Option<(Directory, Record)>> {
     let Some(directory) = store.plugin_store()? else {
@@ -587,6 +1078,15 @@ pub struct LaunchPlugins {
 /// default alias (not isolated) gets nothing. A due auto-update writes its new
 /// timestamp here, first, so concurrent launches skip it.
 pub fn claim(store: &Store, registration: &Registration, env: &ProfileEnv) -> LaunchPlugins {
+    claim_with(store, registration, env, vec![])
+}
+
+pub(crate) fn claim_with(
+    store: &Store,
+    registration: &Registration,
+    env: &ProfileEnv,
+    extra: Vec<String>,
+) -> LaunchPlugins {
     let mut plugins = LaunchPlugins {
         store: None,
         owned: store.root.join(PLUGIN_STORE),
@@ -598,17 +1098,18 @@ pub fn claim(store: &Store, registration: &Registration, env: &ProfileEnv) -> La
     if !env.is_isolated() {
         return plugins;
     }
-    let sets = match store.read_sets() {
-        Ok(sets) => sets,
+    match store.read_sets() {
+        Ok(sets) => {
+            plugins.wanted = sets::plugin_items(&sets, &registration.registration_id);
+            plugins.update = sets.plugin_auto_update && claim_update(store, &mut plugins.warnings);
+        }
         Err(error) => {
             plugins
                 .warnings
                 .push(format!("Skipped store plugins: {}", error.message));
-            return plugins;
         }
     };
-    plugins.wanted = sets::plugin_items(&sets, &registration.registration_id);
-    plugins.update = sets.plugin_auto_update && claim_update(store, &mut plugins.warnings);
+    plugins.wanted.extend(extra);
     if plugins.update || !plugins.wanted.is_empty() {
         match store.plugin_store() {
             Ok(directory) => plugins.store = directory,
@@ -932,7 +1433,7 @@ pub fn command(action: PluginAction, data: &mut Value) -> Result<(Vec<String>, V
             sets: named,
             no_set,
         } => add(&root, &plugin, named, no_set),
-        PluginAction::Update { plugin } => update(&root, plugin.as_deref()),
+        PluginAction::Update { plugin, .. } => update(&root, plugin.as_deref()),
         PluginAction::AutoUpdate { on, .. } => {
             let store = Store::open(&root, true, OpenMode::Mutate)?;
             store.update_sets(|sets| {
@@ -950,6 +1451,8 @@ pub fn command(action: PluginAction, data: &mut Value) -> Result<(Vec<String>, V
             ))
         }
         PluginAction::Remove { plugin } => remove(&root, &plugin),
+        #[allow(unreachable_patterns)]
+        _ => Err(Error::new("usage", "Expected a legacy plugin command")),
     }
 }
 
@@ -1323,16 +1826,32 @@ fn remove_marketplace(root: &Path, name: &str) -> Result<(Vec<String>, Vec<Strin
     if !valid_part(name) {
         return Err(Error::new("usage", format!("Invalid marketplace {name}")));
     }
-    let mut used: Vec<String> = Store::open(root, true, OpenMode::Mutate)?
-        .read_sets()?
-        .sets
-        .iter()
-        .flat_map(|s| &s.items)
-        .filter(|i| {
-            i.kind == ItemKind::Plugin && i.value.split_once('@').map(|(_, m)| m) == Some(name)
-        })
-        .map(|i| i.value.clone())
-        .collect();
+    let session = Session::open(root)?;
+    let mut used: Vec<String> = {
+        let manager = Store::open(root, false, OpenMode::Read)?;
+        same_root(&manager.root_id, &session.root_id)?;
+        let managed = crate::managed::claude_references(&manager)?;
+        if !managed.is_empty()
+            && dependency_ids(&read_record_in(&session.store, &session.root_id)?, managed)
+                .iter()
+                .any(|id| id.split_once('@').is_some_and(|(_, market)| market == name))
+        {
+            return Err(Error::new(
+                "conflict",
+                "Managed installs still use this Claude marketplace",
+            ));
+        }
+        manager
+            .read_sets()?
+            .sets
+            .iter()
+            .flat_map(|s| &s.items)
+            .filter(|i| {
+                i.kind == ItemKind::Plugin && i.value.split_once('@').map(|(_, m)| m) == Some(name)
+            })
+            .map(|i| i.value.clone())
+            .collect()
+    };
     used.sort();
     used.dedup();
     if let Some(first) = used.first() {
@@ -1342,7 +1861,6 @@ fn remove_marketplace(root: &Path, name: &str) -> Result<(Vec<String>, Vec<Strin
         )
         .next(format!("Remove them first: roost plugin remove {first}")));
     }
-    let session = Session::open(root)?;
     session.run(
         &["plugin", "marketplace", "remove", name],
         &format!("roost plugin marketplace remove {name}"),
@@ -1392,6 +1910,16 @@ fn remove(root: &Path, plugin: &str) -> Result<(Vec<String>, Vec<String>)> {
     same_root(&session.root_id, &root_id)?;
     let record = read_record_in(&session.store, &session.root_id)
         .or_else(|_| session.refresh(Duration::from_secs(10)).map(|(r, _)| r))?;
+    {
+        let manager = Store::open(root, false, OpenMode::Read)?;
+        same_root(&manager.root_id, &root_id)?;
+        if dependency_ids(&record, crate::managed::claude_references(&manager)?).contains(&id) {
+            lines.push(format!(
+                "Kept {id} in the plugin store for managed installs"
+            ));
+            return Ok((lines, warnings));
+        }
+    }
     if record.get(&id).is_none() {
         lines.push(format!("{id} is no longer installed in the plugin store"));
         return Ok((lines, warnings));

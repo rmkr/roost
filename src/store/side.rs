@@ -172,7 +172,7 @@ pub struct Subscription {
 }
 
 /// A side-file document: exact schema, root-ID match and no duplicate keys.
-trait SideFile: Serialize + DeserializeOwned {
+pub(crate) trait SideFile: Serialize + DeserializeOwned {
     const NAME: &'static str;
     fn empty_for(root_id: &str) -> Self;
     fn header(&self) -> (u32, &str);
@@ -417,7 +417,7 @@ impl Store {
         Ok(value)
     }
 
-    fn read_side_unfiltered<T: SideFile>(&self) -> Result<T> {
+    pub(crate) fn read_side_unfiltered<T: SideFile>(&self) -> Result<T> {
         if file_state(&self.directory, T::NAME, true)?.is_none() {
             return Ok(T::empty_for(&self.root_id));
         }
@@ -433,7 +433,10 @@ impl Store {
         Ok(value)
     }
 
-    fn update_side<T: SideFile>(&self, change: impl FnOnce(&mut T) -> Result<()>) -> Result<()> {
+    pub(crate) fn update_side<T: SideFile>(
+        &self,
+        change: impl FnOnce(&mut T) -> Result<()>,
+    ) -> Result<()> {
         self.side_ready()?;
         let mut value = self.read_side::<T>()?;
         change(&mut value)?;
@@ -497,6 +500,8 @@ impl Store {
 pub const STATE: &str = "state.json";
 /// Shared sets, subscriptions and plugin settings.
 pub const SETS: &str = "sets.json";
+pub(crate) const MANAGED_PLUGINS: &str = "managed-plugins.json";
+pub(crate) const MANAGED_PLUGIN_LOCK: &str = ".roost-managed-plugins-lock";
 /// Lazily created plugin store (journaled `store_create`, ticket 07).
 pub const PLUGIN_STORE: &str = "plugin-store";
 /// Lazily created parent of per-registration Desktop folders (ticket 09).
@@ -522,7 +527,7 @@ fn is_temp(name: &str) -> bool {
 /// type. A reserved name holding the wrong type (or a link) is unsafe residue.
 pub(super) fn admitted(root: &Directory, name: &str) -> Result<bool> {
     let directory = match name {
-        STATE | SETS => false,
+        STATE | SETS | MANAGED_PLUGINS | MANAGED_PLUGIN_LOCK => false,
         PLUGIN_STORE | DESKTOP | CODEX => true,
         _ if is_temp(name) => false,
         _ => return Ok(false),
