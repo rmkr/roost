@@ -207,13 +207,19 @@ if args[:1]==['-c']:
 assert args[0]=='plugin'
 pid='demo@tools'
 home=pathlib.Path(os.environ['CODEX_HOME'])
-cache=home/'plugins/cache/tools/demo/1.0'
-row={'pluginId':pid,'version':'1.0','installed':True}
+versions=home/'plugins/cache/tools/demo'
+current=next(versions.iterdir(),None) if versions.exists() else None
+version_file=pathlib.Path(os.environ.get('FAKE_MARKET_ROOT'))/'version'
+version=version_file.read_text().strip() if version_file.exists() else '1.0'
+cache=versions/version
+row={'pluginId':pid,'version':version,'installed':True}
 with (home/'calls').open('a') as calls:
     calls.write(' '.join(args)+'\n')
 if args[1]=='list':
-    print(json.dumps({'installed':[row] if cache.exists() else [],'available':[]}))
+    print(json.dumps({'installed':[dict(row,version=current.name)] if current else [],'available':[row] if '--available' in args else []}))
 elif args[1:3]==['marketplace','list']:
+    if os.environ.get('FAKE_MARKET_LIST_FAIL'):
+        sys.exit(9)
     print(json.dumps({'marketplaces':[{
         'name':'tools',
         'marketplaceRoot':market_root,
@@ -228,7 +234,7 @@ elif args[1]=='add':
     print(json.dumps(row))
 elif args[1]=='remove':
     assert args[2]==pid
-    shutil.rmtree(cache)
+    shutil.rmtree(current)
     print(json.dumps({'pluginId':pid}))
 else:
     sys.exit(2)
@@ -305,5 +311,278 @@ fn managed_native_plugins_target_verified_homes_and_sync_future_profiles() {
     f.ok(&["plugin", "uninstall", "codex:demo@tools", "--yes"]);
     for name in ["work", "personal", "later"] {
         assert!(!target(name).exists());
+    }
+}
+
+#[test]
+fn managed_catalog_skips_absent_provider_targets_and_keeps_successful_installs() {
+    let f = Fixture::with_fakes("codex-provider", &[("codex", PLUGIN_CODEX)]);
+    let marketplace = f.path.join("marketplace");
+    fs::create_dir(&marketplace).unwrap();
+    let f = f.with_var("FAKE_MARKET_ROOT", &marketplace);
+    f.ok(&["codex", "add", "work"]);
+    f.json(&[
+        "plugin",
+        "install",
+        s(&marketplace),
+        "--all-repos",
+        "--all-profiles",
+        "--yes",
+        "--json",
+    ]);
+    let cache = f.root.join("codex/work/plugins/cache/tools/demo/1.0");
+    assert!(cache.is_dir());
+
+    f.ok(&["add", "work"]);
+    let output = f.run(&["plugin", "sync", "--yes", "--json"]);
+    assert!(!output.status.success());
+    let report = common::parsed(&output);
+    let targets = report["data"]["rules"][0]["targets"].as_array().unwrap();
+    assert!(targets.iter().any(|target| {
+        target["target"]["kind"] == "claude"
+            && target["status"]["failure"]
+                .as_str()
+                .unwrap()
+                .contains("claude")
+    }));
+    assert!(cache.is_dir());
+    assert_eq!(
+        fs::read_to_string(f.root.join("codex/work/calls"))
+            .unwrap()
+            .lines()
+            .filter(|line| line.starts_with("plugin add "))
+            .count(),
+        1
+    );
+}
+
+#[test]
+fn managed_codex_adopts_a_verified_provider_upgrade_before_syncing_new_homes() {
+    let f = Fixture::with_fakes("codex-adopt", &[("codex", PLUGIN_CODEX)]);
+    let marketplace = f.path.join("marketplace");
+    fs::create_dir(&marketplace).unwrap();
+    let f = f.with_var("FAKE_MARKET_ROOT", &marketplace);
+    f.ok(&["codex", "add", "work"]);
+    f.ok(&[
+        "plugin",
+        "install",
+        "codex:demo@tools",
+        "--all-repos",
+        "--all-profiles",
+        "--yes",
+    ]);
+    let versions = f.root.join("codex/work/plugins/cache/tools/demo");
+    fs::rename(versions.join("1.0"), versions.join("2.0")).unwrap();
+    fs::write(marketplace.join("version"), "2.0").unwrap();
+
+    let checked = f.json(&["plugin", "check", "--json"]);
+    let rule = &checked["data"]["rules"][0];
+    assert!(rule["codex_revision"].as_str().unwrap().starts_with("1.0+"));
+    assert!(
+        rule["targets"][0]["status"]["candidate"]
+            .as_str()
+            .unwrap()
+            .starts_with("2.0+")
+    );
+    f.ok(&["plugin", "update", "--managed", "--yes"]);
+    let calls = fs::read_to_string(f.root.join("codex/work/calls")).unwrap();
+    assert_eq!(
+        calls
+            .lines()
+            .filter(|line| line.starts_with("plugin add "))
+            .count(),
+        1
+    );
+
+    f.ok(&["codex", "add", "later"]);
+    f.ok(&["plugin", "sync", "--yes"]);
+    assert!(
+        f.root
+            .join("codex/later/plugins/cache/tools/demo/2.0")
+            .is_dir()
+    );
+    assert!(
+        f.root
+            .join("codex/work/plugins/cache/tools/demo/2.0")
+            .is_dir()
+    );
+}
+
+const PORTABLE_CODEX: &str = r#"#!/bin/sh
+mkdir -p .agents/skills/demo
+echo 'fixture skill' > .agents/skills/demo/SKILL.md
+echo '{"version":2,"skills":{"demo":{"sourceType":"local","source":"fixture"}}}' > skills-lock.json
+"#;
+#[test]
+fn qualified_codex_install_rejects_an_overlapping_portable_catalog() {
+    let f = Fixture::with_fakes(
+        "codex-alias",
+        &[("codex", PLUGIN_CODEX), ("bunx", PORTABLE_CODEX)],
+    );
+    let marketplace = f.path.join("marketplace");
+    fs::create_dir(&marketplace).unwrap();
+    let f = f.with_var("FAKE_MARKET_ROOT", &marketplace);
+    assert!(
+        std::process::Command::new("/usr/bin/git")
+            .args(["init", "-q", s(&f.path)])
+            .status()
+            .unwrap()
+            .success()
+    );
+    f.ok(&["codex", "add", "work"]);
+    f.ok(&[
+        "plugin",
+        "install",
+        s(&marketplace),
+        "--skills",
+        "--skill",
+        "demo",
+        "--agent",
+        "codex",
+        "--here",
+        "--yes",
+    ]);
+    let output = f.run(&[
+        "plugin",
+        "install",
+        "codex:demo@tools",
+        "--all-repos",
+        "--all-profiles",
+        "--yes",
+        "--json",
+    ]);
+    assert!(!output.status.success());
+    let report = common::parsed(&output);
+    assert!(
+        report["data"]["rules"][0]["targets"][0]["status"]["failure"]
+            .as_str()
+            .unwrap()
+            .contains("overlapping target")
+    );
+    let failed_lookup = f
+        .command()
+        .env("FAKE_MARKET_LIST_FAIL", "1")
+        .args(["plugin", "sync", "--yes", "--json"])
+        .output()
+        .unwrap();
+    assert!(!failed_lookup.status.success());
+    let report = common::parsed(&failed_lookup);
+    let targets = report["data"]["rules"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .flat_map(|rule| rule["targets"].as_array().unwrap());
+    assert!(
+        targets
+            .filter_map(|target| target["status"]["failure"].as_str())
+            .any(|failure| failure.contains("marketplace list failed"))
+    );
+    let calls = fs::read_to_string(f.root.join("codex/work/calls")).unwrap();
+    assert!(!calls.lines().any(|line| line.starts_with("plugin add ")));
+}
+
+#[test]
+fn sync_resolves_a_provider_that_was_unavailable_at_install() {
+    let f = Fixture::with_fakes("codex-retry", &[("codex", PLUGIN_CODEX)]);
+    let marketplace = f.path.join("marketplace");
+    fs::create_dir(&marketplace).unwrap();
+    let f = f.with_var("FAKE_MARKET_ROOT", &marketplace);
+    f.ok(&["codex", "add", "work"]);
+    let executable = f.bin.join("codex");
+    let disabled = f.bin.join("codex.disabled");
+    fs::rename(&executable, &disabled).unwrap();
+    let output = f.run(&[
+        "plugin",
+        "install",
+        s(&marketplace),
+        "--all-repos",
+        "--all-profiles",
+        "--yes",
+        "--json",
+    ]);
+    assert!(!output.status.success());
+    let report = common::parsed(&output);
+    assert!(
+        report["data"]["rules"][0]["targets"][0]["status"]["failure"]
+            .as_str()
+            .unwrap()
+            .contains("codex_unavailable")
+    );
+    fs::rename(disabled, executable).unwrap();
+    f.ok(&["plugin", "sync", "--yes"]);
+    assert!(
+        f.root
+            .join("codex/work/plugins/cache/tools/demo/1.0")
+            .is_dir()
+    );
+}
+
+#[test]
+fn portable_install_rechecks_an_overlapping_native_receipt_without_provenance() {
+    let f = Fixture::with_fakes(
+        "codex-native-first",
+        &[("codex", PLUGIN_CODEX), ("bunx", PORTABLE_CODEX)],
+    );
+    let marketplace = f.path.join("marketplace");
+    fs::create_dir(&marketplace).unwrap();
+    let f = f.with_var("FAKE_MARKET_ROOT", &marketplace);
+    let status = std::process::Command::new("/usr/bin/git")
+        .args(["init", "-q", s(&f.path)])
+        .status()
+        .unwrap();
+    assert!(status.success());
+    f.ok(&["codex", "add", "work"]);
+    let native = f
+        .command()
+        .env("FAKE_MARKET_LIST_FAIL", "1")
+        .args([
+            "plugin",
+            "install",
+            "codex:demo@tools",
+            "--all-repos",
+            "--all-profiles",
+            "--yes",
+            "--json",
+        ])
+        .output()
+        .unwrap();
+    assert!(native.status.success());
+    let report = common::parsed(&native);
+    let receipt = &report["data"]["rules"][0]["targets"][0]["status"]["installed"];
+    assert!(receipt["provenance"].is_null());
+
+    let portable = [
+        "plugin",
+        "install",
+        s(&marketplace),
+        "--skills",
+        "--skill",
+        "demo",
+        "--agent",
+        "codex",
+        "--here",
+        "--yes",
+        "--json",
+    ];
+    for unavailable in [true, false] {
+        let mut command = f.command();
+        if unavailable {
+            command.env("FAKE_MARKET_LIST_FAIL", "1");
+        }
+        let output = command.args(portable).output().unwrap();
+        assert!(!output.status.success());
+        let report = common::parsed(&output);
+        let failure = report["data"]["rules"][0]["targets"][0]["status"]["failure"]
+            .as_str()
+            .unwrap();
+        assert!(
+            failure.contains(if unavailable {
+                "marketplace list failed"
+            } else {
+                "overlapping target"
+            }),
+            "{failure}"
+        );
+        assert!(!f.path.join(".agents/skills/demo").exists());
     }
 }

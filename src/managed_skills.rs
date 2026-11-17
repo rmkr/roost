@@ -303,27 +303,42 @@ fn git() -> Command {
 }
 
 fn digest(content: &impl Serialize) -> Result<String> {
-    // Git is already required for checkout validation. A blob hash outside
-    // any repository is stable across processes, unlike Rust's map hashers.
-    let mut hash = git()
+    digest_with(git(), content, Duration::from_secs(5))
+}
+
+fn digest_with(
+    mut command: Command,
+    content: &impl Serialize,
+    timeout: Duration,
+) -> Result<String> {
+    // A regular file avoids blocking on a hash subprocess that stops reading stdin.
+    let temporary = Temp::new()?;
+    let input = temporary.0.join("content");
+    let file = File::create(&input).map_err(|e| Error::io("create hash input", &input, e))?;
+    let mut writer = BufWriter::new(file);
+    serde_json::to_writer(&mut writer, content)
+        .map_err(|e| Error::new("io", format!("Cannot encode skill content: {e}")))?;
+    writer
+        .flush()
+        .map_err(|e| Error::io("write hash input", &input, e))?;
+    drop(writer);
+    command
         .current_dir("/")
-        .args(["hash-object", "--stdin", "--no-filters"])
-        .stdin(Stdio::piped())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::null())
-        .spawn()
-        .map_err(|e| Error::new("skills_unavailable", format!("Cannot start git: {e}")))?;
-    let written = {
-        let mut stdin = BufWriter::new(hash.stdin.take().expect("piped stdin"));
-        serde_json::to_writer(&mut stdin, content).is_ok() && stdin.flush().is_ok()
-    };
-    let output = hash
-        .wait_with_output()
-        .map_err(|e| Error::new("io", format!("Cannot read git content hash: {e}")))?;
-    let hash = std::str::from_utf8(&output.stdout)
-        .unwrap_or_default()
-        .trim();
-    if !written || !output.status.success() || !valid_hash(hash) {
+        .args(["hash-object", "--no-filters", "--"])
+        .arg(&input);
+    let (output, status) =
+        launch::probe(command, "skills_unavailable", timeout).map_err(|error| {
+            if error.code == "cancelled" {
+                error
+            } else {
+                Error::new(
+                    error.code,
+                    error.message.replace("Claude probe", "Git content hash"),
+                )
+            }
+        })?;
+    let hash = std::str::from_utf8(&output).unwrap_or_default().trim();
+    if !status.success() || !valid_hash(hash) {
         return Err(Error::new(
             "io",
             "Git could not hash the staged skill content",
@@ -1674,6 +1689,23 @@ mod tests {
 
     fn identity(path: &Path) -> FileIdentity {
         Directory::open(path, false).unwrap().identity().unwrap()
+    }
+
+    #[test]
+    fn content_hash_preserves_blob_digest_and_bounds_a_stalled_process() {
+        // The Git blob SHA-1 of JSON null, independent of file or argument naming.
+        assert_eq!(
+            digest(&()).unwrap(),
+            "ec747fa47ddb81e9bf2d282011ed32aa4c59f932"
+        );
+        let mut stalled = Command::new("/bin/sh");
+        stalled.args(["-c", "exec sleep 10"]);
+        let error = digest_with(stalled, &(), Duration::from_millis(100)).unwrap_err();
+        assert!(
+            error
+                .message
+                .contains("Git content hash exceeded its deadline")
+        );
     }
 
     #[test]

@@ -7,7 +7,7 @@ use crate::{
     Error, Outcome, Result,
     cli::{InstallArgs, PluginAction, ProjectAction},
     platform::{self, Directory},
-    store::{Kind, OpenMode, Registration, Store},
+    store::{Kind, OpenMode, Registration, State, Store},
 };
 use model::{
     Artifact, Database, Entry, Profile, Repository, Rule, Target, TargetEntry, UnresolvedRepo,
@@ -192,7 +192,20 @@ fn add_targets(
         return Ok(());
     }
 
+    let has_claude_target = if rule.all_profiles {
+        crate::launch::resolve_program("claude").is_ok()
+            || store.is_some_and(|store| {
+                store.registry.registrations.iter().any(|registration| {
+                    registration.kind != Kind::DefaultAlias && registration.state == State::Active
+                })
+            })
+    } else {
+        rule.profiles
+            .iter()
+            .any(|profile| profile.agent == Agent::Claude)
+    };
     if rule.agents.contains(&Agent::Claude)
+        && has_claude_target
         && (rule.all_repos || !rule.repositories.is_empty())
         && !target_present(rule, &Target::Claude)
     {
@@ -498,7 +511,11 @@ fn target_preview(entry: &TargetEntry, rule: &Rule, root: &Path) -> String {
         .native_ids
         .get(&agent)
         .map_or("unresolved plugin", String::as_str);
-    format!("  {target} | {id} | {}", directory.display())
+    let location = format!("  {target} | {id} | {}", directory.display());
+    match &entry.status.failure {
+        Some(failure) if !rule.native_ids.contains_key(&agent) => format!("{location} | {failure}"),
+        _ => location,
+    }
 }
 
 fn install(args: InstallArgs, data: &mut Value) -> Result<Outcome> {
@@ -509,7 +526,13 @@ fn install(args: InstallArgs, data: &mut Value) -> Result<Outcome> {
     // No root lock while interacting with the terminal or invoking Git.
     drop(candidate_store);
     let mut rule = install_rule(&args, &root, &db)?;
-    work::resolve_native_ids(&mut rule)?;
+    if let Some(existing) = db
+        .rules
+        .iter()
+        .find(|existing| !existing.removing && existing.same_scope(&rule))
+    {
+        rule.native_ids.clone_from(&existing.native_ids);
+    }
     work::verify_mode(&rule, &db)?;
     let mut warnings = vec![];
     add_targets(
@@ -519,6 +542,7 @@ fn install(args: InstallArgs, data: &mut Value) -> Result<Outcome> {
         false,
         &mut warnings,
     )?;
+    work::resolve_native_ids(&mut rule)?;
     let mut preview = vec![rule_header(&rule)];
     preview.extend(
         rule.targets
@@ -537,11 +561,15 @@ fn install(args: InstallArgs, data: &mut Value) -> Result<Outcome> {
     }
     if args.dry_run {
         *data = json!({"dry_run":true,"rule":rule,"targets":preview});
-        let failed = !rule.unresolved.is_empty();
+        let failed = !rule.unresolved.is_empty()
+            || rule
+                .targets
+                .iter()
+                .any(|entry| entry.status.failure.is_some());
         let error = failed.then(|| {
             Error::new(
                 "managed_plugin_failed",
-                "One or more repositories could not be verified",
+                "One or more targets could not be resolved",
             )
         });
         return Ok(Outcome {
@@ -572,6 +600,7 @@ fn install(args: InstallArgs, data: &mut Value) -> Result<Outcome> {
             }),
         }
     }
+    let resolved = rule.clone();
     rule.repositories = verified;
     if !rule.all_repos && rule.repositories.is_empty() {
         return output(vec![rule], warnings, true, data);
@@ -622,9 +651,21 @@ fn install(args: InstallArgs, data: &mut Value) -> Result<Outcome> {
         .into_iter()
         .find(|existing| !existing.removing && existing.same_scope(&rule))
     {
+        if existing.native_ids.iter().any(|(agent, id)| {
+            resolved
+                .native_ids
+                .get(agent)
+                .is_some_and(|approved| approved != id)
+        }) {
+            return Err(Error::new(
+                "conflict",
+                "A managed plugin ID changed since preview",
+            ));
+        }
         rule = existing;
         work::expand(&session, &mut rule, &mut warnings)?;
     }
+    work::keep_native_preview(&mut rule, &resolved);
     session.save(&rule)?;
     let result = work::sync_rule(&session, &mut rule)? || !rule.unresolved.is_empty();
     output(vec![rule], warnings, result, data)

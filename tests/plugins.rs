@@ -982,3 +982,21 @@ fn managed_claude_plugin_matches_repository_and_profile_and_blocks_legacy_remova
     f.ok(&["plugin", "uninstall", "claude:fmt@tools", "--yes"]);
     assert!(!f.cache("fmt@tools", "v1").exists());
 }
+
+#[test]
+fn standing_claude_rule_is_prepared_before_the_first_profile() {
+    let f = Fixture::new();
+    f.ok(&["plugin", "marketplace", "add", "tools"]);
+    f.ok(&[
+        "plugin",
+        "install",
+        "claude:lint@tools",
+        "--all-repos",
+        "--all-profiles",
+        "--yes",
+    ]);
+    assert!(f.cache("lint@tools", "v1").is_dir());
+    f.ok(&["add", "Work"]);
+    let paths = f.injected("Work").expect("managed plugin in first launch");
+    assert!(paths.contains(s(&f.cache("lint@tools", "v1"))));
+}

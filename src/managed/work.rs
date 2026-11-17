@@ -6,6 +6,7 @@ use super::{
 use crate::{managed_native as native, managed_skills as skills};
 use serde_json::Value;
 use std::{
+    borrow::Cow,
     ffi::OsString,
     path::{Path, PathBuf},
     process::{Command, Stdio},
@@ -49,18 +50,19 @@ fn source_matches(rule: &Rule, source: Option<&str>) -> bool {
     })
 }
 
-pub(super) fn verify_mode(rule: &Rule, db: &Database) -> Result<()> {
-    fn normalized(source: &str) -> &str {
-        let source = source
-            .trim_start_matches("claude:")
-            .trim_start_matches("codex:");
-        let source = source.trim_start_matches("https://github.com/");
-        if source.starts_with('/') {
-            source
-        } else {
-            source.trim_end_matches(".git")
+fn normalized(source: &str) -> Cow<'_, str> {
+    let source = source
+        .trim_start_matches("claude:")
+        .trim_start_matches("codex:");
+    match native::CatalogSource::remote(source) {
+        Some(native::CatalogSource::Github(name)) => {
+            Cow::Owned(name.strip_suffix(".git").unwrap_or(&name).to_owned())
         }
+        _ => Cow::Borrowed(source),
     }
+}
+
+pub(super) fn verify_mode(rule: &Rule, db: &Database) -> Result<()> {
     let source = normalized(&rule.source);
     for other in db
         .rules
@@ -128,24 +130,154 @@ pub(super) fn verify_mode(rule: &Rule, db: &Database) -> Result<()> {
     Ok(())
 }
 
-pub(super) fn resolve_native_ids(rule: &mut Rule) -> Result<()> {
-    if rule.portable() {
-        return Ok(());
+fn native_agent(target: &Target) -> Option<Agent> {
+    match target {
+        Target::Claude => Some(Agent::Claude),
+        Target::Codex { .. } => Some(Agent::Codex),
+        Target::Skills { .. } => None,
     }
-    for &agent in &rule.agents {
+}
+
+pub(super) fn resolve_native_ids(rule: &mut Rule) -> Result<()> {
+    for agent in rule.agents.clone() {
+        let pending = |entry: &TargetEntry| {
+            native_agent(&entry.target) == Some(agent) && entry.status.installed.is_none()
+        };
+        if rule.native_ids.contains_key(&agent) || !rule.targets.iter().any(pending) {
+            continue;
+        }
         let source = model::native_source(rule, agent);
-        let id = match agent {
+        let resolved = match agent {
             Agent::Claude => native::claude_preview(source),
             Agent::Codex => native::codex_preview(source),
-        }
-        .map_err(|error| {
-            if error.code == "not_found" || error.code == "unsupported" {
-                error.next("For a portable skill source, retry with --skills --skill NAME")
-            } else {
-                error
+        };
+        match resolved {
+            Ok(id) => {
+                rule.native_ids.insert(agent, id);
             }
-        })?;
-        rule.native_ids.insert(agent, id);
+            Err(error) if error.code == "cancelled" => return Err(error),
+            Err(error) => {
+                let mut failure = format!("{}: {}", error.code, error.message);
+                if matches!(error.code, "not_found" | "unsupported") {
+                    failure.push_str(
+                        ". For a portable skill source, retry with --skills --skill NAME",
+                    );
+                }
+                for entry in rule.targets.iter_mut().filter(|entry| pending(entry)) {
+                    entry.status.failure = Some(failure.clone());
+                }
+            }
+        }
+    }
+    Ok(())
+}
+
+pub(super) fn keep_native_preview(rule: &mut Rule, preview: &Rule) {
+    for (agent, id) in &preview.native_ids {
+        rule.native_ids.entry(*agent).or_insert_with(|| id.clone());
+    }
+    for entry in &mut rule.targets {
+        let Some(agent) = native_agent(&entry.target) else {
+            continue;
+        };
+        if entry.status.installed.is_none()
+            && !rule.native_ids.contains_key(&agent)
+            && let Some(failure) = preview
+                .targets
+                .iter()
+                .filter(|prior| native_agent(&prior.target) == Some(agent))
+                .find_map(|prior| prior.status.failure.as_ref())
+        {
+            entry.status.failure = Some(failure.clone());
+        }
+    }
+}
+
+fn verify_native_mode(
+    rule: &Rule,
+    db: &Database,
+    agent: Agent,
+    provenance: Result<Option<&str>>,
+) -> Result<()> {
+    let overlapping = db.rules.iter().filter(|other| {
+        other.portable() && other.agents.contains(&agent)
+            && other.targets.iter().any(|entry| {
+                entry.status.installed.is_some()
+                    && matches!(&entry.target, Target::Skills { repository } if
+                        rule.all_repos || rule.repositories.iter().any(|repo| repo.same_repo(repository)))
+            })
+    });
+    let mut overlapping = overlapping.peekable();
+    if overlapping.peek().is_none() {
+        return Ok(());
+    }
+    let provenance = require_catalog(provenance?)?;
+    for other in overlapping {
+        verify_distinct_catalogs(&other.source, provenance)?;
+    }
+    Ok(())
+}
+
+fn require_catalog<T>(provenance: Option<T>) -> Result<T> {
+    provenance.ok_or_else(|| {
+        Error::new(
+            "unverified_catalog",
+            "Cannot verify the native marketplace source against existing portable skills",
+        )
+        .next("Verify the marketplace configuration or specify its source, then retry")
+    })
+}
+
+fn verify_distinct_catalogs(portable_source: &str, native_source: &str) -> Result<()> {
+    if normalized(portable_source) == normalized(native_source) {
+        return Err(Error::new(
+            "collision",
+            "This marketplace already uses the other install mode for an overlapping target",
+        ));
+    }
+    Ok(())
+}
+
+fn verify_portable_catalogs(
+    session: &Session,
+    rule: &Rule,
+    db: &Database,
+    repository: &model::Repository,
+) -> Result<()> {
+    for other in db.rules.iter().filter(|other| {
+        !other.portable()
+            && (other.all_repos
+                || other
+                    .repositories
+                    .iter()
+                    .any(|anchor| anchor.same_repo(repository)))
+    }) {
+        for entry in &other.targets {
+            let Some(agent) = native_agent(&entry.target) else {
+                continue;
+            };
+            if !rule.agents.contains(&agent) {
+                continue;
+            }
+            if let Some(Artifact::Native { id, provenance, .. }) = &entry.status.installed {
+                let discovered;
+                let source = match provenance {
+                    Some(source) => source.as_str(),
+                    None => {
+                        discovered = match &entry.target {
+                            Target::Claude => native::claude_provenance(&session.root, id)?,
+                            Target::Codex { profile } => {
+                                let home = codex_home(session, profile)?;
+                                native::codex_provenance(&home, &profile.generation, id)?
+                            }
+                            Target::Skills { .. } => unreachable!(),
+                        };
+                        require_catalog(discovered.as_deref())?
+                    }
+                };
+                verify_distinct_catalogs(&rule.source, source)?;
+            }
+        }
     }
     Ok(())
 }
@@ -183,6 +315,10 @@ pub(super) fn dispatch(
     if job == Job::Sync {
         for rule in &mut planned {
             resolve_pending_repositories(rule)?;
+            let store = Store::open_if_present(&root)?;
+            add_targets(rule, &db, store.as_ref(), false, &mut vec![])?;
+            drop(store);
+            resolve_native_ids(rule)?;
         }
     }
     let (lines, targets) =
@@ -270,7 +406,13 @@ fn operation_preview(
     let mut rules = rules.to_vec();
     if job == Job::Sync {
         for rule in &mut rules {
+            let saved = db.rules.iter().find(|saved| saved.id == rule.id);
+            let preview = rule.clone();
+            if let Some(saved) = saved {
+                rule.targets.clone_from(&saved.targets);
+            }
             add_targets(rule, db, Some(store), false, &mut vec![])?;
+            keep_native_preview(rule, &preview);
             rule.targets
                 .retain(|entry| entry.status.installed.is_none());
         }
@@ -363,6 +505,7 @@ fn run(session: &Session, mut rules: Vec<Rule>, job: Job, data: &mut Value) -> R
             continue;
         }
         if job == Job::Sync {
+            let preview = rule.clone();
             let repositories = std::mem::take(&mut rule.repositories);
             let unresolved = std::mem::take(&mut rule.unresolved);
             *rule = saved;
@@ -374,12 +517,13 @@ fn run(session: &Session, mut rules: Vec<Rule>, job: Job, data: &mut Value) -> R
             }
             rule.repositories = repositories;
             rule.unresolved = unresolved;
+            expand(session, rule, &mut warnings)?;
+            keep_native_preview(rule, &preview);
         } else {
             *rule = saved;
         }
         let result = match job {
             Job::Sync => {
-                expand(session, rule, &mut warnings)?;
                 session.save(rule)?;
                 sync_rule(session, rule)? || !rule.unresolved.is_empty()
             }
@@ -462,7 +606,8 @@ pub(super) fn sync_rule(session: &Session, rule: &mut Rule) -> Result<bool> {
     {
         return Ok(false);
     }
-    verify_mode(rule, &session.read()?)?;
+    let db = session.read()?;
+    verify_mode(rule, &db)?;
     let staged = rule.portable().then(|| {
         if let Some(revision) = &rule.skill_revision {
             let mut stage = skills::load(&skills_cache(session, false)?, revision)?;
@@ -489,23 +634,41 @@ pub(super) fn sync_rule(session: &Session, rule: &mut Rule) -> Result<bool> {
         if platform::cancelled() {
             return Err(Error::cancelled());
         }
+        let approved_id = |agent| {
+            rule.native_ids.get(&agent).ok_or_else(|| {
+                Error::new(
+                    "unresolved_plugin",
+                    entry
+                        .status
+                        .failure
+                        .clone()
+                        .unwrap_or_else(|| "No plugin ID was resolved for this target".into()),
+                )
+            })
+        };
         let result = match &entry.target {
-            Target::Claude => native::claude_install(
-                &session.root,
-                model::native_source(rule, Agent::Claude),
-                &rule.native_ids[&Agent::Claude],
-            )
-            .map(native_artifact),
-            Target::Codex { profile } => codex_home(session, profile).and_then(|home| {
+            Target::Claude => approved_id(Agent::Claude).and_then(|id| {
+                native::claude_install(
+                    &session.root,
+                    model::native_source(rule, Agent::Claude),
+                    id,
+                    |source| verify_native_mode(rule, &db, Agent::Claude, source),
+                )
+                .map(native_artifact)
+            }),
+            Target::Codex { profile } => (|| {
+                let id = approved_id(Agent::Codex)?;
+                let home = codex_home(session, profile)?;
                 native::codex_install(
                     &home,
                     &profile.generation,
                     model::native_source(rule, Agent::Codex),
-                    &rule.native_ids[&Agent::Codex],
+                    id,
                     rule.codex_revision.as_deref(),
+                    |source| verify_native_mode(rule, &db, Agent::Codex, source),
                 )
                 .map(native_artifact)
-            }),
+            })(),
             Target::Skills { repository } => (|| {
                 let staged = staged
                     .as_ref()
@@ -520,7 +683,7 @@ pub(super) fn sync_rule(session: &Session, rule: &mut Rule) -> Result<bool> {
                     .next("Review the new revision with roost plugin check, then update"));
                 }
                 repository.verify()?;
-                let db = session.read()?;
+                verify_portable_catalogs(session, rule, &db, repository)?;
                 let prior = db
                     .rules
                     .iter()
@@ -615,7 +778,7 @@ fn check_rule(session: &Session, rule: &mut Rule, offset: usize) -> Result<bool>
                         model::native_source(rule, Agent::Codex),
                         id,
                     )?;
-                    if observed.as_deref() != Some(revision)
+                    if (observed.as_deref() != Some(revision) || observed != rule.codex_revision)
                         && observed != native::codex_current(&home, &profile.generation, id)?
                     {
                         return Err(Error::new(
@@ -623,7 +786,16 @@ fn check_rule(session: &Session, rule: &mut Rule, offset: usize) -> Result<bool>
                             "Native plugin revision changed during the check",
                         ));
                     }
-                    Ok(candidate)
+                    Ok(candidate.or_else(|| {
+                        observed
+                            .as_ref()
+                            .filter(|revision| {
+                                rule.codex_revision
+                                    .as_ref()
+                                    .is_some_and(|pin| pin != *revision)
+                            })
+                            .cloned()
+                    }))
                 })
             }
             (Target::Skills { repository }, installed)
@@ -888,6 +1060,7 @@ fn update_rule(session: &Session, rule: &mut Rule) -> Result<bool> {
                     .next("Run roost plugin check again"));
                 }
                 repository.verify()?;
+                verify_portable_catalogs(session, rule, &session.read()?, repository)?;
                 let prior = match previous {
                     Some(Artifact::Skills { receipt }) => Some(receipt),
                     None => None,
@@ -1293,4 +1466,22 @@ fn launch_updates(root: &Path, root_id: &str, agent: Agent, generation: &str) ->
         session.save(&saved)?;
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::normalized;
+
+    #[test]
+    fn catalog_identity_normalizes_github_but_preserves_filesystem_and_url_case() {
+        assert_eq!(
+            normalized("Owner/Repo"),
+            normalized("https://github.com/owner/repo.git")
+        );
+        assert_ne!(normalized("/Repo/Skills"), normalized("/Repo/skills"));
+        assert_ne!(
+            normalized("https://example.org/Repo"),
+            normalized("https://example.org/repo")
+        );
+    }
 }

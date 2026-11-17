@@ -489,6 +489,7 @@ pub(crate) fn claude_install(
     root: &Path,
     source: &str,
     expected_id: &str,
+    verify_mode: impl FnOnce(Result<Option<&str>>) -> Result<()>,
 ) -> Result<NativeInstall> {
     use managed_native::Source;
 
@@ -499,8 +500,13 @@ pub(crate) fn claude_install(
     }
     let session = Session::open(root)?;
     let provenance = match source {
-        Source::Id(_) => None,
+        Source::Id(id) => managed_native::verify_provenance(
+            claude_marketplaces(&session.claude, &session.store)
+                .and_then(|markets| managed_native::marketplace_provenance(&markets, id)),
+            verify_mode,
+        )?,
         Source::Catalog(source) => {
+            verify_mode(Ok(Some(source.arg())))?;
             let markets = claude_marketplaces(&session.claude, &session.store)?;
             if let Some(market) = managed_native::match_market(&markets, &source)? {
                 let id =
@@ -529,20 +535,13 @@ pub(crate) fn claude_install(
         }
     };
     let id = expected_id;
-    let provenance = || {
-        provenance.or_else(|| {
-            claude_marketplaces(&session.claude, &session.store)
-                .ok()
-                .and_then(|markets| managed_native::marketplace_provenance(&markets, id))
-        })
-    };
     if let Some(revision) = claude_revision(&session.claude, &session.store, id)? {
         session.refresh(Duration::from_secs(10))?;
         return Ok(NativeInstall {
             id: id.into(),
             revision,
             owned: false,
-            provenance: provenance(),
+            provenance,
         });
     }
     record_changed_store(
@@ -565,8 +564,16 @@ pub(crate) fn claude_install(
         id: id.into(),
         revision,
         owned: true,
-        provenance: provenance(),
+        provenance,
     })
+}
+
+pub(crate) fn claude_provenance(root: &Path, id: &str) -> Result<Option<String>> {
+    let Some(session) = Session::existing(root)? else {
+        return Ok(None);
+    };
+    let markets = claude_marketplaces(&session.claude, &session.store)?;
+    managed_native::marketplace_provenance(&markets, id)
 }
 
 pub(crate) fn claude_current(root: &Path, id: &str) -> Result<Option<String>> {

@@ -17,7 +17,8 @@ use std::{
 };
 
 pub(crate) use plugins::{
-    claude_check, claude_current, claude_install, claude_preview, claude_remove, claude_update,
+    claude_check, claude_current, claude_install, claude_preview, claude_provenance, claude_remove,
+    claude_update,
 };
 
 const CODEX_LOCK: &str = ".roost-plugin-lock";
@@ -197,12 +198,27 @@ pub(crate) fn require_id(expected: &str, actual: &str) -> Result<()> {
     Ok(())
 }
 
-pub(crate) fn marketplace_provenance(markets: &[Marketplace], id: &str) -> Option<String> {
-    market_for_id(markets, Source::Id(id), id)
-        .ok()
-        .flatten()
+pub(crate) fn marketplace_provenance(markets: &[Marketplace], id: &str) -> Result<Option<String>> {
+    Ok(market_for_id(markets, Source::Id(id), id)?
         .and_then(|market| market.source.as_ref())
-        .map(|source| source.arg().to_owned())
+        .map(|source| source.arg().to_owned()))
+}
+
+pub(crate) fn verify_provenance(
+    provenance: Result<Option<String>>,
+    verify_mode: impl FnOnce(Result<Option<&str>>) -> Result<()>,
+) -> Result<Option<String>> {
+    match provenance {
+        Ok(provenance) => {
+            verify_mode(Ok(provenance.as_deref()))?;
+            Ok(provenance)
+        }
+        Err(error) if matches!(error.code, "cancelled" | "ownership") => Err(error),
+        Err(error) => {
+            verify_mode(Err(error))?;
+            Ok(None)
+        }
+    }
 }
 
 pub(crate) fn scratch() -> Result<Scratch> {
@@ -834,6 +850,7 @@ pub(crate) fn codex_install(
     source: &str,
     expected_id: &str,
     selected_revision: Option<&str>,
+    verify_mode: impl FnOnce(Result<Option<&str>>) -> Result<()>,
 ) -> Result<NativeInstall> {
     let source = source_for("codex", source)?;
     let (_, name) = split_id(expected_id)?;
@@ -843,14 +860,14 @@ pub(crate) fn codex_install(
     let codex = Codex::open(home, generation)?;
     if let Source::Id(id) = source {
         let current = codex.current(id)?;
-        let markets = match codex.marketplaces() {
-            Ok(markets) => markets,
-            Err(error) if error.code == "cancelled" || error.code == "ownership" => {
-                return Err(error);
-            }
-            Err(_) => Vec::new(),
-        };
-        let provenance = marketplace_provenance(&markets, id);
+        let markets = codex.marketplaces();
+        let provenance = verify_provenance(
+            markets
+                .as_ref()
+                .map_err(Clone::clone)
+                .and_then(|markets| marketplace_provenance(markets, id)),
+            verify_mode,
+        )?;
         if let Some(revision) = current {
             if let Some(expected) = selected_revision {
                 require_revision(Some(&revision), expected)?;
@@ -863,6 +880,7 @@ pub(crate) fn codex_install(
             });
         }
         let mut installed = if let Some(expected) = selected_revision {
+            let markets = markets?;
             let catalog = market_for_id(&markets, Source::Id(id), id)?
                 .and_then(|market| market.source.as_ref())
                 .ok_or_else(|| {
@@ -882,6 +900,7 @@ pub(crate) fn codex_install(
     let Source::Catalog(source) = source else {
         unreachable!()
     };
+    verify_mode(Ok(Some(source.arg())))?;
     let markets = codex.marketplaces()?;
     let configured = match_market(&markets, &source)?;
     if let Some(market) = configured {
@@ -920,6 +939,11 @@ pub(crate) fn codex_install(
     };
     installed.provenance = Some(source.arg().to_owned());
     Ok(installed)
+}
+
+pub(crate) fn codex_provenance(home: &Path, generation: &str, id: &str) -> Result<Option<String>> {
+    let codex = Codex::open(home, generation)?;
+    marketplace_provenance(&codex.marketplaces()?, id)
 }
 
 pub(crate) fn codex_current(home: &Path, generation: &str, id: &str) -> Result<Option<String>> {
@@ -981,6 +1005,14 @@ pub(crate) fn codex_update(
         })?;
         require_candidate(expected, &codex_candidate(catalog, id)?, false)?;
         require_revision(codex.current(id)?.as_deref(), expected_revision)?;
+    }
+    if expected_candidate == Some(expected_revision) {
+        return Ok(NativeInstall {
+            id: id.to_owned(),
+            revision: expected_revision.to_owned(),
+            owned: false,
+            provenance: catalog.map(|source| source.arg().to_owned()),
+        });
     }
     if catalog.is_some_and(CatalogSource::is_git) {
         let (_, market) = split_id(id)?;
@@ -1049,12 +1081,19 @@ mod tests {
 
         let temporary = scratch().unwrap();
         let root = temporary.0.join("roost");
-        let error = claude_install(&root, "plug@catalog", "other@catalog").unwrap_err();
+        let error = claude_install(&root, "plug@catalog", "other@catalog", |_| Ok(())).unwrap_err();
         assert_eq!(error.code, "conflict");
         assert!(!root.exists());
         let home = root.join("codex/work");
-        let error =
-            codex_install(&home, "invalid", "plug@catalog", "other@catalog", None).unwrap_err();
+        let error = codex_install(
+            &home,
+            "invalid",
+            "plug@catalog",
+            "other@catalog",
+            None,
+            |_| Ok(()),
+        )
+        .unwrap_err();
         assert_eq!(error.code, "conflict");
         assert!(!home.exists());
     }
@@ -1141,7 +1180,9 @@ mod tests {
         }];
         assert!(market_for_id(&markets, Source::Id("plug@market"), "plug@market").is_ok());
         assert_eq!(
-            marketplace_provenance(&markets, "plug@market").as_deref(),
+            marketplace_provenance(&markets, "plug@market")
+                .unwrap()
+                .as_deref(),
             Some("owner/catalog"),
         );
         assert!(
