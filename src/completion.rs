@@ -78,6 +78,7 @@ fn complete(words: Vec<OsString>, manager_flag_used: bool) -> Vec<String> {
     }
     let cursor = words.len() - 1;
     let before = words[..cursor].to_vec();
+    let after_delimiter = before.iter().skip(1).any(|word| word == "--");
     engine::complete(&mut command, words, cursor, None)
         .unwrap_or_default()
         .into_iter()
@@ -87,7 +88,8 @@ fn complete(words: Vec<OsString>, manager_flag_used: bool) -> Vec<String> {
             let is_manager_flag = RUN_FLAGS.contains(&value) || SWITCH_FLAGS.contains(&value);
             if value.contains(['\r', '\n', '\t'])
                 || (manager_flag_used && is_manager_flag)
-                || (value.starts_with('-') && option_conflicts(&command, &before, value))
+                || ((value.starts_with('-') || after_delimiter)
+                    && parser_rejects_candidate(&command, &before, value, after_delimiter))
             {
                 return None;
             }
@@ -96,23 +98,32 @@ fn complete(words: Vec<OsString>, manager_flag_used: bool) -> Vec<String> {
         .collect()
 }
 
-fn option_conflicts(command: &Command, before: &[OsString], option: &str) -> bool {
+fn parser_rejects_candidate(
+    command: &Command,
+    before: &[OsString],
+    candidate: &str,
+    after_delimiter: bool,
+) -> bool {
     let args = before
         .iter()
         .map(OsString::as_os_str)
-        .chain([OsStr::new(option)]);
+        .chain([OsStr::new(candidate)]);
     let Err(error) = command.clone().try_get_matches_from(args.clone()) else {
         return false;
     };
     match error.kind() {
         ErrorKind::ArgumentConflict => true,
+        // The completion engine can suggest a subcommand after `--`.
+        ErrorKind::UnknownArgument | ErrorKind::InvalidSubcommand => after_delimiter,
         // Clap checks for a missing option value before checking for conflicts.
         // Probe with a value so repeatable options and conflicts get the same
         // treatment as switches. Keep candidates when the parser is inconclusive.
-        ErrorKind::InvalidValue if !option.contains('=') => command
-            .clone()
-            .try_get_matches_from(args.chain([OsStr::new("value")]))
-            .is_err_and(|error| error.kind() == ErrorKind::ArgumentConflict),
+        ErrorKind::InvalidValue if candidate.starts_with('-') && !candidate.contains('=') => {
+            command
+                .clone()
+                .try_get_matches_from(args.chain([OsStr::new("value")]))
+                .is_err_and(|error| error.kind() == ErrorKind::ArgumentConflict)
+        }
         _ => false,
     }
 }

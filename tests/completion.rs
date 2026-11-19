@@ -64,6 +64,14 @@ fn completion_omits_conflicting_options_and_keeps_incomplete_commands() {
 }
 
 #[test]
+fn delimiter_stops_subcommand_completion_and_preserves_positional_values() {
+    let fixture = Fixture::with_fakes("completion-delimiter", &[]);
+    assert!(complete(&fixture, &["plugin", "marketplace", "--", "re"]).is_empty());
+    assert!(complete(&fixture, &["codex", "--", "a"]).is_empty());
+    assert_eq!(complete(&fixture, &["completions", "--", "fi"]), ["fish"]);
+}
+
+#[test]
 fn profiles_follow_the_active_root_and_leave_storage_untouched() {
     let fixture = Fixture::with_fakes("completion-profiles", &[]);
     fixture.ok(&["add", "Work"]);
