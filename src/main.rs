@@ -566,6 +566,16 @@ fn dispatch(action: Action, data: &mut Value) -> Result<Outcome> {
         Action::ManagedPluginCheck { root, root_id } => managed::background_check(root, &root_id),
         Action::Plugin { action } => {
             use cli::PluginAction;
+            let action = match action {
+                PluginAction::Install(args) if args.no_set || !args.sets.is_empty() => {
+                    PluginAction::Add {
+                        plugin: args.source,
+                        sets: args.sets,
+                        no_set: args.no_set,
+                    }
+                }
+                action => action,
+            };
             if matches!(
                 action,
                 PluginAction::Install(_)
