@@ -1,4 +1,4 @@
-use clap::{Args, CommandFactory, Parser, Subcommand, error::ErrorKind};
+use clap::{ArgGroup, Args, CommandFactory, Parser, Subcommand, error::ErrorKind};
 use std::{
     ffi::{OsStr, OsString},
     path::PathBuf,
@@ -257,7 +257,17 @@ pub enum PluginAction {
         #[arg(long)]
         managed: bool,
     },
-    /// Install native plugins or portable skills for selected repositories or profiles
+    /// Share a Claude plugin through sets or install for selected targets
+    ///
+    /// Use PLUGIN[@MARKETPLACE] with --set SET to share a Claude plugin with
+    /// profiles subscribed to that set. Use --no-set to install it into the
+    /// shared store without adding it to any set.
+    ///
+    /// For direct installs, choose profiles and repositories. Roost loads
+    /// Claude plugins on CLI launches that match those targets. Native Codex
+    /// plugins require all repositories in the selected Codex profiles. Pass
+    /// --all-repos or choose All repositories in the picker. Use --skills
+    /// --skill NAME to install portable skills into selected Git checkouts.
     Install(InstallArgs),
     /// Check managed installs for updates without changing installed files
     Check {
@@ -287,7 +297,12 @@ pub enum PluginAction {
         #[command(subcommand)]
         action: MarketplaceAction,
     },
-    /// Install a plugin into the store and add it to sets
+    /// Share a Claude plugin with profiles subscribed to a set
+    ///
+    /// Roost installs the plugin in its shared store. At launch, Claude profiles
+    /// subscribed to the selected sets get the plugin. Use --no-set to install it
+    /// into the store only.
+    #[command(hide = true)]
     Add {
         #[arg(value_name = "PLUGIN[@MARKETPLACE]")]
         plugin: String,
@@ -357,8 +372,18 @@ pub(crate) enum Agent {
 }
 
 #[derive(Args, Debug)]
+#[command(group(ArgGroup::new("store_scope").args(["sets", "no_set"]).conflicts_with_all([
+    "here", "repo", "all_repos", "profile", "all_profiles", "agent", "skills", "skill",
+    "dry_run", "yes", "json",
+])))]
 pub struct InstallArgs {
     pub source: String,
+    /// Share a Claude plugin with profiles subscribed to this set (repeatable)
+    #[arg(long = "set", value_name = "SET")]
+    pub sets: Vec<String>,
+    /// Install a Claude plugin into the shared store only
+    #[arg(long)]
+    pub no_set: bool,
     /// Use the repository containing the current directory
     #[arg(long, conflicts_with_all = ["repo", "all_repos"])]
     pub here: bool,

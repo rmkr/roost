@@ -1250,7 +1250,7 @@ fn inject(
                 order.push(id);
             }
             None => warnings.push(format!(
-                "Skipped plugin {id}: not installed in the plugin store (roost plugin add {id})"
+                "Skipped plugin {id}: not installed in the plugin store (roost plugin install {id} --no-set)"
             )),
         }
     }
@@ -1521,7 +1521,7 @@ pub fn command(action: PluginAction, data: &mut Value) -> Result<(Vec<String>, V
 fn list(root: &Path, data: &mut Value) -> Result<(Vec<String>, Vec<String>)> {
     let Some(store) = Store::open_if_present(root)? else {
         return Ok((
-            vec!["No store plugins; install one with roost plugin add PLUGIN".into()],
+            vec!["No store plugins; run roost plugin install PLUGIN --no-set".into()],
             vec![],
         ));
     };
@@ -1558,7 +1558,7 @@ fn list(root: &Path, data: &mut Value) -> Result<(Vec<String>, Vec<String>)> {
         .collect();
     let last = state.plugin_auto_update_at;
     let mut lines = if plugins.is_empty() {
-        vec!["No store plugins; install one with roost plugin add PLUGIN".into()]
+        vec!["No store plugins; run roost plugin install PLUGIN --no-set".into()]
     } else {
         Table::new()
             .column("Plugin", |r: &Value| {
@@ -1718,6 +1718,13 @@ fn add(
 ) -> Result<(Vec<String>, Vec<String>)> {
     let (name, marketplace) = parse_id(plugin)?;
     let chosen = choose_sets(root, named, no_set)?;
+    let mut scope = String::new();
+    if chosen.is_empty() {
+        scope.push_str(" --no-set");
+    }
+    for set in &chosen {
+        scope.push_str(&format!(" --set {set}"));
+    }
     let session = Session::open(root)?;
     let id = match marketplace {
         Some(marketplace) => format!("{name}@{marketplace}"),
@@ -1734,7 +1741,9 @@ fn add(
                 format!("No marketplace in the plugin store offers {name}"),
             )
             .next("Add its marketplace with roost plugin marketplace add SOURCE");
-            resolve_known(&candidates, plugin, missing, "Name one: roost plugin add")?
+            resolve_known(&candidates, plugin, missing, |qualified| {
+                format!("Name one: roost plugin install {qualified}{scope}")
+            })?
         }
     };
     let item = Item {
@@ -1746,13 +1755,7 @@ fn add(
         same_root(&manager.root_id, &session.root_id)?;
         check_sets(&manager, &manager.read_sets()?, &chosen, &item)?;
     }
-    let mut retry = format!("roost plugin add {id}");
-    if chosen.is_empty() {
-        retry.push_str(" --no-set");
-    }
-    for set in &chosen {
-        retry.push_str(&format!(" --set {set}"));
-    }
+    let retry = format!("roost plugin install {id}{scope}");
     session.run(&["plugin", "install", &id], &retry)?;
     let (record, mut warnings) = session.refresh(Duration::from_secs(10))?;
     let root_id = session.root_id.clone();
@@ -1800,16 +1803,18 @@ fn add(
 fn resolve_store(known: &BTreeSet<String>, plugin: &str) -> Result<String> {
     let missing = Error::new("not_found", format!("No store plugin named {plugin}"))
         .next("List store plugins with roost plugin list");
-    resolve_known(known, plugin, missing, "Name one as")
+    resolve_known(known, plugin, missing, |qualified| {
+        format!("Name one as {qualified}")
+    })
 }
 
 /// Resolves PLUGIN[@MARKETPLACE] against `known`: `missing` when no ID has
-/// that name, and `name_one` prefixes the hint when several do.
+/// that name, and `name_one` builds the hint when several do.
 fn resolve_known(
     known: &BTreeSet<String>,
     plugin: &str,
     missing: Error,
-    name_one: &str,
+    name_one: impl FnOnce(&str) -> String,
 ) -> Result<String> {
     let (name, marketplace) = parse_id(plugin)?;
     if marketplace.is_some() {
@@ -1830,7 +1835,7 @@ fn resolve_known(
                     .join(", ")
             ),
         )
-        .next(format!("{name_one} {name}@MARKETPLACE"))),
+        .next(name_one(&format!("{name}@MARKETPLACE")))),
     }
 }
 
@@ -1851,7 +1856,7 @@ fn update(root: &Path, plugin: Option<&str>) -> Result<(Vec<String>, Vec<String>
                     "not_found",
                     format!("{id} is not installed in the plugin store"),
                 )
-                .next(format!("roost plugin add {id}")));
+                .next(format!("roost plugin install {id} --no-set")));
             }
             vec![id]
         }
