@@ -3,7 +3,7 @@ use crate::{
     platform,
     store::{State, Store},
 };
-use clap::{Arg, ArgAction, Command};
+use clap::{Arg, ArgAction, Command, error::ErrorKind};
 use clap_complete::engine::{self, CompletionCandidate};
 use std::{
     collections::{BTreeSet, HashSet},
@@ -32,21 +32,16 @@ pub(crate) fn candidates(words: Vec<OsString>) -> Vec<String> {
     };
     let manager_flag_used = match command.to_str() {
         Some("--allow-auth-env") if before.len() == 2 => {
-            return CLAUDE_SUBCOMMANDS
-                .iter()
-                .filter(|name| {
-                    current
-                        .to_str()
-                        .is_some_and(|prefix| name.starts_with(prefix))
-                })
-                .map(|name| (*name).into())
-                .collect();
+            return matching_words(current, &CLAUDE_SUBCOMMANDS);
         }
         Some("run") => match cli::manager_prefix(before, RUN_FLAGS) {
             Ok(([used], index)) if index == before.len() => used,
             _ => return vec![],
         },
         Some("switch") => match cli::manager_prefix(before, SWITCH_FLAGS) {
+            Ok(([false, false, true], index)) if index == before.len() => {
+                return matching_words(current, &["--help", "-h"]);
+            }
             Ok(([auth, no_launch, false], index))
                 if index == before.len() && !(auth && no_launch) =>
             {
@@ -61,6 +56,17 @@ pub(crate) fn candidates(words: Vec<OsString>) -> Vec<String> {
     complete(words, manager_flag_used)
 }
 
+fn matching_words(current: &OsStr, names: &[&str]) -> Vec<String> {
+    let Some(prefix) = current.to_str() else {
+        return vec![];
+    };
+    names
+        .iter()
+        .filter(|name| name.starts_with(prefix))
+        .map(|name| (*name).into())
+        .collect()
+}
+
 fn complete(words: Vec<OsString>, manager_flag_used: bool) -> Vec<String> {
     let mut command = cli::command().arg(
         Arg::new("allow_auth_env")
@@ -71,16 +77,44 @@ fn complete(words: Vec<OsString>, manager_flag_used: bool) -> Vec<String> {
         command = command.subcommand(Command::new(name));
     }
     let cursor = words.len() - 1;
+    let before = words[..cursor].to_vec();
     engine::complete(&mut command, words, cursor, None)
         .unwrap_or_default()
         .into_iter()
+        .filter(|candidate| !candidate.is_hide_set())
         .filter_map(|candidate| {
             let value = candidate.get_value().to_str()?;
             let is_manager_flag = RUN_FLAGS.contains(&value) || SWITCH_FLAGS.contains(&value);
-            (!value.contains(['\r', '\n', '\t']) && !(manager_flag_used && is_manager_flag))
-                .then(|| value.to_owned())
+            if value.contains(['\r', '\n', '\t'])
+                || (manager_flag_used && is_manager_flag)
+                || (value.starts_with('-') && option_conflicts(&command, &before, value))
+            {
+                return None;
+            }
+            Some(value.to_owned())
         })
         .collect()
+}
+
+fn option_conflicts(command: &Command, before: &[OsString], option: &str) -> bool {
+    let args = before
+        .iter()
+        .map(OsString::as_os_str)
+        .chain([OsStr::new(option)]);
+    let Err(error) = command.clone().try_get_matches_from(args.clone()) else {
+        return false;
+    };
+    match error.kind() {
+        ErrorKind::ArgumentConflict => true,
+        // Clap checks for a missing option value before checking for conflicts.
+        // Probe with a value so repeatable options and conflicts get the same
+        // treatment as switches. Keep candidates when the parser is inconclusive.
+        ErrorKind::InvalidValue if !option.contains('=') => command
+            .clone()
+            .try_get_matches_from(args.chain([OsStr::new("value")]))
+            .is_err_and(|error| error.kind() == ErrorKind::ArgumentConflict),
+        _ => false,
+    }
 }
 
 pub(crate) fn profile_names(current: &OsStr) -> Vec<CompletionCandidate> {

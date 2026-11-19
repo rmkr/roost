@@ -32,14 +32,35 @@ fn shell_scripts_and_cli_completions_need_no_storage() {
         (&["plugin", "marketplace", "re"], "remove"),
         (&["ls", "--fu"], "--full"),
         (&["switch", "--no-"], "--no-launch"),
+        (&["switch", "--forget", "--h"], "--help"),
         (&["set", "add", "team", "--skills-"], "--skills-from"),
         (&["completions", "fi"], "fish"),
         (&["--allow-auth-env", "mc"], "mcp"),
     ] {
         assert_eq!(complete(&fixture, words), [expected], "{words:?}");
     }
+    assert!(complete(&fixture, &["__"]).is_empty());
     assert!(complete(&fixture, &["run", "work"]).is_empty());
     assert!(!fixture.root.exists());
+}
+
+#[test]
+fn completion_omits_conflicting_options_and_keeps_incomplete_commands() {
+    let fixture = Fixture::with_fakes("completion-options", &[]);
+    for words in [
+        &["ls", "--full", "--fu"][..],
+        &["token", "work", "--stdin", "--cl"],
+        &["plugin", "add", "pkg", "--no-set", "--se"],
+        &["set", "add", "team", "--skill", "./one", "--ins"],
+    ] {
+        assert!(complete(&fixture, words).is_empty(), "{words:?}");
+    }
+    for (words, expected) in [
+        (&["desktop", "--cl"][..], "--close"),
+        (&["plugin", "add", "pkg", "--set", "team", "--se"], "--set"),
+    ] {
+        assert_eq!(complete(&fixture, words), [expected], "{words:?}");
+    }
 }
 
 #[test]
