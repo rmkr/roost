@@ -1,4 +1,5 @@
-use clap::{ArgGroup, Args, CommandFactory, Parser, Subcommand, error::ErrorKind};
+use clap::{ArgGroup, Args, CommandFactory, Parser, Subcommand, ValueEnum, error::ErrorKind};
+use clap_complete::engine::ArgValueCompleter;
 use std::{
     ffi::{OsStr, OsString},
     path::PathBuf,
@@ -58,6 +59,7 @@ pub enum Action {
     Run {
         #[arg(long)]
         allow_auth_env: bool,
+        #[arg(add = ArgValueCompleter::new(crate::completion::profile_names))]
         name: String,
         #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
         arguments: Vec<OsString>,
@@ -97,6 +99,13 @@ pub enum Action {
         #[arg(long)]
         apply: bool,
     },
+    /// Print a shell script that enables Roost tab completion
+    Completions {
+        #[arg(value_enum)]
+        shell: CompletionShell,
+    },
+    #[command(skip)]
+    Complete { words: Vec<OsString> },
     /// Inspect installation/storage/launcher safety without repairing anything
     Doctor {
         #[arg(long)]
@@ -175,6 +184,7 @@ pub enum Action {
         /// Clear this project's selection
         #[arg(long)]
         forget: bool,
+        #[arg(add = ArgValueCompleter::new(crate::completion::profile_names))]
         name: Option<String>,
         #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
         arguments: Vec<OsString>,
@@ -186,6 +196,13 @@ pub enum Action {
         allow_auth_env: bool,
         arguments: Vec<OsString>,
     },
+}
+
+#[derive(Clone, Copy, Debug, ValueEnum)]
+pub enum CompletionShell {
+    Bash,
+    Zsh,
+    Fish,
 }
 
 #[derive(Subcommand, Debug)]
@@ -538,6 +555,11 @@ pub fn parse() -> std::result::Result<Action, clap::Error> {
 }
 
 fn parse_from(args: Vec<OsString>) -> std::result::Result<Action, clap::Error> {
+    if args.get(1).is_some_and(|v| v == "__roost_complete") {
+        return Ok(Action::Complete {
+            words: args.into_iter().skip(2).collect(),
+        });
+    }
     if args.get(1).is_some_and(|v| v == "__roost_launch_v1") {
         if args.len() < 6 || args[5] != "--" {
             return Err(usage(
@@ -567,7 +589,7 @@ fn parse_from(args: Vec<OsString>) -> std::result::Result<Action, clap::Error> {
     // Public run has one boundary: only switches before NAME are manager switches.
     // Clap's normal trailing arguments can still consume a known switch after NAME.
     if args.get(1).is_some_and(|v| v == "run") {
-        let ([allow_auth_env], index) = manager_prefix(&args, ["--allow-auth-env"])?;
+        let ([allow_auth_env], index) = manager_prefix(&args, RUN_FLAGS)?;
         let value = args.get(index).ok_or_else(|| usage("run requires NAME"))?;
         return Ok(Action::Run {
             allow_auth_env,
@@ -612,6 +634,9 @@ pub const CLAUDE_SUBCOMMANDS: [&str; 12] = [
     "ultrareview",
 ];
 
+pub(crate) const RUN_FLAGS: [&str; 1] = ["--allow-auth-env"];
+pub(crate) const SWITCH_FLAGS: [&str; 3] = ["--allow-auth-env", "--no-launch", "--forget"];
+
 /// Bare `roost`: only an optional leading `--allow-auth-env`, then nothing, `--`
 /// and an opaque tail, or an allowlisted Claude subcommand and its arguments. Anything
 /// else is a command or switch for clap.
@@ -638,7 +663,7 @@ fn parse_launch(args: &[OsString]) -> std::result::Result<Option<Action>, clap::
 
 /// Manager switches before NAME, shared by `run` and `switch`: each flag at most
 /// once, and `--help` goes back to clap. Returns the flags and NAME's index.
-fn manager_prefix<const N: usize>(
+pub(crate) fn manager_prefix<const N: usize>(
     args: &[OsString],
     flags: [&str; N],
 ) -> std::result::Result<([bool; N], usize), clap::Error> {
@@ -687,8 +712,7 @@ fn claude_tail(tail: &[OsString]) -> Vec<OsString> {
 /// `switch` shares run's single boundary: manager switches precede NAME and the
 /// tail after NAME (one optional `--` consumed) belongs to Claude.
 fn parse_switch(args: &[OsString]) -> std::result::Result<Action, clap::Error> {
-    let ([allow_auth_env, no_launch, forget], index) =
-        manager_prefix(args, ["--allow-auth-env", "--no-launch", "--forget"])?;
+    let ([allow_auth_env, no_launch, forget], index) = manager_prefix(args, SWITCH_FLAGS)?;
     if [allow_auth_env, no_launch, forget]
         .into_iter()
         .filter(|v| *v)
@@ -725,6 +749,10 @@ fn parse_switch(args: &[OsString]) -> std::result::Result<Action, clap::Error> {
         name,
         arguments,
     })
+}
+
+pub(crate) fn command() -> clap::Command {
+    Cli::command()
 }
 
 pub fn help(command: Option<&str>) -> crate::Result<String> {

@@ -1,4 +1,5 @@
 mod cli;
+mod completion;
 mod desktop;
 mod launch;
 mod managed;
@@ -134,7 +135,13 @@ fn main() {
         if let Some(name) = action.name() {
             store::validate_name(name)?;
         }
-        if !matches!(action, Action::Help { .. } | Action::Version) {
+        if !matches!(
+            action,
+            Action::Help { .. }
+                | Action::Version
+                | Action::Completions { .. }
+                | Action::Complete { .. }
+        ) {
             platform::install_cancel_handler()?;
         }
         dispatch(action, &mut data)
@@ -248,6 +255,8 @@ fn dispatch(action: Action, data: &mut Value) -> Result<Outcome> {
             shell.as_deref(),
             apply,
         )?)),
+        Action::Completions { shell } => Ok(Outcome::lines(vec![completion::script(shell).into()])),
+        Action::Complete { words } => Ok(Outcome::lines(completion::candidates(words))),
         Action::Doctor { .. } => doctor(data),
         Action::Codex { action } => codex(action),
         Action::Desktop {

@@ -376,9 +376,9 @@ fn file_name(path: &Path) -> Result<&str> {
         .and_then(|n| n.to_str())
         .ok_or_else(|| err("unsafe_path", "Invalid object name"))
 }
-fn lock(dir: &Directory) -> Result<File> {
+fn lock(dir: &Directory, timeout: Duration) -> Result<File> {
     let file = dir.open_file(LOCK, true, true)?;
-    let deadline = Instant::now() + Duration::from_secs(10);
+    let deadline = Instant::now() + timeout;
     loop {
         if platform::cancelled() {
             return Err(Error::cancelled());
@@ -426,6 +426,20 @@ impl Store {
     }
 
     pub fn open(root: &Path, create: bool, mode: OpenMode) -> Result<Self> {
+        Self::open_with_lock_timeout(root, create, mode, Duration::from_secs(10))
+    }
+
+    /// Tab completion should never wait behind an operation holding the root lock.
+    pub(crate) fn open_for_completion(root: &Path) -> Result<Self> {
+        Self::open_with_lock_timeout(root, false, OpenMode::Read, Duration::ZERO)
+    }
+
+    fn open_with_lock_timeout(
+        root: &Path,
+        create: bool,
+        mode: OpenMode,
+        lock_timeout: Duration,
+    ) -> Result<Self> {
         let root = platform::absolute(root)?;
         let can_initialize = mode.journaled() || mode == OpenMode::CodexAdd;
         let parent = Directory::open(
@@ -467,7 +481,7 @@ impl Store {
                 ));
             }
         }
-        let held_lock = lock(&directory)?;
+        let held_lock = lock(&directory, lock_timeout)?;
         let lock_identity = platform::file_identity(&held_lock)?;
         if directory.entry(LOCK)?.as_ref().map(|e| &e.identity) != Some(&lock_identity) {
             return Err(recovery("Stable lock changed while acquiring it"));

@@ -274,6 +274,18 @@ roost-work
 
 Default PATH setup prints instructions. Explicit apply edits one user startup block/snippet; Fish uses `roost-path.fish` and `fish_add_path --path` without universal-variable changes. Restart the shell afterward. Bash, Zsh and POSIX sh recipes are also available on Unix. Adding Cargo's executable bin directory to PATH remains a separate installation step.
 
+## Shell tab completion
+
+With `roost` on your PATH, run the line for your shell to enable completion in the current session. Add the same line to your shell's startup file to enable it in future sessions. In Zsh, put it after `compinit`.
+
+| Shell | Enable completion |
+| --- | --- |
+| Bash | `eval "$(roost completions bash)"` |
+| Zsh | `source <(roost completions zsh)` |
+| Fish | `roost completions fish \| source` |
+
+Press Tab to complete Roost commands and flags. After `roost run` or `roost switch`, Tab offers active profiles from the current `ROOST_DIR` (or `~/.roost`). Type `claude:` or `codex:` to narrow the list to one provider. After arguments pass through to Claude or Codex, your shell resumes its normal completion behavior.
+
 ## Storage and existing profiles
 
 Storage defaults to `~/.roost`; `ROOST_DIR` selects the entire manager root. It does not change your home, default-copy source or Cargo root. Names are ASCII, case-insensitive for manager lookup, and keep their stored spelling.
