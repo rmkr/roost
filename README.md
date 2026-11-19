@@ -193,7 +193,7 @@ roost plugin install mattpocock/skills --skills --skill grill-me \
 
 Repeat `--repo`, `--profile`, `--agent`, or `--skill` to select multiple targets where supported. Use `--dry-run` to preview a rule. In scripts, pass explicit scope flags and `--yes` to apply. Managed commands support `--json`.
 
-Claude receives native plugins from the shared store when the repo and profile match a Roost CLI launch. Codex installs native plugins into the selected Roost Codex homes, so they are available across repos when using those homes, including from T3. To target a repo subset for Codex, use portable skills. Portable skills require Bun and write to the selected checkouts' skill directories and `skills-lock.json`.
+Claude receives native plugins from the shared store when the repo and profile match a Roost CLI launch. Codex installs native plugins into the selected Roost Codex homes, where they are available across repositories, including from T3. Pass `--all-repos` or pick **All repositories** for native Codex plugins. To target a repo subset for Codex, use portable skills. Portable skills require Bun and write to the selected checkouts' skill directories and `skills-lock.json`.
 
 | Command | Purpose |
 | --- | --- |
@@ -214,15 +214,17 @@ Shared plugins are installed once into a Roost-owned plugin store (`<root>/plugi
 ```sh
 roost plugin marketplace add OWNER/REPO
 roost plugin marketplace remove NAME
-roost plugin add PLUGIN@MARKETPLACE --set core
-roost plugin add PLUGIN --no-set
+roost plugin install PLUGIN@MARKETPLACE --set core
+roost plugin install PLUGIN --no-set
 roost plugin list
 roost plugin update            # all store plugins, or name one
 roost plugin auto-update --on
 roost plugin remove PLUGIN
 ```
 
-`marketplace add` passes SOURCE to `claude plugin marketplace add` unchanged. `marketplace remove` runs `claude plugin marketplace remove` in the store and refreshes Roost's record of installed plugins; it refuses while any set still uses a plugin from that marketplace (`roost plugin remove` it first). To change a marketplace's SOURCE, remove it and add it again. `plugin add` without `--set` or `--no-set` asks which sets on a terminal and fails without one. Injected plugins appear in Claude as `name@inline`, and Claude does not update them itself: use `roost plugin update`, or `auto-update --on` to update at most once a day at launch (short timeout; failure warns and still launches). A profile can turn one off with `"<name>@inline": false` in its own settings. `roost plugin remove` drops the plugin from every set and uninstalls it; profiles lose it at their next launch. `roost doctor` reports a store plugin that is also installed natively in an owned profile.
+Repeat `--set` to share a plugin through multiple sets. Use `--no-set` to install it into the store without adding it to a set. Existing scripts can still use `roost plugin add` with the same flags and terminal prompt.
+
+`marketplace add` passes SOURCE to `claude plugin marketplace add` unchanged. `marketplace remove` runs `claude plugin marketplace remove` in the store and refreshes Roost's record of installed plugins; it refuses while any set still uses a plugin from that marketplace (`roost plugin remove` it first). To change a marketplace's SOURCE, remove it and add it again. Injected plugins appear in Claude as `name@inline`, and Claude does not update them itself: use `roost plugin update`, or `auto-update --on` to update at most once a day at launch (short timeout; failure warns and still launches). A profile can turn one off with `"<name>@inline": false` in its own settings. `roost plugin remove` drops the plugin from every set and uninstalls it; profiles lose it at their next launch. `roost doctor` reports a store plugin that is also installed natively in an owned profile.
 
 Marketplace and install use your own git credentials; marketplaces hosted on claude.ai (organization libraries) cannot be added to the store. `roost update` still only runs `claude update`.
 

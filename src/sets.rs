@@ -541,7 +541,7 @@ pub fn command(action: SetAction, data: &mut Value) -> Result<Vec<String>> {
                     "not_found",
                     format!("Plugin {} is not installed in the plugin store", item.value),
                 )
-                .next(format!("roost plugin add {} --set {set}", item.value)));
+                .next(format!("roost plugin install {} --set {set}", item.value)));
             }
             let mut added = false;
             store.update_sets(|sets| {

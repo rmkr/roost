@@ -221,6 +221,81 @@ fn marketplace_add_runs_claude_in_the_store_under_the_store_lock_only() {
 }
 
 #[test]
+fn install_shares_through_sets_or_installs_into_the_store_only() {
+    let f = Fixture::new();
+    f.ok(&["plugin", "marketplace", "add", "tools"]);
+    f.ok(&["set", "create", "dev"]);
+    f.ok(&["set", "create", "ops"]);
+    f.ok(&[
+        "plugin",
+        "install",
+        "lint@tools",
+        "--set",
+        "dev",
+        "--set",
+        "ops",
+    ]);
+    f.ok(&["plugin", "install", "core@tools", "--no-set"]);
+    let list = f.json(&["plugin", "list", "--json"]);
+    assert_eq!(
+        list["data"]["plugins"],
+        json!([
+            {"id":"core@tools","sets":[]},
+            {"id":"lint@tools","sets":["dev","ops"]},
+        ])
+    );
+    assert_eq!(
+        f.json(&["plugin", "list", "--managed", "--json"])["data"]["rules"],
+        json!([])
+    );
+}
+
+#[test]
+fn store_install_flags_conflict_before_running_an_installer() {
+    let f = Fixture::new();
+    for flags in [
+        &["--set", "dev", "--no-set"][..],
+        &["--set", "dev", "--here"],
+        &["--no-set", "--all-profiles"],
+        &["--no-set", "--skills", "--skill", "example"],
+        &["--set", "dev", "--dry-run"],
+        &["--no-set", "--yes"],
+        &["--no-set", "--json"],
+    ] {
+        let mut args = vec!["plugin", "install", "lint@tools"];
+        args.extend_from_slice(flags);
+        let out = f.run(&args);
+        assert_eq!(out.status.code(), Some(2), "{flags:?}");
+        assert!(String::from_utf8_lossy(&out.stderr).contains("cannot be used with"));
+    }
+    assert!(f.plugin_calls().is_empty());
+    assert!(!f.store().exists());
+}
+
+#[test]
+fn plugin_help_lists_install_but_keeps_legacy_add_help() {
+    let f = Fixture::new();
+    let out = f.ok(&["plugin", "--help"]);
+    let help = String::from_utf8_lossy(&out.stdout);
+    assert!(
+        help.lines()
+            .any(|line| line.trim_start().starts_with("install "))
+    );
+    assert!(
+        !help
+            .lines()
+            .any(|line| line.trim_start().starts_with("add "))
+    );
+    let out = f.ok(&["plugin", "install", "--help"]);
+    let help = String::from_utf8_lossy(&out.stdout);
+    for option in ["--set <SET>", "--no-set", "--skill <SKILL>"] {
+        assert!(help.lines().any(|line| line.trim() == option), "{option}");
+    }
+    assert!(help.contains("--skills --skill NAME"));
+    f.ok(&["plugin", "add", "--help"]);
+}
+
+#[test]
 fn add_installs_records_and_injects_into_subscribed_profiles() {
     let f = Fixture::new();
     f.ok(&["add", "Work"]);
@@ -329,7 +404,7 @@ fn bare_names_resolve_through_the_store_listing() {
     let out = f.fails(&["plugin", "add", "lint", "--no-set"], "not_found");
     let stderr = String::from_utf8_lossy(&out.stderr);
     assert!(stderr.contains("ambiguous"));
-    assert!(stderr.contains("Name one: roost plugin add lint@MARKETPLACE"));
+    assert!(stderr.contains("Name one: roost plugin install lint@MARKETPLACE --no-set"));
     let out = f.fails(&["plugin", "add", "nothing", "--no-set"], "not_found");
     assert!(String::from_utf8_lossy(&out.stderr).contains("No marketplace"));
     f.fails(&["plugin", "add", "bad/name", "--no-set"], "usage");
@@ -380,7 +455,7 @@ fn set_choice_flags_and_conflicts_are_checked_before_install() {
     let stderr = String::from_utf8_lossy(&out.stderr);
     assert!(stderr.contains("plugin_store"), "{stderr}");
     assert!(
-        stderr.contains("roost plugin add fmt@tools --set ops"),
+        stderr.contains("roost plugin install fmt@tools --set ops"),
         "{stderr}"
     );
     let sets = f.json(&["set", "list", "--json"])["data"]["sets"].clone();
